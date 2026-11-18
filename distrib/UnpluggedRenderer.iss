@@ -43,11 +43,10 @@
 ; ---------------------------------------------------------------------------
 
 #define MyAppName      "Unplugged Video Renderer"
-; The PACKAGE version, kept in lockstep with the Unplugged application release.
-; build_renderer_setup.ps1 reads MyAppVersion from
-; ..\..\unplugged-mpc-hc\distrib\unplugged.iss and refuses to build when the
-; two disagree, so the renderer setup and Unplugged 2.2.0 are one release.
-#define MyAppVersion   "2.2.0"
+; The PACKAGE version. The standalone renderer ships independently of the
+; Unplugged application now: 2.2.1 is a renderer-only update for 2.2.x users.
+; build_renderer_setup.ps1 no longer requires this to match the app release.
+#define MyAppVersion   "2.2.1"
 #define MyAppPublisher "unplugged"
 
 ; The renderer BINARY build (Include\Version.h + revision.h). It names the
@@ -55,7 +54,7 @@
 ; rebuilt filter cannot ship under a stale folder name. It is deliberately
 ; separate from MyAppVersion: the package follows the application release,
 ; the filter inside it is this build (shown in the filter's own properties).
-#define RendererBuild  "0.10.9.2637"
+#define RendererBuild  "0.11.0.2637"
 #define FiltersSrc     "..\_bin\UnpluggedRenderer-" + RendererBuild
 
 ; The VC++ runtime and its check live with the application repo, which is

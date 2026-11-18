@@ -38,6 +38,7 @@
 #include "sky_seg.h"
 #include "person_seg.h"
 #include "BYTETracker.h"
+#include "ClipGuard.h"
 
 #include <atomic>
 #include <memory>
@@ -871,16 +872,19 @@ private:
 	// Statistics
 	CD3D11Rectangle m_StatsBackground;
 	CD3D11Font      m_Font3D;
-	CD3D11Font      m_DbleFont;      // DBLE on-screen overlay (own size, not the stats font)
-	UINT            m_dbleFontH = 0;
-	// DBLEFix measurement pass: the finished SDR picture at 128x72 cells, read
-	// two frames later through a 3-texture staging ring. Same design as the
-	// contributed DbleFix.h, but the roll-off itself stays in the final pass.
-	CComPtr<ID3D11PixelShader> m_pPSDbleMeasure;
-	CComPtr<ID3D11Buffer>      m_pCBDbleMeasure;
-	CComPtr<ID3D11Texture2D>   m_pDbleMeasure;
-	CComPtr<ID3D11Texture2D>   m_pDbleStaging[3];
-	UINT m_dbleFrame = 0;
+	// ClipGuard: projector highlight compensation, test views and overlay.
+	CDbleFix            m_Dble;
+	CD3D11Rectangle     m_DbleRect;   // overlay panel, bars and key caps
+	CD3D11Quadrilateral m_DbleQuad;   // overlay icon
+	Tex2D_t  m_DbleDelay[7];          // look-ahead: the last frames, shown 2-6 frames late
+	UINT     m_DbleDelayN = 0;
+	UINT     m_DbleDelayPos = 0;
+	UINT     m_DbleDelayRing = 0;     // slots in use (look-ahead + 1), 0 = off
+	Tex2D_t  m_DbleOut;               // picture as sent, measured for the readout
+	// ClipGuard panel size, held stable while the readout text changes. A spot
+	// count or cost value must not resize the panel frame to frame.
+	int m_dblePanelW = 0, m_dblePanelH = 0;
+	int m_dblePanelWinW = 0, m_dblePanelWinH = 0;
 	CD3D11Rectangle m_Rect3D;
 	CD3D11Rectangle m_Underlay;
 	CD3D11Lines     m_Lines;
@@ -1233,10 +1237,6 @@ private:
 	//void UpdateStatsPostProc();
 	HRESULT DrawStats(ID3D11Texture2D* pRenderTarget);
 	void DrawDbleOverlay(ID3D11Texture2D* pRenderTarget);
-	HRESULT InitDbleMeasure();
-	void ReleaseDbleMeasure();
-	void MeasureDblePicture(const Tex2D_t& Tex, const CRect& srcRect);
-	void ReadDbleMeasurement();
 
 public:
 	// IMFVideoProcessor

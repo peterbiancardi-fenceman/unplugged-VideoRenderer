@@ -5,9 +5,10 @@ Unplugged, packaged for MPC-HC and MPC-BE: the same HDR tone mapping, the
 Unplugged tone curve, the ML grade (Auto/Manual) and the renderer property
 pages.
 
-Package version 2.2.0 -- the same release as Unplugged 2.2.0. The renderer
-binary inside it is build 0.10.9.2637; the filter's own properties show that
-build number.
+Package version 2.2.1 -- a renderer-only update for Unplugged 2.2.x users.
+It does not require or install the Unplugged application. The renderer binary
+inside it is build 0.11.0.2637; the filter's own properties show that build
+number.
 
 
 REQUIREMENTS

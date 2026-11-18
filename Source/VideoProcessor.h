@@ -76,34 +76,9 @@ protected:
 	// explicit value converts SDR sources too. DX9 has no final pass, so the
 	// value is inert there.
 	int   m_iDisplayTransfer               = 5;
-	// DBLE compensation (final pass, target code). Smoothing state is per
-	// activation: -1 means "no history", snapped on a scene cut.
-	bool  m_bDbleEnabled                   = false;
-	float m_fDbleStrength                  = 1.0f;
-	float m_fDbleTriggerPct                = 5.0f;
-	float m_fDbleKnee                      = 0.30f;
-	float m_fDbleSmooth                    = -1.0f;
-	int   m_iDbleView                      = 0;
-	bool  m_bDbleOsdEnabled                = false;
-	bool  m_bDbleOsdPinned                 = true;
-	int   m_iDbleOsdSelected               = 2;
-	int   m_iDbleOsdX                      = 0;   // OSD safe area, window pixels
-	int   m_iDbleOsdY                      = 0;
-	int   m_iDbleOsdW                      = 0;   // 0 = whole window
-	int   m_iDbleOsdH                      = 0;
-	// Last frame's applied DBLE state, for the on-screen overlay.
-	bool  m_bDbleLastActive                = false;
-	float m_fDbleLastAmount                = 0.0f;
-	float m_fDbleLastCeil                  = 1.0f;
-	float m_fDbleLastKnee                  = 0.30f;
-	// Measurement of the finished SDR picture (128x72 cells, read two frames
-	// later): picture brightness in percent of SDR white, clipping fraction,
-	// bottom-bar fraction. The contributed DBLEFix trigger, independent of ML.
-	float m_fDblePicturePct                = 0.0f;
-	float m_fDbleClipFrac                  = 0.0f;
-	float m_fDbleBottomBarFrac             = 0.0f;
-	bool  m_bDbleHaveMeasure               = false;
-	bool  m_bDbleCut                       = false;
+	// ClipGuard: projector highlight compensation. The renderer receives the
+	// whole block through Settings_t; no shared memory or clipguard.ini.
+	ClipGuardSettings m_clipGuard;
 	// Content peak, nits — the top of the range the tone curves map from. Distinct
 	// from m_iHdrDisplayMaxNits (the display's peak). Falls back to the HDR10
 	// nominal 1000 when the source carries no metadata, which is always on the

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <dxva2api.h>
+#include "ClipGuardSettings.h"
 
 enum :int {
 	TEXFMT_AUTOINT = 0,
@@ -248,39 +249,9 @@ struct Settings_t {
 	//       house 2.2 reference. Explicit values convert SDR too, decoding
 	//       BT.709 video as BT.1886 and sRGB/plain-gamma as their own curve.
 	int iDisplayTransfer = 5;
-	// DBLE compensation. In dark scenes, roll the top of the range down so a
-	// projector's dynamic laser dimming (DBLE) does not push highlights into
-	// clipping. The roll-off is applied in the TARGET code space, after the
-	// display transfer, so knee/ceiling follow the configured TRC. The scene
-	// mean and cut flag come from the always-on frame statistics, so this works
-	// with the ML grade Off, Auto or Manual. SDR output only.
-	bool  bDbleEnabled = false;
-	float fDbleStrength = 1.0f;      // 0..1; 1.0 puts peak white at 50 %
-	// Picture brightness measured on the finished SDR picture, in percent of
-	// SDR white. The fix starts below this and reaches full effect at a quarter
-	// of it. This is the contributed DBLEFix trigger and is independent of the
-	// ML grade (it is measured from the picture, not from the model).
-	float fDbleTriggerPct = 5.0f;    // 0.5 .. 30.0
-	float fDbleKnee = 0.30f;         // target-code level where the roll-off starts
-	// Diagnostic views of the fix, as in the contributed overlay:
-	//   0 = normal, 1 = clipping test (green/red/blue), 2 = split screen
-	int   iDbleView = 0;
-	// On-screen DBLE overlay: the contributed overlay, drawn over the finished
-	// picture. Its rows mirror the settings above; the selected row is marked
-	// with '>'. Off by default; the app's OSD row and Ctrl+Alt shortcuts drive
-	// it. overlayPinned shows the overlay continuously ("Always") instead of
-	// hiding 8 s after the last shortcut.
-	bool  bDbleOsd = false;
-	bool  bDbleOsdPinned = true;
-	int   iDbleOsdSelected = 2;      // 0..5, the row the shortcuts adjust
-	// The OSD's safe area in window pixels: the part of the picture the app's
-	// chrome (status rail, settings rail, transport bar) does not cover. Zero
-	// width/height means the whole window. The app updates this on every layout
-	// change, so the overlay moves out from under a panel that opens.
-	int   iDbleOsdX = 0;
-	int   iDbleOsdY = 0;
-	int   iDbleOsdW = 0;
-	int   iDbleOsdH = 0;
+	// ClipGuard: projector highlight compensation. Native settings live here; the
+	// renderer no longer reads the add-on's shared memory or clipguard.ini.
+	ClipGuardSettings clipGuard;
 	// The CONTENT's peak luminance, in nits — the top of the range the tone curves
 	// map FROM. Distinct from iHdrDisplayMaxNits, which is the DISPLAY's peak and is
 	// only read by the HDR-output path.
@@ -310,13 +281,13 @@ struct Settings_t {
 	float fToneLutContrast = 0.50f;
 
 	// Zion ML grade
-	bool  bMLEnabled = false;
-	int   iMLMode = ML_Disable; // ML_Disable / ML_Manual / ML_Auto
+	bool  bMLEnabled = true;
+	int   iMLMode = ML_Auto; // ML_Disable / ML_Manual / ML_Auto
 	bool  bMLToneCurveEnabled = true; // "Tone curve" group master
 	bool  bMLGammaEnabled = true;
 	float fMLGamma = 1.0f;       // manual gamma [0.5, 1.5]
 	bool  bMLShadowEnabled = true;
-	float fMLShadow = 2.0f;      // shadow strength: 0=Off 1=Low 2=Med 3=High 4=VHi 5=Saturate
+	float fMLShadow = 0.0f;      // shadow strength: 0=Off 1=Low 2=Med 3=High 4=VHi 5=Saturate
 	float fMLShadowDehaze = 0.0f; // 0..1 scale DOWN the model's shadow-toe lift (lifted-black haze control); 0 = model as-is
 	float fMLHighlightRolloffCtrl = 0.0f; // model-override: signed offset added to the model's rolloff in Auto (rim highlight softening); 0 = model as-is
 	// model-override: signed offset ADDED to the model's gamma exponent in Auto.
@@ -350,7 +321,7 @@ struct Settings_t {
 	// ps_convert_pq_to_sdr.hlsl) — re-spreads the highlight band Hable compresses
 	// least. fSoftKnee <= 0 disables (identical to before it existed); knee and
 	// width are display-relative light (1.0 = the display's white).
-	float fSoftKnee      = 0.60f;
+	float fSoftKnee      = 0.21f;
 	float fSoftKneeRatio = 2.48f;
 	float fSoftKneeWidth = 0.42f;
 	// The Hable curve's reference axis, decoupled from display white (sdrNits).
@@ -405,11 +376,11 @@ struct Settings_t {
 	float fMLHunt = 0.80f;  // libplacebo default (ml_render.h)
 	bool  bMLChromaEnabled = true;       // master pass gate (also off under DoVi)
 	bool  bMLChromaNeutralEnabled = true;
-	float fMLChromaNeutral = 1.20f;
+	float fMLChromaNeutral = 1.08f;
 	bool  bMLChromaFireEnabled = true;
-	float fMLChromaFire = 1.35f;
+	float fMLChromaFire = 1.15f;
 	bool  bMLChromaKneeEnabled = true;
-	float fMLChromaKnee = 0.55f;
+	float fMLChromaKnee = 0.45f;
 	bool  bMLChromaSkinEnabled = true;
 	float fMLChromaSkinProtect = 0.95f;
 	// Face detection
@@ -419,7 +390,7 @@ struct Settings_t {
 	float fMLFaceExpand = 1.50f;    // box expansion factor
 	bool  bMLFaceDebugVis = false;  // red rectangle overlay on detected faces
 	// P0 black bars
-	bool  bMLBars = true;           // repaint detected letterbox bars
+	bool  bMLBars = false;          // repaint detected letterbox bars
 	bool  bMLBarsHighlight = false; // red debug overlay
 	// diagnostic: monotonic config-change counter shared by s3_shell and MPCVR
 	uint32_t configSeq = 0;
@@ -689,40 +660,32 @@ struct Settings_t {
 		iHdrToggleDisplay               = HDRTD_Disabled;
 		bConvertToSdr                   = true;
 		iHdrOsdBrightness               = 0;
-		iSDRDisplayNits                 = SDR_NITS_DEF;
+		iSDRDisplayNits                 = 80;
 		fHdrDisplayMinNits              = 0.0f; // 0 == the mapping assumes an ideal black
 		iOutputGamut                    = 0;    // 0 == Rec.709 SDR output
 		iDisplayTransfer                = 5;    // 5 == follow source
-		bDbleEnabled                    = false;
-		fDbleStrength                   = 1.0f;
-		fDbleTriggerPct                 = 5.0f;
-		fDbleKnee                       = 0.30f;
-		iDbleView                       = 0;
-		bDbleOsd                        = false;
-		bDbleOsdPinned                  = true;
-		iDbleOsdSelected                = 2;
-		iDbleOsdX                       = 0;
-		iDbleOsdY                       = 0;
-		iDbleOsdW                       = 0;
-		iDbleOsdH                       = 0;
+		clipGuard                       = ClipGuardSettings{};
 		fHdrTitlePeakNits               = 1000.0f; // HDR10 nominal content peak
 		iExperimentalToneMapper         = 0;    // 0 == the shipped tone mapping
 		fToneLutContrast                = 0.50f; // pl_tone_map_spline default
-		iHdrLocalToneMappingType        = 5;   // BT.2390 default
+		// House default: the Unplugged tone curve, not BT.2390 passthrough.
+		bHdrPassthrough                 = false;
+		bHdrLocalToneMapping            = true;
+		iHdrLocalToneMappingType        = TONE_CURVE_REFERENCE;
 		bHDRPassthroughRaw              = false;
 		iInputColorSpace                = ICS_Auto;
-		bMLEnabled                      = false;
-		iMLMode                         = ML_Disable;
+		bMLEnabled                      = true;
+		iMLMode                         = ML_Auto;
 		bMLToneCurveEnabled             = true;
 		bMLGammaEnabled                 = true;
 		fMLGamma                        = 1.0f;
 		bMLShadowEnabled                = true;
-		fMLShadow                       = 2.0f;
+		fMLShadow                       = 0.0f;
 		fMLShadowDehaze                 = 0.0f;
 		fMLHighlightRolloffCtrl         = 0.0f;
 		fMLGammaTopUp                   = 0.0f;
 		fHdrHableKnee                   = 0.0f;
-		fSoftKnee                       = 0.60f;
+		fSoftKnee                       = 0.21f;
 		fSoftKneeRatio                  = 2.48f;
 		fSoftKneeWidth                  = 0.42f;
 		fHdrRefWhiteNits                = 203.0f;
@@ -752,11 +715,11 @@ struct Settings_t {
 		fMLHunt                         = 0.80f;
 		bMLChromaEnabled                = true;
 		bMLChromaNeutralEnabled         = true;
-		fMLChromaNeutral                = 1.20f;
+		fMLChromaNeutral                = 1.08f;
 		bMLChromaFireEnabled            = true;
-		fMLChromaFire                   = 1.35f;
+		fMLChromaFire                   = 1.15f;
 		bMLChromaKneeEnabled            = true;
-		fMLChromaKnee                   = 0.55f;
+		fMLChromaKnee                   = 0.45f;
 		bMLChromaSkinEnabled            = true;
 		fMLChromaSkinProtect            = 0.95f;
 		bMLFaceProtectEnabled           = true;
@@ -764,7 +727,7 @@ struct Settings_t {
 		fMLFaceFeather                  = 0.04f;
 		fMLFaceExpand                   = 1.50f;
 		bMLFaceDebugVis                 = false;
-		bMLBars                         = true;
+		bMLBars                         = false;
 		bMLBarsHighlight                = false;
 		configSeq                       = 0;
 		fHdrGt7Blend                    = 0.6f;
@@ -780,7 +743,7 @@ struct Settings_t {
 		fHdrGt7Dbg                      = 0.0f;
 		bHdrAutoRefWhite                = false;
 		fHdrRefWhiteTarget              = 0.42f;
-		bMLController                   = false;
+		bMLController                   = true;
 		fCtlWhiteNits                   = 203.0f;
 		iHdrExposureTrim                = 0;
 		iHdrShadowLift                  = 0;

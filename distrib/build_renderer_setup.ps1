@@ -74,21 +74,20 @@ if ($rb.Groups[1].Value -ne $version) {
     Fail $msg
 }
 
-# The package version follows the Unplugged application release, not the
-# filter build: one release, one version for users to quote in a report.
+# The package version is INDEPENDENT of the Unplugged application version: the
+# standalone renderer is also shipped as a renderer-only update for users who do
+# not install the app. Keep the filter build version separate (RendererBuild).
 $vm = [regex]::Match($issText, '#define\s+MyAppVersion\s+"([^"]+)"')
 if (-not $vm.Success) { Fail "MyAppVersion not found in UnpluggedRenderer.iss" }
-$appRoot = Join-Path (Split-Path $root -Parent) 'unplugged-mpc-hc'
-$appIss  = Join-Path $appRoot 'distrib\unplugged.iss'
-if (-not (Test-Path $appIss)) { Fail "missing $appIss (the application release version lives there)" }
-$av = [regex]::Match((Get-Content $appIss -Raw), '#define\s+MyAppVersion\s+"([^"]+)"')
-if (-not $av.Success) { Fail "MyAppVersion not found in $appIss" }
-if ($vm.Groups[1].Value -ne $av.Groups[1].Value) {
-    $msg = "renderer setup says package version {0} but the Unplugged application is {1}. " -f $vm.Groups[1].Value, $av.Groups[1].Value
-    $msg += "Set MyAppVersion in UnpluggedRenderer.iss to match the application release."
-    Fail $msg
+$pkgVer = $vm.Groups[1].Value
+if ($pkgVer -notmatch '^\d+\.\d+\.\d+$') {
+    Fail "UnpluggedRenderer.iss MyAppVersion '$pkgVer' is not a x.y.z package version."
 }
-Write-Host "package version: $($vm.Groups[1].Value) (matches Unplugged)"
+Write-Host "package version: $pkgVer (renderer-only; independent of the app release)"
+
+# The shared VC++ redist checks still live in the application repo; that path is
+# independent of the package version.
+$appRoot = Join-Path (Split-Path $root -Parent) 'unplugged-mpc-hc'
 
 $stageName = "UnpluggedRenderer-$version"
 $stageDir  = Join-Path $root "_bin\$stageName"

@@ -1,4 +1,4 @@
-﻿/*
+/*
 * (C) 2018-2026 see Authors.txt
 *
 * This file is part of MPC-BE.
@@ -413,14 +413,8 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bConvertToSdr        = config.bConvertToSdr;
 	m_iSDRDisplayNits      = config.iSDRDisplayNits;
 	m_iDisplayTransfer    = config.iDisplayTransfer;
-	m_bDbleEnabled        = config.bDbleEnabled;
-	m_fDbleStrength       = config.fDbleStrength;
-	m_fDbleTriggerPct     = config.fDbleTriggerPct;
-	m_fDbleKnee           = config.fDbleKnee;
-	m_iDbleView           = config.iDbleView;
-	m_bDbleOsdEnabled     = config.bDbleOsd;
-	m_bDbleOsdPinned      = config.bDbleOsdPinned;
-	m_iDbleOsdSelected    = config.iDbleOsdSelected;
+	m_clipGuard           = config.clipGuard;
+	m_Dble.SetNativeSettings(m_clipGuard);
 	m_fHdrDisplayMinNits   = config.fHdrDisplayMinNits;
 	m_fHdrTitlePeakNits    = config.fHdrTitlePeakNits;
 	m_fHdrHableKnee        = config.fHdrHableKnee;
@@ -505,7 +499,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 		}
 		if (m_pMLDebugFile) {
 			if (fseek(m_pMLDebugFile, 0, SEEK_END) == 0 && ftell(m_pMLDebugFile) == 0) {
-				fwprintf(m_pMLDebugFile, L"# ml_debug.csv â€” MPCVR ML diagnostic log\n");
+				fwprintf(m_pMLDebugFile, L"# ml_debug.csv Ã¢â‚¬â€ MPCVR ML diagnostic log\n");
 			}
 			fwprintf(m_pMLDebugFile, L"# init (bMLEnabled=%d bMLDebug=%d)\n", (int)m_bML, (int)m_bMLDebug);
 				fwprintf(m_pMLDebugFile, L"# BUILD ZION-PIPE tag=skyMC-decouple-v3 person=perFrame skyMaxCad=5 personModel=yolo26n-seg_op21\n");
@@ -514,7 +508,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	}
 
 	// Deterministic ML init: load all models and face detection at construction
-	// time. No lazy/deferred loading â€” the .ax pays the cost upfront so that
+	// time. No lazy/deferred loading Ã¢â‚¬â€ the .ax pays the cost upfront so that
 	// enabling ML grade or switching video processors incurs zero delay.
 	m_bMLModelLoadTried = true;
 	m_bMLGammaModelLoaded     = m_MLGammaModel.Load(GetMLModelPath(L"xgb_gamma_model.plxgb").c_str());
@@ -531,7 +525,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	EXECUTE_ASSERT(m_bMLShadowModelLoaded);
 	EXECUTE_ASSERT(m_bMLHighlightModelLoaded);
 
-	// Face detection (YuNet) DISABLED â€” person instance masks replace it. The
+	// Face detection (YuNet) DISABLED Ã¢â‚¬â€ person instance masks replace it. The
 	// member stays NULL so every guarded block is inert; re-enable by restoring
 	// these lines and un-#if-0'ing the detect block in ExtractMLFeatures.
 #if 0
@@ -557,13 +551,13 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 			m_pSkySeg->GetLastError().c_str());
 		fflush(m_pMLDebugFile);
 	}
-	// Sky seg is optional â€” do not hard-fail the filter if the model is missing.
+	// Sky seg is optional Ã¢â‚¬â€ do not hard-fail the filter if the model is missing.
 	if (FAILED(hrSky) && m_pMLDebugFile) {
 		fwprintf(m_pMLDebugFile, L"INIT_SKY disabled (model load failed)\n");
 		fflush(m_pMLDebugFile);
 	}
 
-	// Person instance segmentation (yolo26n-seg, COCO class 0) â€” the continuity
+	// Person instance segmentation (yolo26n-seg, COCO class 0) Ã¢â‚¬â€ the continuity
 	// layer for skin protection. Ships re-stamped to opset 21 (the raw export is
 	// opset 22, rejected by the bundled ORT 1.21). Optional like sky.
 	m_pPersonSeg = std::make_unique<CPersonSeg>();
@@ -843,11 +837,15 @@ void CDX11VideoProcessor::ReleaseDevice()
 	ReleaseVP();
 	m_D3D11VP.ReleaseVideoDevice();
 
+	m_Dble.ReleaseDevice();
+	for (auto& t : m_DbleDelay) t.Release();
+	m_DbleDelayN = 0;
+	m_DbleDelayRing = 0;
+	m_DbleOut.Release();
 	m_StatsBackground.InvalidateDeviceObjects();
 	m_Font3D.InvalidateDeviceObjects();
-	m_DbleFont.InvalidateDeviceObjects();
-	m_dbleFontH = 0;
-	ReleaseDbleMeasure();
+	m_DbleRect.InvalidateDeviceObjects();
+	m_DbleQuad.InvalidateDeviceObjects();
 	m_Rect3D.InvalidateDeviceObjects();
 
 	m_Underlay.InvalidateDeviceObjects();
@@ -983,7 +981,7 @@ void CDX11VideoProcessor::ReleaseDevice()
 
 void CDX11VideoProcessor::ReleaseSwapChain()
 {
-	m_pFilter->LogLine("renderer: ReleaseSwapChain â€” tearing the swap chain down%s",
+	m_pFilter->LogLine("renderer: ReleaseSwapChain Ã¢â‚¬â€ tearing the swap chain down%s",
 		m_pDXGISwapChain1 ? "" : " (nothing to release)");
 	if (m_pDXGISwapChain1) {
 		m_pDXGISwapChain1->SetFullscreenState(FALSE, nullptr);
@@ -1019,6 +1017,11 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	}
 	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
 		nSteps++; // P0 bar repaint
+	}
+	// ClipGuard pass: counted whenever it is ready, so the ring is sized for it.
+	// When the fix is off it draws an exact copy.
+	if (m_Dble.Ready()) {
+		nSteps++;
 	}
 	if (m_pPSHalfOUtoInterlace) {
 		nSteps++;
@@ -1122,7 +1125,7 @@ void CDX11VideoProcessor::SetShaderConvertColorParams()
 }
 
 // ---------------------------------------------------------------------------
-// Experimental tone mapping â€” ported from libplacebo src/tone_mapping.c
+// Experimental tone mapping Ã¢â‚¬â€ ported from libplacebo src/tone_mapping.c
 //
 // libplacebo builds a 1D tone-curve LUT on the CPU and the shader SAMPLES it,
 // instead of evaluating a curve per pixel. That is both cheaper and better:
@@ -1130,7 +1133,7 @@ void CDX11VideoProcessor::SetShaderConvertColorParams()
 // tunable parameter rather than being one fixed shape.
 //
 // Only what this port needs is here, and it lives entirely apart from the
-// shipped tone mapping â€” selecting none of these leaves that path bit-identical.
+// shipped tone mapping Ã¢â‚¬â€ selecting none of these leaves that path bit-identical.
 // Where this and upstream disagree, UPSTREAM IS RIGHT: it is the reference.
 //
 // The scene statistics it needs are already computed per frame for the Zion
@@ -1141,7 +1144,7 @@ void CDX11VideoProcessor::SetShaderConvertColorParams()
 // Entries in the experimental tone curve. libplacebo defaults to 256 and allows
 // up to 4096; 1024 keeps the 4 KB upload trivial while leaving the interpolated
 // curve indistinguishable from the closed form. Must match TONE_LUT_SIZE in the
-// converter shaders â€” the shader takes it from the constant buffer so the two
+// converter shaders Ã¢â‚¬â€ the shader takes it from the constant buffer so the two
 // cannot silently disagree.
 static constexpr int kToneLutSize = 1024;
 
@@ -1179,13 +1182,13 @@ static float LinearNitsToPq(float y) {
 	return powf((c1 + c2 * y) / (1.0f + c3 * y), m2);
 }
 
-// PL_HDR_PQ code values â€” NOT nits. This is load-bearing: the spline's
+// PL_HDR_PQ code values Ã¢â‚¬â€ NOT nits. This is load-bearing: the spline's
 // `scaling` is PL_HDR_PQ and libplacebo's own colour-mapping shader sets
 // `input_scaling`/`output_scaling` to PL_HDR_PQ too (src/shaders/colorspace.c),
 // so the table's index axis, its values, and every param below live in PQ.
 // Its ML feature extractor does the same (src/ml_render.c feeds the spline
-// `features[0]`/`features[1]` â€” the same two numbers this renderer's extractor
-// produces â€” with no rescale at all).
+// `features[0]`/`features[1]` Ã¢â‚¬â€ the same two numbers this renderer's extractor
+// produces Ã¢â‚¬â€ with no rescale at all).
 //
 // Running the same math in nits instead looks equivalent and is not: the pivot
 // and the knee are picked by interpolation along the index axis, so the axis
@@ -1256,7 +1259,7 @@ static void St2094PickKnee(float* out_src, float* out_dst, const Params& p) {
 }
 
 // libplacebo spline(): the function's `map`, operating IN PLACE on a table of PQ
-// values. Single-pivot polynomial â€” quadratic below the pivot, cubic above,
+// values. Single-pivot polynomial Ã¢â‚¬â€ quadratic below the pivot, cubic above,
 // solved so the slope matches through the knee. Do not "simplify" the PQ away:
 // it is the domain libplacebo solves in, and the curve shape depends on it.
 static void SplineMap(float* lut, int n, const Params& p) {
@@ -1274,7 +1277,7 @@ static void SplineMap(float* lut, int n, const Params& p) {
 	// actual luminance range). Here input_max/output_max are PQ CODES (the index axis),
 	// and PQ is perceptual: 1000/85 nits is a ratio of ~11.8 but their PQ codes ratio to
 	// ~0.24. Feeding the PQ ratio collapsed slope_tuning's exponent to ~0.08, so
-	// slope = pow(linear_slope, ~0.08) â‰ˆ 1 â€” a near-1:1 PQ map that LIFTS the shadows
+	// slope = pow(linear_slope, ~0.08) Ã¢â€°Ë† 1 Ã¢â‚¬â€ a near-1:1 PQ map that LIFTS the shadows
 	// (the high black floor), and left both `contrast` and the pivot dial with almost no
 	// leverage (their effect rides on that exponent). Convert to nits for the ratio only;
 	// the index axis stays PQ (that is what the knee interpolation needs).
@@ -1307,7 +1310,7 @@ static void SplineMap(float* lut, int n, const Params& p) {
 }
 
 // pl_tone_map_generate() for the spline. The index axis is uniform in PQ over
-// [input_min, input_max] and each entry is the output in PQ â€” exactly what
+// [input_min, input_max] and each entry is the output in PQ Ã¢â‚¬â€ exactly what
 // libplacebo builds when input_scaling/output_scaling are PL_HDR_PQ, which is
 // how both its colour-mapping shader and its ML extractor call it.
 //
@@ -1316,7 +1319,7 @@ static void SplineMap(float* lut, int n, const Params& p) {
 // shader's plain `pow(v, 1/2.2)` encodes, and it has to be this rather than
 // absolute light for a panel that has a black offset.
 //
-// A projector's response is L = Lb + (Lw - Lb)*v^gamma â€” the offset is IN the
+// A projector's response is L = Lb + (Lw - Lb)*v^gamma Ã¢â‚¬â€ the offset is IN the
 // panel, which is what "black output offset 100%" in a calibration report means.
 // Handing the shader absolute light (nits/Lw) makes the encode add that offset a
 // second time: source black came out at code 15 instead of code 0, i.e. exactly
@@ -1336,7 +1339,7 @@ static void SplineLut(float* out, int n, Params p) {
 
 	// Sanitize outputs, adapt back out of the function's scaling, and convert to
 	// display-relative. The subtraction uses the SAME clamp bounds the sanitize
-	// does, so entry 0 lands on exactly 0.0 and the last entry on exactly 1.0 â€”
+	// does, so entry 0 lands on exactly 0.0 and the last entry on exactly 1.0 Ã¢â‚¬â€
 	// the two codes that must be right for black and white to land where the
 	// calibration measured them.
 	const float outMinNits = PqToLinearNits(p.output_min);
@@ -1414,7 +1417,7 @@ bool CDX11VideoProcessor::MLInputIsPq() const
 	// The ML passes read the POST-correction texture (pInputTexture), so PQ
 	// survives only if the correction left it alone. On the DeckLink path with
 	// Convert to SDR OFF that correction is "Fix BT.2020", which passes PQ
-	// through while the swap chain stays SDR â€” so the old swap-chain test said
+	// through while the swap chain stays SDR Ã¢â‚¬â€ so the old swap-chain test said
 	// "gamma 2.2" and ps_ml_gamma decoded PQ with pow(x, 2.2).
 	return (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
 		|| ((m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084) && !IsPqToSdrSelected());
@@ -1447,11 +1450,11 @@ void CDX11VideoProcessor::UpdateCorrectionShader()
 							|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_240M;
 
 	if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) && m_bConvertToSdr) {
-		// IsPqSupported() asks whether the HARDWARE VP can emit PQ â€” which decides
+		// IsPqSupported() asks whether the HARDWARE VP can emit PQ Ã¢â‚¬â€ which decides
 		// the correction shader's INPUT on the VP path. On the TexVP path (no VP:
 		// P210 and friends) the converter override in UpdateConvertColorShader
 		// hands over raw PQ codes regardless, so the full fork converter (curve
-		// selection, exposure trim, GT7 â€” everything the fixconvert variant lacks)
+		// selection, exposure trim, GT7 Ã¢â‚¬â€ everything the fixconvert variant lacks)
 		// is the matching shader; picking fixconvert there left sdrNits working
 		// and every other dial inert (measured 2026-10-24).
 		const bool bInputIsPqCodes = !m_D3D11VP.IsReady() || m_D3D11VP.IsPqSupported();
@@ -1494,7 +1497,7 @@ void CDX11VideoProcessor::UpdateCorrectionShader()
 // its placement by), the GT7 fade reference, and PredictGt7* (the CPU model that must
 // "stay in step with the shader") are all the same 2^(trim/3), thirds of a stop over
 // -3..+3. A copy that drifts is exactly how the fade reference came to model a curve that
-// was not the one running â€” and the visible result was the chroma fade eating the
+// was not the one running Ã¢â‚¬â€ and the visible result was the chroma fade eating the
 // highlight cores.
 static float Gt7TrimGain(int trimSteps)
 {
@@ -1507,19 +1510,19 @@ static float Gt7Reach(float alpha);
 
 void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 {
-	// [0] LuminanceScale â€” PQ decode scale, 10000/sdrNits, so 1.0 == sdrNits nits
-	// [1] displayMinNits â€” the display's measured black. Was an unused zero; the
+	// [0] LuminanceScale Ã¢â‚¬â€ PQ decode scale, 10000/sdrNits, so 1.0 == sdrNits nits
+	// [1] displayMinNits Ã¢â‚¬â€ the display's measured black. Was an unused zero; the
 	//     PQ->SDR converter now builds its curve over [floor, 1] and puts the
 	//     floor back on the output, so the shadow end lands in the range the
 	//     panel can actually show instead of inside a band it renders as one black.
-	// [2] outputGamut â€” 0 converts BT.2020->BT.709, 1 keeps BT.2020 so a wider-than-
+	// [2] outputGamut Ã¢â‚¬â€ 0 converts BT.2020->BT.709, 1 keeps BT.2020 so a wider-than-
 	//     Rec.709 display can show the source's real colour. Read only by the
 	//     PQ/HLG->SDR converters; the other correction shaders ignore the slot.
-	// [3] toneLutEnable â€” 0 = the shipped tone mapping, 1 = sample the experimental
+	// [3] toneLutEnable Ã¢â‚¬â€ 0 = the shipped tone mapping, 1 = sample the experimental
 	//     1D curve. Read only by the PQ/HLG->SDR converters.
-	// [4] toneLutPqMin â€” the curve's index axis, in PQ code values
+	// [4] toneLutPqMin Ã¢â‚¬â€ the curve's index axis, in PQ code values
 	// [5] toneLutPqMax
-	// [6] toneLutSize â€” entries in m_pToneLut. The shader samples texel CENTRES,
+	// [6] toneLutSize Ã¢â‚¬â€ entries in m_pToneLut. The shader samples texel CENTRES,
 	//     so it needs N to map [0,1] onto them; passing it keeps the two sides
 	//     from drifting if the texture size is ever changed.
 	// [7] unused
@@ -1527,27 +1530,27 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 	// Slots 3..6 are new. The other correction shaders declare only three floats,
 	// so their reads are unaffected by the larger buffer.
 	//
-	// [8] toneCurveSelection â€” the "Tone curve" choice (iHdrLocalToneMappingType,
+	// [8] toneCurveSelection Ã¢â‚¬â€ the "Tone curve" choice (iHdrLocalToneMappingType,
 	//     1..6). This is the value the panel has always set; the converter used to
 	//     ignore it and call ToneMappingHable unconditionally, so the row changed
 	//     nothing on an SDR display. 0 and 3 both mean the legacy Hable.
 	// [9..12] HDR10 static metadata for the curves that derive a knee from it.
 	//     Same fallbacks SetHDR10ShaderParams applies, so the HDR-output path and
 	//     the SDR path see the same numbers for the same content. All zero on the
-	//     DeckLink capture path â€” the card's ST.2086 frame metadata is unsupported
-	//     on HDMI â€” so in practice the fallback peak (1000 nits) is what is used.
+	//     DeckLink capture path Ã¢â‚¬â€ the card's ST.2086 frame metadata is unsupported
+	//     on HDMI Ã¢â‚¬â€ so in practice the fallback peak (1000 nits) is what is used.
 	// [13] per-scene Hable peak   [14] Hable knee   [15] spare
 	// [16..18] mobius coefficients for the curve that takes over above the knee
-	// [19] padding â€” cbuffers must stay 16-byte aligned
+	// [19] padding Ã¢â‚¬â€ cbuffers must stay 16-byte aligned
 	// [19] the Hable curve's 1.0 in nits (decoupled reference white).
 		// [20] the nonlinear chroma compensation exponent (hableChromaExp).
 		// [21..23] the GT7 operator's blend + chroma-fade window (selection 8).
 		// [24]     the GT7 Adapt scene-peak weight (selection 10).
 		// cbuffer ByteWidth MUST stay a multiple of 16 bytes (84 vs 96 is the
-		// difference between a valid and a FAILED CreateBuffer â€” observed as a black
+		// difference between a valid and a FAILED CreateBuffer Ã¢â‚¬â€ observed as a black
 		// picture whenever the buffer grew to 21 floats). The array has grown 24 -> 28
 		// -> 32 floats (96 -> 112 -> 128 bytes), each time landing exactly on a 16-byte
-		// multiple as the old comment prescribed â€” never on 25/26/27 or 29/30/31.
+		// multiple as the old comment prescribed Ã¢â‚¬â€ never on 25/26/27 or 29/30/31.
 		// 40 floats / 160 bytes. Grown from 36 for the identity transfer's configured
 		// peak; the 16-byte multiple rule is what keeps D3D11 from rejecting the buffer.
 		FLOAT cbuffer[40] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
@@ -1568,17 +1571,17 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// The content peak comes from real metadata when there is any, and from the
 		// user's Title peak otherwise. On the DeckLink capture path there never is:
 		// the card's ST.2086 frame metadata is unsupported on HDMI and the values
-		// arrive as media SIDE data, which a captured frame does not carry â€” so
+		// arrive as media SIDE data, which a captured frame does not carry Ã¢â‚¬â€ so
 		// m_lastHdr10 stays zeroed and the control is what the curves actually get.
 		//
 		// FILE content has the opposite problem, measured 2026-09-26: on an SDR
 		// display m_lastHdr10 is NEVER written (it only lands when an HDR10 swapchain
-		// is live â€” see the side-data snapshot comment ~line 5025), yet the sample's
+		// is live Ã¢â‚¬â€ see the side-data snapshot comment ~line 5025), yet the sample's
 		// metadata DOES arrive and is snapshotted into the display-independent
 		// m_hdr10Cll/Fall/Mmax/Mmin (the very numbers the pipeline echo prints as
 		// rcll=991 etc). The code below used to fall straight to
 		// m_lastHdr10(=0) -> titlePeak(=100), so GT7's adapted gain divided by 100
-		// instead of 991 and "every source pixel above ~101 nits hit the clamp" â€”
+		// instead of 991 and "every source pixel above ~101 nits hit the clamp" Ã¢â‚¬â€
 		// the blown picture persisted no matter what the dials said.
 		const float titlePeak = std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f);
 		// Display-independent snapshots first; m_lastHdr10 next (an HDR10 swapchain
@@ -1610,7 +1613,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		//
 		// GT7 Adapt blends two estimates of ONE quantity: the metadata's MaxCLL and the
 		// extractor's measured scene peak. The user's dial sets how much the measurement
-		// gets â€” but that question only has a meaning when there IS a second estimate to
+		// gets Ã¢â‚¬â€ but that question only has a meaning when there IS a second estimate to
 		// weigh it against. When the signal carries no static metadata at all, `cll` above
 		// is not an estimate of anything: it is the Title peak dial (default 1000, floor
 		// 100) wearing the metadata's clothes.
@@ -1618,7 +1621,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// Measured on Dolby Vision P7 from an Oppo (Gladiator 2 language menu):
 		// `sdata=0 cll=0 mmax=0` with the dial at 100, so the shader computed
 		//     lerp(100, ~1000, 0.25) = 325
-		// and the top two thirds of the highlight range slammed into the clamp â€” the exact
+		// and the top two thirds of the highlight range slammed into the clamp Ã¢â‚¬â€ the exact
 		// failure this blend's own comment warns about ("a peak too LOW slams the top into
 		// the clamp"). A fallback default is not a measurement, and it must not receive
 		// confidence weight against one.
@@ -1626,7 +1629,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// REVERTED 2026-10-04 (option B): the weight is no longer forced to 1.0 when the
 		// signal carries no metadata. Forcing it made the gain divisor the fast peak ALONE,
 		// which maximised the sensitivity of a whole-image quantity to the noisiest statistic
-		// in the system â€” every flare, every fade, every grain excursion became a global
+		// in the system Ã¢â‚¬â€ every flare, every fade, every grain excursion became a global
 		// brightness move. That is what "the adapt jumps crazily" was.
 		//
 		// The stability now comes from the FLOOR below instead: the metadata/dial peak is a
@@ -1640,9 +1643,9 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// adapted number. But every CPU-side prediction has to use the number the shader
 		// used: publishing the un-adapted cll here made auto-exposure's refWhite and the
 		// band controller's anchor prediction solve against a peak that no longer exists
-		// the moment the blend is non-zero â€” which is why the two could disagree with the
+		// the moment the blend is non-zero Ã¢â‚¬â€ which is why the two could disagree with the
 		// picture on screen while each of them was individually self-consistent.
-		// The placement peak, and it must match the shader's expression EXACTLY â€” this is
+		// The placement peak, and it must match the shader's expression EXACTLY Ã¢â‚¬â€ this is
 		// the number auto-exposure and the band controller solve against, and any drift
 		// between the two is the disagreement that previously showed up as the picture and
 		// the model each being self-consistent but not each other.
@@ -1687,7 +1690,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// display's white). cbuffer[16..18]: the mobius coefficients for the curve
 		// that takes over ABOVE it.
 		//
-		// With the knee OFF (0) Hable applies unchanged â€” exactly the behaviour it
+		// With the knee OFF (0) Hable applies unchanged Ã¢â‚¬â€ exactly the behaviour it
 		// has always had, and the reason the curve is worth keeping: it protects
 		// highlights. With the knee ON, the curve above it is a SOLVED rational:
 		//
@@ -1695,7 +1698,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		//
 		// so the joint at the knee is smooth BY CONSTRUCTION rather than by a blend
 		// band. That matters because a blend band shows its mismatch, and it would
-		// show it most when the knee MOVES â€” which is the whole point of a knee.
+		// show it most when the knee MOVES Ã¢â‚¬â€ which is the whole point of a knee.
 		//
 		// Hable itself cannot be joined this way. It is concave everywhere, so
 		// identity (slope 1) meets it only at the origin and no positive knee can be
@@ -1703,7 +1706,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// is why libplacebo solves mobius this way and why its spline family is
 		// joinable while Hable is not. (Solve from libplacebo tone_mapping.c.)
 		//
-		// Three divides, run when the knee or the measured peak moves â€” never per
+		// Three divides, run when the knee or the measured peak moves Ã¢â‚¬â€ never per
 		// pixel.
 		// cbuffer[14]: the Hable reserved knee slot (kept, unused since the mobius
 		// knee was removed). cbuffer[15..17]: the soft-plus pre-compressor.
@@ -1729,10 +1732,10 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		// master's peak is PLACED on the curve (peak cancels out of 2.2*refWhite/peak x
 		// peak, so that top is a property of the dial, not of the content). GT7's
 		// shoulder reaches Gt7Reach(alpha) x the ceiling and then min(blended, ceiling)
-		// flattens everything above â€” so a refWhite past the reach does not brighten the
+		// flattens everything above Ã¢â‚¬â€ so a refWhite past the reach does not brighten the
 		// picture, it deletes the highlights. Measured at the user's settings
 		// (refWhite 203.8, sdrNits 127, alpha 0.10): placement top 448 adapted nits
-		// against a wall at 237, which is why only explosions show it â€” they are the only
+		// against a wall at 237, which is why only explosions show it Ã¢â‚¬â€ they are the only
 		// content that lives where the curve has stopped.
 		//
 		// The auto solver already refused to demand more than the reach allows (see the
@@ -1743,7 +1746,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		//
 		// Deliberately NOT relaxed by the pre-compressor's authority, even though at
 		// softKnee 0.21 / ratio 2.0 it pulls that 448 down to ~240. The compressor is a
-		// dial (softKnee <= 0 disables it â€” a trap this project has already documented),
+		// dial (softKnee <= 0 disables it Ã¢â‚¬â€ a trap this project has already documented),
 		// so a bound that relies on it is not a bound.
 		if (bGt7Family) {
 			m_fRefWhiteCeil = Gt7Reach(m_fHdrGt7Alpha) * (float)m_iSDRDisplayNits
@@ -1759,21 +1762,21 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		cbuffer[20] = m_fHdrChromaExp;
 
 		// [21..23] the GT7 operator's two knobs (selection 8). These were the three
-		// pad slots, so the buffer is STILL 24 floats / 96 bytes â€” no growth, and no
+		// pad slots, so the buffer is STILL 24 floats / 96 bytes Ã¢â‚¬â€ no growth, and no
 		// repeat of the 21-float (84-byte) CreateBuffer failure that produced a black
 		// picture with nothing on screen to explain it. The NEXT field added here has
-		// to take the array to 28, never 25/26/27 â€” which is what happened here.
+		// to take the array to 28, never 25/26/27 Ã¢â‚¬â€ which is what happened here.
 		cbuffer[21] = m_fHdrGt7Blend;
 		cbuffer[22] = m_fHdrGt7FadeStart;
 		cbuffer[23] = m_fHdrGt7FadeEnd;
 		// [24] GT7 Adapt (selection 10): weight of the measured scene peak in the
-		// peak the curve maps FROM. Harmless for every other selection â€” only the
+		// peak the curve maps FROM. Harmless for every other selection Ã¢â‚¬â€ only the
 		// GT7 branch reads it, and only when the selection is 10.
 		// The EFFECTIVE weight, not the dial: with no metadata to weigh against, the
 		// measurement takes the whole vote (see bPeakFromMeta above).
 		cbuffer[24] = m_fGt7AdaptEff;
 		// [25] the shoulder's reach (GT7_ALPHA). Takes a padding slot, so the buffer
-		// stays 28 floats / 112 bytes â€” no alignment risk.
+		// stays 28 floats / 112 bytes Ã¢â‚¬â€ no alignment risk.
 		cbuffer[25] = m_fHdrGt7Alpha;
 		cbuffer[26] = m_fHdrGt7Desat;   // luminance-linked chroma compression
 		cbuffer[27] = m_fGamutCap;      // 709 capacity target for the gamut mapping
@@ -1796,7 +1799,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		cbuffer[33] = m_bDynValid ? m_fDynP : 1.0f;   // toe exponent, slot 33's padding
 
 		// (The DV identity transfer and its cbuffer slots 34/35 were removed here: DV is
-		// one case now â€” Hable plus the taste controls â€” whether it arrives from an
+		// one case now Ã¢â‚¬â€ Hable plus the taste controls Ã¢â‚¬â€ whether it arrives from an
 		// external player or from a file. The user's A/B across DV content settled it;
 		// d96afab retains the transfer if it is ever wanted back.)
 		// Precomputed 2^(trim/3) so the shader does one multiply, not a pow per pixel.
@@ -1814,7 +1817,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 		//     ceilNits = (hableCeilNits > 10.0) ? hableCeilNits : (4.8 * sdrNits)
 		// and on a metadata-free source those two differ by 6x: cll has already fallen
 		// back through mMax to the Title-peak dial (floor 100), while the shader uses
-		// 4.8 x sdrNits â€” 610 at a 127-nit target. Feeding the fallback to the model made
+		// 4.8 x sdrNits Ã¢â‚¬â€ 610 at a 127-nit target. Feeding the fallback to the model made
 		// the band controller normalise its relative anchors by 100 nits while the curve
 		// spread the range across 610, which is the disagreement the GT7 peak publish
 		// above exists to prevent, arriving on the other curve.
@@ -1884,7 +1887,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 
 // Display calibration LUT. Text format per the .cube spec (Adobe/Resolve/Argyll):
 //   LUT_3D_SIZE N            N^3 entries, red varying fastest
-//   DOMAIN_MIN / DOMAIN_MAX  (assumed 0..1 â€” the only range DisplayCAL emits)
+//   DOMAIN_MIN / DOMAIN_MAX  (assumed 0..1 Ã¢â‚¬â€ the only range DisplayCAL emits)
 //   then N^3 "r g b" float rows
 // A 1D shaper (LUT_1D_SIZE) is ignored in v1; DisplayCAL's 3D-only exports have none.
 HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
@@ -1897,7 +1900,7 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 
 	if (!utf8Path || !utf8Path[0]) {
 		DLog(L"CDX11VideoProcessor::LoadCubeLut() : cleared (no path)");
-		// S_OK: the requested end state â€” no LUT â€” is exactly what we now have.
+		// S_OK: the requested end state Ã¢â‚¬â€ no LUT Ã¢â‚¬â€ is exactly what we now have.
 		// S_FALSE here would be indistinguishable from a bad file to the caller.
 		return S_OK;
 	}
@@ -2000,7 +2003,7 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 }
 
 // The experimental tone curve. libplacebo builds its tone LUT on the CPU once
-// per parameter change and lets the shader sample it â€” complex curves become
+// per parameter change and lets the shader sample it Ã¢â‚¬â€ complex curves become
 // practical, and each curve carries a tunable parameter instead of being one
 // fixed shape. The scene statistics that drive it (features[0] = maxscl,
 // features[1] = average, both in PQ) are the ones the Zion grade already
@@ -2009,7 +2012,7 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 // The two IIR-smoothed inputs are the curve's dynamic part: the spline picks its
 // pivot from the scene average, so an unsmoothed average makes the curve flicker
 // on noise. The smoothing anchor is the same scene-jump test the gamma filter
-// uses (a change in maxscl beyond 0.15 PQ is a cut, not a drift) â€” one policy
+// uses (a change in maxscl beyond 0.15 PQ is a cut, not a drift) Ã¢â‚¬â€ one policy
 // for "has the scene changed", not two that can disagree.
 void CDX11VideoProcessor::UpdateToneLut()
 {
@@ -2021,7 +2024,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 	const float featAvg = m_MLFeatures[1];
 
 	// The published cut flag first, the maxscl jump as a backstop. The old test alone
-	// was 0.15 in PQ CODES â€” about two stops where film peaks live â€” so an ordinary
+	// was 0.15 in PQ CODES Ã¢â‚¬â€ about two stops where film peaks live Ã¢â‚¬â€ so an ordinary
 	// cut never tripped it and the spline's pivot glided to the new scene over ~10
 	// frames. Read one frame late here (this runs before the anchor block restates the
 	// flag), which costs a single frame of a half-second ramp: nothing.
@@ -2035,7 +2038,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 		m_MLToneAvgSmooth = 0.10f * featAvg + 0.90f * m_MLToneAvgSmooth;
 	}
 
-	// The display's measured range. This IS the curve's output range â€” that is the
+	// The display's measured range. This IS the curve's output range Ã¢â‚¬â€ that is the
 	// whole point of feeding the mapper display black and white.
 	//
 	// `iSDRDisplayNits` is the white in NITS. Do not compute 10000/sdrNits here:
@@ -2052,8 +2055,8 @@ void CDX11VideoProcessor::UpdateToneLut()
 	//
 	// This is the one place where following the measured statistics would be
 	// wrong, and it is worth being explicit about why. libplacebo takes input_max
-	// from the source colour space's nominal luma â€” the declared peak (MaxCLL, or
-	// the mastering display peak) â€” and takes only input_avg from dynamic
+	// from the source colour space's nominal luma Ã¢â‚¬â€ the declared peak (MaxCLL, or
+	// the mastering display peak) Ã¢â‚¬â€ and takes only input_avg from dynamic
 	// per-scene metadata. Feeding the MEASURED peak in instead stretches every
 	// scene to fill the display: a 40-nit night scene and a 1000-nit daylight
 	// scene would come out the same brightness, which is auto-gain, not tone
@@ -2063,7 +2066,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 	// 1000 nits is libplacebo's own fallback for HDR10 with no usable metadata
 	// (see pl_color_space_nominal_luma and the SetHDR10ShaderParams guard below,
 	// which substitutes 1000 for anything <= 10). The Title peak control replaces
-	// it when the user knows better â€” and on this capture path they may be the only
+	// it when the user knows better Ã¢â‚¬â€ and on this capture path they may be the only
 	// source of the value, since the card cannot supply MaxCLL.
 	key.pqMax     = exptm::LinearNitsToPq(std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f));
 	key.pqAvg     = m_MLToneAvgSmooth;   // measured: this is the pivot's input
@@ -2079,7 +2082,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 	//
 	// The rate limit has to be on TIME rather than on the size of the change: the
 	// IIR steps ~2/1000 PQ per frame, so any deadband small enough to be invisible
-	// is also small enough to be cleared every frame â€” measured at 24 rebuilds/s
+	// is also small enough to be cleared every frame Ã¢â‚¬â€ measured at 24 rebuilds/s
 	// with a 2/1000 deadband, i.e. no throttling at all. One rebuild every 6th
 	// frame, plus an immediate one on a cut or a config change, keeps the curve
 	// responsive for a quarter of the cost.
@@ -2113,14 +2116,14 @@ void CDX11VideoProcessor::UpdateToneLut()
 	p.spline_contrast = key.contrast;
 
 	exptm::InferParams(p);
-	// InferParams can lift input_max, so publish the INFERRED axis â€” the shader
+	// InferParams can lift input_max, so publish the INFERRED axis Ã¢â‚¬â€ the shader
 	// indexes with these, and an axis that disagrees with the table mis-maps the
 	// whole curve while still looking like a plausible picture.
 	key.pqMax = p.input_max;
 
 	std::vector<float> table(kToneLutSize);
 	// Display-relative (0 = the display's black, 1 = its white), which is what the
-	// shader's plain pow(v, 1/2.2) encodes â€” see SplineLut().
+	// shader's plain pow(v, 1/2.2) encodes Ã¢â‚¬â€ see SplineLut().
 	exptm::SplineLut(table.data(), kToneLutSize, p);
 
 	if (!m_pToneLut) {
@@ -2176,7 +2179,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 	m_ToneLutKey = key;
 	m_nToneLutBuilds++;
 	// The curve's axis lives in the correction cbuffer, which is only re-uploaded
-	// by SetShaderLuminanceParams â€” push it so a scene change takes effect on this
+	// by SetShaderLuminanceParams Ã¢â‚¬â€ push it so a scene change takes effect on this
 	// frame rather than at the next unrelated settings change.
 	SetShaderLuminanceParams();
 
@@ -2386,7 +2389,7 @@ static inline float smoothstepf2(float e0, float e1, float x)
 // owns the shadow band through the additive pedestal instead, because a gain cannot
 // lift a pixel that is already at zero).
 //   w  = linear fraction of white delivered by the tone curve
-//   x  = PQ(I) / 0.5893       (I_norm: the grade's ACTUAL domain â€” a normalised PQ
+//   x  = PQ(I) / 0.5893       (I_norm: the grade's ACTUAL domain Ã¢â‚¬â€ a normalised PQ
 //                              code, NOT a linear fraction. ps_ml_gamma divides
 //                              ictcp.x by SDR_I_PEAK_PQ = 0.5893, the PQ code of 203
 //                              nits. Mirroring this in linear space made the solver
@@ -2401,7 +2404,7 @@ static inline float smoothstepf2(float e0, float e1, float x)
 // grey and veils the picture (measured by eye as "a grey layer on top" of a dark tent
 // interior), because it adds the same amount to a pixel at 0 and to one at 0.01 and so
 // cannot reveal detail that sits near the floor. A power below the knee keeps 0 at 0
-// and the knee fixed while expanding everything between in log â€” the code span dark
+// and the knee fixed while expanding everything between in log Ã¢â‚¬â€ the code span dark
 // detail occupies moves up out of the invisible floor with its contrast intact.
 // baseG/baseR are the model grade's own gamma and rolloff. The controller solves for
 // CORRECTIONS on top of them, not replacements: on a dark scene every anchor sits
@@ -2438,7 +2441,7 @@ static float GradeChainDelivered(float w, float S, float G, float R,
 }
 
 // Joint solve: three band targets (delivered linear fractions of white) in, the three
-// actuator values out. Coordinate-descent Newton on the analytic chain â€” each actuator
+// actuator values out. Coordinate-descent Newton on the analytic chain Ã¢â‚¬â€ each actuator
 // is monotone in its own band, so per-anchor secant steps converge in a handful of
 // iterations.
 //
@@ -2586,7 +2589,7 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 // CPU mirror of the GT7 path in ps_convert_pq_to_sdr.hlsl / convert/gt7_tonemap.hlsl:
 // for one SOURCE luminance in nits, return the ENCODED (gamma-2.2, 0..1) value the
 // correction pass will hand to the grade. This is what lets the grade know what the
-// curve is about to deliver without measuring anything â€” the curve is closed-form
+// curve is about to deliver without measuring anything Ã¢â‚¬â€ the curve is closed-form
 // and every input to it is already on this side of the API.
 //
 // The constants MUST stay in step with the shader. If GT7_ALPHA, GT7_LINEAR_SECTION
@@ -2610,7 +2613,7 @@ static float PredictGt7RelLinear(float srcNits, float refWhiteNits, float peakNi
 	// belongs in the shader's: the placement IS the gain. Left out, this model would
 	// predict the curve without the lift the curve is actually applying, and the
 	// mid-tone solve that consumes it would push gamma to correct an error that is not
-	// on screen â€” fighting the user's exposure dial by a factor that scales with trim.
+	// on screen Ã¢â‚¬â€ fighting the user's exposure dial by a factor that scales with trim.
 	// The comment above ("the constants MUST stay in step with the shader") is the same
 	// rule, and the fade reference in the shader is the first casualty of ignoring it.
 	const float gain = kGT7RangeFit * refWhiteNits / peakNits * trimGain;
@@ -2627,7 +2630,7 @@ static float PredictGt7RelLinear(float srcNits, float refWhiteNits, float peakNi
 		out = kA + kB * expf(x * kC);                  // the exponential shoulder
 	} else {
 		out = x;      // GT7_TOE_STRENGTH is 1.0 in this port, so the toe branch IS
-		              // identity â€” which is why this prediction is simple.
+		              // identity Ã¢â‚¬â€ which is why this prediction is simple.
 	}
 	out = fminf(out, ceilingNits);                     // min(blended, ceiling), as GT does
 	return fmaxf(out / ceilingNits, 0.0f);             // linear fraction of white
@@ -2655,7 +2658,7 @@ float CDX11VideoProcessor::PredictDeliveredRelLinear(float srcNits) const
 	case TONE_CURVE_REFERENCE:
 		// Exactly the shader's order: the trim multiplies the input BEFORE the curve
 		// (a display-referred Hable absorbs it in the shoulder), and the divisor is the
-		// ceiling the shader will use â€” m_fHableCeilNits, not the raw metadata value.
+		// ceiling the shader will use Ã¢â‚¬â€ m_fHableCeilNits, not the raw metadata value.
 		// Clamped to 1.0 because that is what the shader's own headroom fit plus
 		// saturate() do to anything above the ceiling.
 		{
@@ -2670,8 +2673,8 @@ float CDX11VideoProcessor::PredictDeliveredRelLinear(float srcNits) const
 		// ACES / Reinhard / Mobius / BT.2390 / ST.2094 / spline / dynamic have no CPU
 		// model. Returning 0 would pin every band target to white and hand the controller
 		// full authority over a picture it cannot see, so the GT7 shape is used as the
-		// reference model on those curves. They are not supported shipping surfaces â€”
-		// the rail offers Unplugged and GT7 Adapt â€” and this is where to look first if
+		// reference model on those curves. They are not supported shipping surfaces Ã¢â‚¬â€
+		// the rail offers Unplugged and GT7 Adapt Ã¢â‚¬â€ and this is where to look first if
 		// one of them ever starts behaving oddly with the grade on.
 		return PredictGt7RelLinear(srcNits, m_fEffRefWhite, m_fCurvePeakNits, sdrN,
 		                           m_fHdrGt7Alpha, trimG);
@@ -2684,7 +2687,7 @@ float CDX11VideoProcessor::PredictDeliveredEncoded(float srcNits) const
 }
 
 
-// Where GT7's shoulder lands on the ceiling, as a multiple of it â€” the CPU mirror of
+// Where GT7's shoulder lands on the ceiling, as a multiple of it Ã¢â‚¬â€ the CPU mirror of
 // the algebra in gt7_tonemap.hlsl (solve shoulder(x) = peak for x/peak). 1.47 at
 // alpha 0.25, 1.87 at 0.10, 2.67 at 0.02. This is the most exposure the curve can
 // carry before highlights flatten, so it is the only honest upper bound on refWhite.
@@ -2697,7 +2700,7 @@ static float Gt7Reach(float alpha)
 }
 
 // Median of a small window, by insertion sort into a local copy. kShotHist is 8, so
-// this is a handful of compares per cut â€” never per pixel, never per frame.
+// this is a handful of compares per cut Ã¢â‚¬â€ never per pixel, never per frame.
 //
 // A median and not a mean BECAUSE of what a shot ensemble contains: a montage of
 // matched coverage will include the odd insert or lens flare that is nothing like
@@ -2719,7 +2722,7 @@ static float MedianOf(const float* v, int n)
 }
 
 // -----------------------------------------------------------------------------
-// THE DYNAMIC & AUTO CURVE â€” one solved transfer function instead of a chain of
+// THE DYNAMIC & AUTO CURVE Ã¢â‚¬â€ one solved transfer function instead of a chain of
 // scalars that each secretly implement part of one.
 //
 //     code(nits) = 1 - exp( -k * (nits / x0)^g )
@@ -2733,7 +2736,7 @@ static float MedianOf(const float* v, int n)
 //       of this shape and dividing the two equations leaves
 //           g = ln( ln(1/(1-M995)) / ln(1/(1-M50)) ) / ln( p99.5 / p50 )
 //       so a narrow-range interior gets g near 1 and a night scene with a lamp gets a
-//       low g that opens the shadows. That is not a tuned behaviour â€” it falls out of
+//       low g that opens the shadows. That is not a tuned behaviour Ã¢â‚¬â€ it falls out of
 //       the two placement targets.
 //   k   from the mean target, by bisection over the source quantile table.
 //   x0  anchored at the scene's own p99.5.
@@ -2745,7 +2748,7 @@ static float MedianOf(const float* v, int n)
 // THE WINDOW IS THE PRIORITY, AND IT IS A HOUSE DECISION (option A, 2026-10-05).
 // On the real frames measured in _gt7probe, the mean target and the highlight floor
 // are jointly infeasible about 2 times in 12: a scene with a 2.6-nit mean and a 226-nit
-// lamp cannot put its average at 0.216 of white AND keep its highlights at 0.85 â€” that
+// lamp cannot put its average at 0.216 of white AND keep its highlights at 0.85 Ã¢â‚¬â€ that
 // asks for more separation than the panel has. Something must yield, and the answer
 // chosen is that the highlights do not. Clamping k to the window implements exactly
 // that: the mean lands wherever it can, and the ceiling also stops the opposite
@@ -2760,11 +2763,11 @@ void CDX11VideoProcessor::SolveDynamicAutoCurve()
 	// rows for the same reason the anchor peak is: player chrome and subtitles in the
 	// letterbox bars must not be allowed to move a quantity that places the whole
 	// image. It is also why the six model percentiles in features[] cannot be used
-	// here â€” they deliberately report the full frame, and they exclude the lower half
+	// here Ã¢â‚¬â€ they deliberately report the full frame, and they exclude the lower half
 	// where the delivered mean is actually made.
 	// The LATCHED table. See m_MLQuantilesLocked: the solve must integrate over the
 	// scene's distribution, not this frame's, or g chases content movement inside a
-	// shot while holding a target that is locked â€” a contrast pump with stable
+	// shot while holding a target that is locked Ã¢â‚¬â€ a contrast pump with stable
 	// brightness, which is exactly what the 60 s trace showed.
 	const float* qsrc = (m_MLQuantilesLocked[ML_QUANT_N - 1] > 0.0f)
 	                    ? m_MLQuantilesLocked : m_MLQuantiles;
@@ -2774,7 +2777,7 @@ void CDX11VideoProcessor::SolveDynamicAutoCurve()
 	// The highlight anchor is the GUARDED peak, not the locked anchor.
 	//
 	// m_PeakMaxPq / m_BandPeakPq are scene-locked, which is what an exposure MEAN
-	// wants and what makes the curve not pump â€” but the peak is the one statistic
+	// wants and what makes the curve not pump Ã¢â‚¬â€ but the peak is the one statistic
 	// where being scene-locked is a defect rather than a feature: a scene that opens
 	// dark (fade from black, night interior) locks the anchor at a value the scene
 	// outgrows minutes later, and the running-max guard exists precisely to correct
@@ -2782,11 +2785,11 @@ void CDX11VideoProcessor::SolveDynamicAutoCurve()
 	// curve placed a 43-nit pixel at 0.85 of white and the whole image washed out
 	// (delivered p50 = 155 of 255, against a house target of 0.24).
 	//
-	// m_HableScenePeakNits already IS that corrected quantity â€” it is what the GT7
+	// m_HableScenePeakNits already IS that corrected quantity Ã¢â‚¬â€ it is what the GT7
 	// Adapt branch divides by, so reading it here also keeps the two curves honest
 	// about the same scene. Reading the raw anchor instead discarded a correction
 	// that had taken three rounds to build.
-	// The LATCHED peak, not the live guarded one â€” see the latch in Render. Feeding
+	// The LATCHED peak, not the live guarded one Ã¢â‚¬â€ see the latch in Render. Feeding
 	// the fast quantity here is what made the picture re-solve once a second.
 	const float peakNits = (m_fScenePeakLockNits > 1.0f)
 		? m_fScenePeakLockNits
@@ -2824,7 +2827,7 @@ void CDX11VideoProcessor::SolveDynamicAutoCurve()
 	//     p10               GT7: 19        us: 126
 	// 1 - exp(-k u^g) is concave everywhere, so it compresses from the first nit: no
 	// toe, no S, blacks lifted off the floor. That is the missing punch, and it is
-	// structural â€” no value of g produces an S. Raising the output to a power p > 1
+	// structural Ã¢â‚¬â€ no value of g produces an S. Raising the output to a power p > 1
 	// does, because it crushes the low end and leaves the asymptote alone:
 	//
 	//     code(Y) = ( 1 - exp(-k (Y/x0)^g) )^p
@@ -2894,13 +2897,13 @@ void CDX11VideoProcessor::SetMLParams()
 	// ONE CUT SIGNAL FOR EVERY SMOOTHER IN THIS FUNCTION.
 	//
 	// Owned by the anchor block in Render(), which runs AFTER this function in the
-	// same call â€” so what is read on frame N+1 is the decision made on frame N, whose
+	// same call Ã¢â‚¬â€ so what is read on frame N+1 is the decision made on frame N, whose
 	// features are exactly the ones still sitting in m_MLFeatures. Cut and
 	// measurement belong to the same frame; the one-frame latency is the render
 	// pipeline's, not this flag's.
 	//
-	// Read, NOT cleared. The anchor block owns this flag and restates it â€” false, then
-	// true on a cut â€” on every extraction, so it is a LEVEL ("the scene we are holding
+	// Read, NOT cleared. The anchor block owns this flag and restates it Ã¢â‚¬â€ false, then
+	// true on a cut Ã¢â‚¬â€ on every extraction, so it is a LEVEL ("the scene we are holding
 	// was a cut"), not a pulse, and every reader sees the same answer. It used to be
 	// cleared here, and that made the read in UpdateToneLut() structurally dead: that
 	// runs AFTER this function in the same Render() call, so it would only ever see the
@@ -2909,12 +2912,12 @@ void CDX11VideoProcessor::SetMLParams()
 	//
 	// Every temporal filter below has a snap exemption of its own, and every one of
 	// them is keyed to a statistic that does not move the way its author assumed.
-	// The 0.15-maxscl test under this comment is 0.15 in PQ CODES â€” about TWO STOPS
+	// The 0.15-maxscl test under this comment is 0.15 in PQ CODES Ã¢â‚¬â€ about TWO STOPS
 	// where film peaks actually live (0.50..0.65 is 92 nits..391). A cut that moves
 	// the scene a stop and a half measures 0.10 and does not trip it, so the gamma
 	// filter eased to the new scene at 10%/frame: a 0.4 s time constant, ~1.2 s to be
 	// 90% there. On screen the cut lands, the picture is dim, and the exposure walks
-	// up under it. A cut is a frame being REPLACED â€” it is the one event none of the
+	// up under it. A cut is a frame being REPLACED Ã¢â‚¬â€ it is the one event none of the
 	// smoothing rules below was written to survive.
 	const bool cutNow = m_bSceneCut && !m_bSceneSame;
 
@@ -2958,7 +2961,7 @@ void CDX11VideoProcessor::SetMLParams()
 			// without freezing the scene adaptation.
 			//
 			// Additive on the EXPONENT, not multiplicative: a multiplier cannot lift
-			// a scene the model judged neutral â€” predicted 1.0 is a fixed point â€”
+			// a scene the model judged neutral Ã¢â‚¬â€ predicted 1.0 is a fixed point Ã¢â‚¬â€
 			// which is precisely the case a top-up exists to cover.
 			//
 			// Clamped wider than the model's own 0.5-1.5 because an offset can leave
@@ -2967,7 +2970,7 @@ void CDX11VideoProcessor::SetMLParams()
 			// midtone move and cannot reintroduce the highlight push the curve gain
 			// had at 1.6.
 			//
-			// Signed, and added to the exponent â€” see fMLGammaTopUp in IVideoRenderer.h
+			// Signed, and added to the exponent Ã¢â‚¬â€ see fMLGammaTopUp in IVideoRenderer.h
 			// for why it is additive rather than a multiplier.
 			//
 			// NOT folded into `gamma`. It is passed to the shader SEPARATELY as
@@ -2979,7 +2982,7 @@ void CDX11VideoProcessor::SetMLParams()
 			// cannot see what the tone curve already did to the picture: change
 			// refWhite or sdrNits and the input vector is identical while the delivered
 			// mid-tone moves a long way. That is why the top-up has to be ridden by
-			// hand â€” it has been absorbing a delivery error the model is blind to.
+			// hand Ã¢â‚¬â€ it has been absorbing a delivery error the model is blind to.
 			//
 			// The curve is closed-form, so its effect on the source's average can be
 			// COMPUTED rather than measured. Solve for the exponent that lands the
@@ -3016,7 +3019,7 @@ void CDX11VideoProcessor::SetMLParams()
 		if (m_bMLHighlightModelLoaded && m_MLHighlightModel.Predict(m_MLFeatures, ML_FEATURE_DIM, highlightPred)) {
 			highlightPred = fmaxf(-0.30f, fminf(0.40f, highlightPred));
 			// Highlight shoulder override (model-override, mirrors dehaze): a signed
-			// offset the user adds to the model's rolloff IN AUTO â€” the model keeps
+			// offset the user adds to the model's rolloff IN AUTO Ã¢â‚¬â€ the model keeps
 			// shaping the per-scene shoulder, the slider just pulls the rim highlight
 			// back (negative = softer/earlier shoulder) without freezing per scene.
 			const float ctrl = fminf(0.20f, fmaxf(-0.20f, m_fMLHighlightRolloffCtrl));
@@ -3042,10 +3045,10 @@ void CDX11VideoProcessor::SetMLParams()
 		if (m_MLShadowModel.Predict(m_MLFeatures, ML_FEATURE_DIM, shadowPred)) {
 			shadow = fmaxf(0.0f, fminf(0.5f, shadowPred));
 			// Shadow dehaze: 0..1 scale DOWN the model's shadow-toe lift. The model
-			// predicts a toe that lifts the dark end (x += toeÂ·xÂ·tÂ²) â€” at high values
+			// predicts a toe that lifts the dark end (x += toeÃ‚Â·xÃ‚Â·tÃ‚Â²) Ã¢â‚¬â€ at high values
 			// this reads as lifted-black haze. dehaze multiplies the toe target by
-			// (1âˆ’dehaze): 0 = model as-is; 1 = model fully suppressed (toeâ†’0, the
-			// shader's >0.005 gate then skips the whole step â†’ bit-identical no-lift).
+			// (1Ã¢Ë†â€™dehaze): 0 = model as-is; 1 = model fully suppressed (toeÃ¢â€ â€™0, the
+			// shader's >0.005 gate then skips the whole step Ã¢â€ â€™ bit-identical no-lift).
 			const float dehaze = fminf(1.0f, fmaxf(0.0f, m_fMLShadowDehaze));
 			shadow *= (1.0f - dehaze);
 			m_MLShadowDehazeApplied = dehaze;
@@ -3063,11 +3066,11 @@ void CDX11VideoProcessor::SetMLParams()
 	const bool bChromaActive = m_bMLChromaEnabled;
 
 	const float shadowStrength = 0.0f;
-	// Micro-contrast strength = user slider (clarity exponent, cap 0.5) Ã— the
+	// Micro-contrast strength = user slider (clarity exponent, cap 0.5) Ãƒâ€” the
 	// automatic per-scene texture gate. The gate NORMALIZES the raw texture
 	// energy into [0,1]: the raw fraction is ~0.006 on box-averaged luma and
 	// crushed strength below the shader's 0.001 fast-path. Textured scenes
-	// (raw â‰¥ kMCGateRef) get the full slider; flat scenes stay ~0.
+	// (raw Ã¢â€°Â¥ kMCGateRef) get the full slider; flat scenes stay ~0.
 	const float kMCGateRef = 0.02f;
 	const float mcGate = m_bMLFeaturesReady
 		? fminf(1.0f, m_MLTextureSmooth / kMCGateRef)
@@ -3091,7 +3094,7 @@ void CDX11VideoProcessor::SetMLParams()
 		fflush(m_pMLDebugFile);
 	}
 
-	// Face detection (YuNet + ByteTrack) DISABLED â€” person masks replace it.
+	// Face detection (YuNet + ByteTrack) DISABLED Ã¢â‚¬â€ person masks replace it.
 #if 0
 	float sceneDelta2 = 0.0f;
 	bool hasPrev = m_fPrevSceneFeat[0] >= 0.0f;
@@ -3153,7 +3156,7 @@ void CDX11VideoProcessor::SetMLParams()
 		};
 	}
 #endif   // end of face-detection disable
-	// Face cbuffer stays zeroed (layout stable) â€” face path is inert.
+	// Face cbuffer stays zeroed (layout stable) Ã¢â‚¬â€ face path is inert.
 	int numFaces = 0;
 	CFaceDetect::FaceBox faceBoxes[4] = {};
 	float faceTrackIds[4] = {};
@@ -3182,22 +3185,22 @@ void CDX11VideoProcessor::SetMLParams()
 	                 m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f;
 	if (ctl) {
 		// A CUT IS NOT DRIFT. Everything below smooths, and every one of those
-		// smoothing rules was written against a real pumping artifact â€” but the
+		// smoothing rules was written against a real pumping artifact Ã¢â‚¬â€ but the
 		// percentiles the controller solves on (features[3/4/7] and the p99.5) are
 		// RAW PER-FRAME readings; nothing about them is locked to the scene. So at a
 		// camera cut the controller is asked for a different correction and walks to
 		// it at 10%/frame: a 0.4 s time constant, ~2 s to converge. On screen that is
-		// the picture landing DIM at the cut and brightening under it â€” the exposure
+		// the picture landing DIM at the cut and brightening under it Ã¢â‚¬â€ the exposure
 		// arriving late, in a shot boundary's face, every single cut. The anchor block
 		// already knows a cut happened; the fix is to let it say so here.
-		// (cutNow, NOT m_bSceneCut â€” the flag was consumed and cleared at the top of
+		// (cutNow, NOT m_bSceneCut Ã¢â‚¬â€ the flag was consumed and cleared at the top of
 		// this function; reading the member here would silently always be false.)
 		const bool cutSnap = cutNow;
 		const float sdrN = (float)m_iSDRDisplayNits;
 		// SCENE-LOCKED BANDS, not the raw per-frame percentiles.
 		//
 		// This is the pump. The controller solved on features[3/4/7] and the live
-		// p99.5 â€” statistics that move every frame with the CONTENT of the shot: a
+		// p99.5 Ã¢â‚¬â€ statistics that move every frame with the CONTENT of the shot: a
 		// coat entering frame, snow drifting, a slow pan across a lit wall. The peak
 		// anchor beside them was correctly frozen, so the grade had one locked half and
 		// one free-running half, and the free-running one was the half that sets
@@ -3206,7 +3209,7 @@ void CDX11VideoProcessor::SetMLParams()
 		// "the light changed" from "something moved in the light".
 		//
 		// m_BandPq moves exactly when the scene state machine allows the anchor to move,
-		// and not at all while a scene is held â€” so a held shot has no moving input left
+		// and not at all while a scene is held Ã¢â‚¬â€ so a held shot has no moving input left
 		// to pump on. Falls back to the live percentiles only until the bands have a
 		// first reading, so the controller cannot be starved at startup.
 		// features[3..8] = p25 p50 p75 p90 p95 p99, in source PQ.
@@ -3228,8 +3231,8 @@ void CDX11VideoProcessor::SetMLParams()
 			const float nits = exptm::PqToLinearNits(bandPq[i]);
 			// Same term as above: these are anchors measured on the DELIVERED picture, so
 			// the prediction must be the curve that is actually drawing it. This call was
-			// the GT7 model unconditionally â€” inside `if (ctl)`, which runs on every curve
-			// â€” so on the Unplugged curve the controller solved its targets against a
+			// the GT7 model unconditionally Ã¢â‚¬â€ inside `if (ctl)`, which runs on every curve
+			// Ã¢â‚¬â€ so on the Unplugged curve the controller solved its targets against a
 			// shoulder (and a refWhite, and a reach) that was never applied, and then
 			// lifted or held the grade to chase a level the picture already had.
 			wA[i] = PredictDeliveredRelLinear(nits);
@@ -3303,7 +3306,7 @@ void CDX11VideoProcessor::SetMLParams()
 		// by less than the jump thresholds (S 1.00 -> 1.20 clears nothing) and then
 		// crawls for ten frames, which is the same late exposure with a shorter tail.
 		// On a cut the frame is replaced wholesale, so a one-frame actuator step is
-		// masked by the cut itself â€” there is nothing here to hide.
+		// masked by the cut itself Ã¢â‚¬â€ there is nothing here to hide.
 		auto settle = [](float& held, float now, float jump, bool cut) {
 			if (cut || fabsf(now - held) > jump) { held = now; }
 			else { held += 0.10f * (now - held); }
@@ -3319,7 +3322,7 @@ void CDX11VideoProcessor::SetMLParams()
 		// actuators deliver -- so "the controller does nothing" becomes a line that
 		// says WHICH of the four stages (measure, target, solve, apply) is lying.
 		// Every 6 frames, not 30: at 24 fps a 30-frame cadence samples a one-second
-		// ramp ONCE, which cannot distinguish "snapped" from "crept" â€” and that is the
+		// ramp ONCE, which cannot distinguish "snapped" from "crept" Ã¢â‚¬â€ and that is the
 		// exact question under test. 6 frames is 4 lines/sec, and this line only exists
 		// while the frame log is on.
 		if (m_bMLDebug && m_pMLDebugFile && (m_MLDebugFrame % 6 == 0)) {
@@ -3376,13 +3379,13 @@ void CDX11VideoProcessor::SetMLParams()
 		// while the behaviour was nowhere. Now it is the hdr.hiDesat dial (see
 		// ps_ml_chroma.hlsl for why the term lives in that pass and not in the curve).
 		std::clamp(m_fMLHiDesat, 0.0f, 1.0f),
-		// The domain of the texture the ML passes actually read â€” NOT the swap
+		// The domain of the texture the ML passes actually read Ã¢â‚¬â€ NOT the swap
 		// chain's. On an SDR display the swap chain is G22 whether or not the
 		// correction ran, so the old test told ps_ml_gamma to decode PQ with
 		// pow(x, 2.2) whenever Convert to SDR was off. See MLInputIsPq().
 		MLInputIsPq() ? 1.0f : 0.0f,
 		0.0f,
-		// Phase 1b â€” chroma vector tuning (per-row enables)
+		// Phase 1b Ã¢â‚¬â€ chroma vector tuning (per-row enables)
 		(bChromaActive && m_bMLChromaNeutralEnabled) ? discard<float>(m_fMLChromaNeutral, 1.08f, 1.0f, 1.3f) : 1.0f,
 		(bChromaActive && m_bMLChromaFireEnabled) ? discard<float>(m_fMLChromaFire, 1.15f, 1.0f, 1.3f) : 1.0f,
 		(bChromaActive && m_bMLChromaKneeEnabled) ? discard<float>(m_fMLChromaKnee, 0.45f, 0.1f, 0.9f) : 0.45f,
@@ -3391,7 +3394,7 @@ void CDX11VideoProcessor::SetMLParams()
 		bChromaActive ? 1.0f : 0.0f,
 		m_bMLHuntEnabled ? 1.0f : 0.0f,
 		m_bMLShadowDebugVis ? 1.0f : 0.0f, m_fMLShadowZoneCeil, m_fMLShadowSkinProtect, m_fMLShadowRatioCap, m_bMLContrastDebugVis ? 1.0f : 0.0f, m_bSkyDebugVis ? 1.0f : 0.0f,
-		// P0 â€” black bars repaint
+		// P0 Ã¢â‚¬â€ black bars repaint
 		(m_bMLFeaturesReady ? m_fMLBarTop : 0.0f),
 		(m_bMLFeaturesReady ? m_fMLBarBot : 1.0f),
 		(m_bMLFeaturesReady ? (float)m_videoRect.top / std::max((int)m_windowRect.Height(), 1) : 0.0f),
@@ -3464,7 +3467,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// same band. Zeroed here rather than at the solve site because `ctl` is not in
 	// scope there.
 	params.MLGammaTopUp = ctl ? 0.0f : gammaTopUp;
-	// Shadow pedestal â€” the offset the toe's gain cannot be. Bounded to 8% of white:
+	// Shadow pedestal Ã¢â‚¬â€ the offset the toe's gain cannot be. Bounded to 8% of white:
 	// it is a fraction of I_norm, and a value large enough to matter for crushed
 	// shadows is also large enough to grey out the letterbox matte if the shader's
 	// in-content gate ever fails. 0 = the previous picture exactly.
@@ -3527,7 +3530,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	}
 
 	// 1) downsample the convert output into the 256x144 luma cache.
-	// Use the actual texture dimensions â€” m_srcRect can exceed the texture
+	// Use the actual texture dimensions Ã¢â‚¬â€ m_srcRect can exceed the texture
 	// when the convert output is display-sized, pushing UVs past 1.0.
 	const CRect fullRect(0, 0, ML_DOWNSAMPLE_W, ML_DOWNSAMPLE_H);
 	const CRect texRect(0, 0, m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height);
@@ -3551,7 +3554,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, D3D11VP.cpp:609-615): the tone
 	// mapping happens later, inside the correction shader. On an SDR display the
 	// swap chain stays G22, so keying the domain off the swap chain selected
-	// SDRGamma22 and applied SdrGammaToPQ to values that were ALREADY PQ â€” a
+	// SDRGamma22 and applied SdrGammaToPQ to values that were ALREADY PQ Ã¢â‚¬â€ a
 	// double remap that corrupted every feature on exactly the path the tone
 	// curve and the Zion grade run on.
 	//
@@ -3562,14 +3565,14 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// The predicate itself was still wrong, and this frame is where it showed: it
 	// ANDed in m_bConvertToSdr, so turning Convert to SDR OFF flipped the domain to
 	// SDRGamma22 for a texture that is still PQ, and the identical double remap
-	// came back on that path only. Caught from the log â€” feat0 read 0.3161 on the
+	// came back on that path only. Caught from the log Ã¢â‚¬â€ feat0 read 0.3161 on the
 	// no-conversion path against 0.3855 on the tone-mapped one for a static frame,
 	// and SdrGammaToPQ(0.3855) = 0.31575. The extractor's texture is written by the
 	// VP, so only the SOURCE decides its domain; the correction is downstream of it.
 	const MLLumaDomain domain =
 		MLFeatureDomainIsPq() ? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
 	// m_MLQuantiles is the source distribution the Dynamic & Auto curve is solved
-	// against â€” 33 content-row quantiles, the same table the offline probe integrates
+	// against Ã¢â‚¬â€ 33 content-row quantiles, the same table the offline probe integrates
 	// over in _gt7probe/curve_solve.cpp. Passing it here rather than reconstructing the
 	// distribution from features[3..8] is deliberate: those six percentiles exclude the
 	// lower half, which is where the delivered mean is actually made.
@@ -3588,11 +3591,11 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	m_MLDebugFeat1 = m_MLFeatures[1];
 	m_MLDebugFeatReady = 1;
 
-	// Face detection DISABLED â€” person instance masks (yolo26n-seg) replace YuNet +
+	// Face detection DISABLED Ã¢â‚¬â€ person instance masks (yolo26n-seg) replace YuNet +
 // ByteTrack. The face_down shader + its IsPQ cbuffer STAY (the sky/person seg
 // preview uses them). Kept behind #if 0 for easy re-enable.
 	{
-		// Update IsPQ flag so face_down applies PQâ†’SDR for the seg preview.
+		// Update IsPQ flag so face_down applies PQÃ¢â€ â€™SDR for the seg preview.
 		if (m_pPSFaceDown && m_pFaceDownParams) {
 			D3D11_MAPPED_SUBRESOURCE mr2 = {};
 			if (SUCCEEDED(m_pDeviceContext->Map(m_pFaceDownParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr2))) {
@@ -3622,21 +3625,21 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 #endif
 	}
 
-	// Sky/person segmentation â€” throttled (~10 fps). Renders its OWN 640x360
+	// Sky/person segmentation Ã¢â‚¬â€ throttled (~10 fps). Renders its OWN 640x360
 	// SDR-ized preview: higher fidelity than the 480x288 face texture, so
 	// building/sky boundaries survive the downscale. Pushes a 640x360 R8G8 mask
 	// (R=sky, G=person) to the shader. Runs when either feature (or an overlay
 	// that needs the mask) is wanted; cadence uses the render-thread frame
-	// counter â€” m_MLDebugFrame is NOT a safe throttle (pinned at 0 without the
+	// counter Ã¢â‚¬â€ m_MLDebugFrame is NOT a safe throttle (pinned at 0 without the
 	// frame log, which made this run EVERY frame in normal playback).
 	const bool wantPerson = m_bPersonEnabled || m_bPersonDebugVis;
 	const bool wantSky    = m_bSkyEnabled || m_bSkyDebugVis;
 	const bool wantMask   = wantPerson || wantSky;
 	// Cadence (render-thread frame counter m_nSkyFrame; NOT m_MLDebugFrame which is
 	// pinned at 0 without the frame log):
-	//   - Person: every 2 frames (mask updates are EMA/snap-stabilized and the Ï„
+	//   - Person: every 2 frames (mask updates are EMA/snap-stabilized and the Ãâ€ž
 	//     envelope riders out a couple stale frames; every-frame DirectML + a GPU
-	//     readback per frame was the stutter â€” the mask does not need 60 fps).
+	//     readback per frame was the stutter Ã¢â‚¬â€ the mask does not need 60 fps).
 	//   - Sky: every 5 frames.
 	const bool doPerson = wantPerson && (m_nSkyFrame - m_nPersonLastFrame >= 2);
 	const bool doSky    = wantSky && (m_nSkyFrame - m_nSkyLastFrame >= 5);
@@ -3650,7 +3653,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 			if (SUCCEEDED(m_pDeviceContext->Map(m_SegStaging, 0, D3D11_MAP_READ, 0, &segMr))) {
 				// Diagnostic: save the staged preview every ~120 refreshes (frame log
 				// on) so a mask-vs-screen offset can be eyeballed (esp. ultrawide /
-				// DV-P5) â€” is the preview the correct presented region?
+				// DV-P5) Ã¢â‚¬â€ is the preview the correct presented region?
 				if (m_bMLDebug && m_pMLDebugFile && segMr.pData && (m_nSkyFrame % 120 == 0)) {
 					wchar_t dumpPath[MAX_PATH];
 					swprintf_s(dumpPath, L"%s\\seg_preview_%04llu.bmp", GetMLModuleDir().c_str(),
@@ -3668,17 +3671,17 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					}
 					m_nSkyLastFrame = m_nSkyFrame;
 				}
-				// Person instance masks (yolo26n-seg, class 0) â€” every frame.
+				// Person instance masks (yolo26n-seg, class 0) Ã¢â‚¬â€ every frame.
 				CPersonSeg::Result person;
 				if (wantPerson && m_pPersonSeg && m_pPersonSeg->IsReady() &&
 					m_pPersonSeg->DetectPersons((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, person)) {
 					m_PersonFrac = person.personFrac;
 					// Camera-cut detector: the new frame's person mask vs the previous
-					// raw â€” a cut has ~zero overlap (different scene, unrelated people).
-					// On a cut SNAP the smoothed mask to the new raw (no blend â†’ the old
+					// raw Ã¢â‚¬â€ a cut has ~zero overlap (different scene, unrelated people).
+					// On a cut SNAP the smoothed mask to the new raw (no blend Ã¢â€ â€™ the old
 					// scene's silhouette cannot linger as a shadow). No tracker needed:
 					// instance IDs exist in yolo26n-seg but a cut is a mismatch, not a
-					// continuity failure â€” the mask itself is the discontinuity signal.
+					// continuity failure Ã¢â‚¬â€ the mask itself is the discontinuity signal.
 					float overlap = 1.0f;
 					if (!m_LastPersonMap.empty() && m_LastPersonMap.size() == person.map.size()) {
 						long long inter = 0, uni = 0;
@@ -3690,19 +3693,19 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 						overlap = uni ? (float)inter / (float)uni : 1.0f;
 					}
 					const bool bCut = overlap < 0.20f;
-					// Scene-confidence scalar (Ï„): falls fast on SUSTAINED mismatch
+					// Scene-confidence scalar (Ãâ€ž): falls fast on SUSTAINED mismatch
 					// (a real cut / montage), recovers slowly on stability. A whip pan
-					// dips for 1-3 frames then recovers â†’ Ï„ blips but the tone blend
-					// barely moves; a real cut keeps Ï„ low for a while â†’ preserve fades
+					// dips for 1-3 frames then recovers Ã¢â€ â€™ Ãâ€ž blips but the tone blend
+					// barely moves; a real cut keeps Ãâ€ž low for a while Ã¢â€ â€™ preserve fades
 					// out and re-fades in smoothly after masks+anchor settle.
 					// Decay on bad: -0.35/frame (reaches ~0 in ~3 bad frames).
 					// Recover on good: +0.08/frame (~13 frames back to full).
 					if (bCut) {
 						m_maskTrust = fmaxf(0.0f, m_maskTrust - 0.35f);
 						m_framesSinceGood = 0;
-						// Labels are NOT consistent across a cut â€” reset the per-instance
-						// skin-fraction IIR so re-emerging people start from a clean Ïƒ
-						// (4ms of stale Ïƒ on a face would dip its gate for ~5 frames).
+						// Labels are NOT consistent across a cut Ã¢â‚¬â€ reset the per-instance
+						// skin-fraction IIR so re-emerging people start from a clean ÃÆ’
+						// (4ms of stale ÃÆ’ on a face would dip its gate for ~5 frames).
 						m_instSmInit = false;
 						for (int ji = 1; ji <= 8; ji++) m_instSkinSm[ji] = 0.0f;
 					} else {
@@ -3716,14 +3719,14 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					const float t = (m_maskTrust - 0.25f) / (0.80f - 0.25f);
 					m_maskEnv = t <= 0.0f ? 0.0f : (t >= 1.0f ? 1.0f : t * t * (3.0f - 2.0f * t));
 					// Update the raw FIRST so the blend below always targets the current
-					// frame (the old ordering blended against the previous frame's raw â€”
+					// frame (the old ordering blended against the previous frame's raw Ã¢â‚¬â€
 					// a permanent 1-frame-late mask).
 					if (!person.map.empty()) m_LastPersonMap = person.map;
 					if (!person.instMap.empty()) m_LastInstMap = person.instMap;
 					if (m_PersonMaskSm.size() != 640 * 360 || bCut) {
 						m_PersonMaskSm = m_LastPersonMap;          // snap (first frame / cut)
 					} else {
-						// Temporal stability: 62% old / 38% new â€” damps detection flicker
+						// Temporal stability: 62% old / 38% new Ã¢â‚¬â€ damps detection flicker
 						// (mirrors, weak silhouettes) within a shot without ghost/trail.
 						for (size_t _i = 0; _i < m_LastPersonMap.size(); _i++)
 							m_PersonMaskSm[_i] = (uint8_t)((5 * (int)m_PersonMaskSm[_i] + 3 * (int)m_LastPersonMap[_i]) >> 3);
@@ -3735,9 +3738,9 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					}
 				} else {
 					// No person this frame (e.g. camera cut to a person-less scene): the
-					// masks MUST clear â€” leaving them made the old scene's silhouette
-					// persist as a shadow on the new scene indefinitely. Ï„ also decays
-					// (scene changed); masks cleared â†’ gate is zero â†’ preserve can't act
+					// masks MUST clear Ã¢â‚¬â€ leaving them made the old scene's silhouette
+					// persist as a shadow on the new scene indefinitely. Ãâ€ž also decays
+					// (scene changed); masks cleared Ã¢â€ â€™ gate is zero Ã¢â€ â€™ preserve can't act
 					// anyway, but the fade-in state should reset for the next scene.
 					m_PersonFrac = 0.0f;
 					m_maskTrust = fmaxf(0.0f, m_maskTrust - 0.35f);
@@ -3774,11 +3777,11 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 						fflush(m_pMLDebugFile);
 					}
 				}
-				// Skin-tone anchor + Poisson gate (production â€” no frame log needed):
-		// anchor = source skin-set mean luma; gate = relaxed personÃ—skin field (gamma t4).
+				// Skin-tone anchor + Poisson gate (production Ã¢â‚¬â€ no frame log needed):
+		// anchor = source skin-set mean luma; gate = relaxed personÃƒâ€”skin field (gamma t4).
 		// The gate (t4) is ONLY consumed by the shader's skin leg, which is gated on
-		// MLSkinPreserve â€” so with preserve=0 the whole 160x90 build (luma, Sobel,
-		// per-instance Ïƒ, 100-iter Jacobi, upload) is PURE WASTE and was the
+		// MLSkinPreserve Ã¢â‚¬â€ so with preserve=0 the whole 160x90 build (luma, Sobel,
+		// per-instance ÃÆ’, 100-iter Jacobi, upload) is PURE WASTE and was the
 		// per-frame stutter. Skip both when the leg is off: bit-identical result,
 		// the gate texture simply keeps its last nonzero value (irrelevant at 0).
 		if (wantPerson && segMr.pData && m_bMLFeaturesReady && m_fMLSkinPreserve > 0.001f) {
@@ -3791,7 +3794,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 
 	// Mask auto-diagnostic: read back the ACTUAL R8G8 GPU texture and compare
 	// the G (person) channel against the CPU personFrac. If gpuG stays ~0 while
-	// cpu pfrac is live, the upload/pack is broken â€” log catches it in the field.
+	// cpu pfrac is live, the upload/pack is broken Ã¢â‚¬â€ log catches it in the field.
 	if (m_bMLDebug && m_pMLDebugFile && (m_nSkyFrame % 36 == 0)) {
 		LogMaskProbe();
 	}
@@ -3886,7 +3889,7 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		// the unsettled value plus its own persistence gate.
 		L"barsNow: top={:.4f} bot={:.4f} left={:.4f} right={:.4f}\n"
 		// Fraction of cells that contain anything above the crop level. A picture
-		// fills its active rows (â‰ˆ hA); a black title card is nearly all cells off
+		// fills its active rows (Ã¢â€°Ë† hA); a black title card is nearly all cells off
 		// even though it is the same "band" shape. Consumers that must not mistake
 		// art for letterbox read this and skip frames that are mostly black.
 		L"activeFrac: {:.4f}\n"
@@ -3960,12 +3963,12 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		// peak: this is the top of the range being mapped FROM.
 		m_fHdrTitlePeakNits,
 		// The file's own ST 2086 as the renderer read it from the decoded side
-		// data (m_lastHdr10.hdr10). MaxCLL/MaxFALL are in cd/mÂ², MaxMasteringLuminance
-		// in cd/mÂ², MinMasteringLuminance scaled by 10000 (0.0001 cd/mÂ²) â€” the
+		// data (m_lastHdr10.hdr10). MaxCLL/MaxFALL are in cd/mÃ‚Â², MaxMasteringLuminance
+		// in cd/mÃ‚Â², MinMasteringLuminance scaled by 10000 (0.0001 cd/mÃ‚Â²) Ã¢â‚¬â€ the
 		// DXGI_HDR_METADATA_HDR10 layout. The engine parses these to feed the
 		// panel's MaxCLL / MaxFALL / Mastering max / Mastering min rows on the
 		// file path (the DeckLink card path feeds those same rows from dl.*).
-		// Content-side ST 2086 (m_hdr10Cllâ€¦ â€” display-independent copy of what
+		// Content-side ST 2086 (m_hdr10CllÃ¢â‚¬Â¦ Ã¢â‚¬â€ display-independent copy of what
 		// the decoded side data carried; m_lastHdr10 is display-applied and
 		// stays zero on SDR swapchains).
 		m_hdr10Cll,
@@ -4029,7 +4032,7 @@ HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
 
 void CDX11VideoProcessor::CreateSkinGateTexture()
 {
-	// 160x90 R8_UNORM â€” the quarter-res Poisson-relaxed person gate consumed on
+	// 160x90 R8_UNORM Ã¢â‚¬â€ the quarter-res Poisson-relaxed person gate consumed on
 	// gamma t4. CPU-written every person-cadence update; released + recreated on
 	// device reset. Kept small: the field is smooth and bilinearly sampled, so
 	// half-resolution of the old 320x180 grid is visually identical but ~4x
@@ -4062,7 +4065,7 @@ void CDX11VideoProcessor::CreateSkinGateTexture()
 
 HRESULT CDX11VideoProcessor::CreateSkySegTextures()
 {
-	// 640x360 BGRA8 SDR-ized preview â€” higher fidelity than the 480x288 face
+	// 640x360 BGRA8 SDR-ized preview Ã¢â‚¬â€ higher fidelity than the 480x288 face
 	// texture so building/sky boundaries survive the downscale for the model.
 	D3D11_TEXTURE2D_DESC desc = {};
 	desc.Width = 640;
@@ -4101,7 +4104,7 @@ void CDX11VideoProcessor::LogSkinMetric(ID3D11Texture2D* pRT, const CRect& rect)
 	// (pRT content rect -> 640x360) and the SOURCE preview (m_SegStaging, the
 	// SDR-ized PQ this frame) and log the source->output displacement in the skin
 	// LUT's own space (gamma-2.2 luma + Cr/Cb), averaged over PERSON pixels and
-	// the skin sub-set (person âˆ§ LUT>0.5). Small deltas = retained skin tone.
+	// the skin sub-set (person Ã¢Ë†Â§ LUT>0.5). Small deltas = retained skin tone.
 	if (!pRT || !m_MetDown || !m_MetStaging || !m_pDeviceContext || !m_pMLDebugFile) return;
 	if (m_LastPersonMap.size() != 640 * 360) return;
 
@@ -4146,7 +4149,7 @@ void CDX11VideoProcessor::LogSkinMetric(ID3D11Texture2D* pRT, const CRect& rect)
 			ycb(orr, og, ob, oy, ocr, ocb);
 			srcP.y += sy; srcP.cr += scr; srcP.cb += scb; srcP.n++;
 			outP.y += oy; outP.cr += ocr; outP.cb += ocb;
-			// skin selector: person âˆ§ skinLUT(source cr/cb) > 0.5 (bilinear, like the shader)
+			// skin selector: person Ã¢Ë†Â§ skinLUT(source cr/cb) > 0.5 (bilinear, like the shader)
 			const float u = (scr - cr0) / (cr1 - cr0);
 			const float v = (scb - cb0) / (cb1 - cb0);
 			float lutW = 0.0f;
@@ -4187,7 +4190,7 @@ void CDX11VideoProcessor::LogSkinMetric(ID3D11Texture2D* pRT, const CRect& rect)
 void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
 {
 	// Skin-tone anchor: IIR of the skin-set mean SOURCE luma (gamma-2.2, in the
-	// same SDR-ized space the shader samples via t3) â€” runs in the seg block so
+	// same SDR-ized space the shader samples via t3) Ã¢â‚¬â€ runs in the seg block so
 	// it's live in production (no frame log needed). MLSkinAnchor for stage 5.
 	if (!bgra || m_SkinLutN <= 0) return;
 	const std::vector<uint8_t>& pm = m_PersonMaskSm.empty() ? m_LastPersonMap : m_PersonMaskSm;
@@ -4222,23 +4225,23 @@ void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
 
 void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 {
-	// Edge-pinned Poisson gate for the gamma skin-tone leg (t4) â€” the boundary is
+	// Edge-pinned Poisson gate for the gamma skin-tone leg (t4) Ã¢â‚¬â€ the boundary is
 	// attached to the CURRENT-FRAME source luma, not to the (late under motion)
 	// semantic mask. This fixes both residual artifacts at once:
 	//   - under-coverage shimmer: when two hugging people separate, the mask edge
 	//     lands INSIDE the face (mask = late). No mask erode/smooth can fix that;
-	//     the source luma edge of the CURRENT frame is always right â€” so the tail
+	//     the source luma edge of the CURRENT frame is always right Ã¢â‚¬â€ so the tail
 	//     is held by anisotropic diffusion that BLOCKS on strong luma contours:
-	//     u stays â‰ˆ1 across the face up to the real silhouette, then falls. The
-	//     edge map is per-frame â†’ no temporal wobble (no shimmer).
+	//     u stays Ã¢â€°Ë†1 across the face up to the real silhouette, then falls. The
+	//     edge map is per-frame Ã¢â€ â€™ no temporal wobble (no shimmer).
 	//   - rim glow on flat background: the plateau is eroded deep inside, the
 	//     zero-pin sits beyond a DILATED mask (+3 texels, so it is safely outside
 	//     the true boundary even when the mask lags), and conductivity is ~0
-	//     across strong edges â†’ the whole brightness turn happens exactly at the
+	//     across strong edges Ã¢â€ â€™ the whole brightness turn happens exactly at the
 	//     person's real contour, not on the background.
 	//
-	// Pins: u=1 where eroded-mask solid (erâ‰¥0.80); u=0 where dilated-mask clear
-	// (gDilâ‰¤0.05). Annulus between: ANISOTROPIC Jacobi, weights c=1/(1+(E/Îº)Â²)
+	// Pins: u=1 where eroded-mask solid (erÃ¢â€°Â¥0.80); u=0 where dilated-mask clear
+	// (gDilÃ¢â€°Â¤0.05). Annulus between: ANISOTROPIC Jacobi, weights c=1/(1+(E/ÃŽÂº)Ã‚Â²)
 	// where E = smoothed Sobel gradient of the source luma at gate resolution.
 	// Runs every frame for person (bgra = the 640x360 SDR-ized seg preview).
 	if (!m_SkinGate || !bgra) return;
@@ -4246,7 +4249,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	if (pm.size() != 640 * 360) return;
 
 	constexpr int GW = 160, GH = 90;   // quarter-res gate grid (4x fewer cells than
-									// 320x180 â€” the gate is a smooth field sampled
+									// 320x180 Ã¢â‚¬â€ the gate is a smooth field sampled
 									// bilinearly, so this is visually identical but
 									// ~4x cheaper per Jacobi iteration)
 	constexpr float lw_r = 0.2126f, lw_g = 0.7152f, lw_b = 0.0722f;
@@ -4298,18 +4301,18 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 				      + Es[o + GW - 1] + Es[o + GW] + Es[o + GW + 1]) * (1.0f / 9.0f);
 			}
 	}
-	if (bTiming) tkB = gqpc();    // â† luma/edge phase end
+	if (bTiming) tkB = gqpc();    // Ã¢â€ Â luma/edge phase end
 
 	// 1) Half-res gate seed = 4x4 max of the RAW per-frame person mask.
 	std::vector<float> g(GW * GH, 0.0f);
 	std::vector<float> instAmpAt(GW * GH, 1.0f);  // plateau amplitude per cell (skin-presence gate)
 	bool anyPerson = false;
-	// Per-instance skin fraction Ïƒ_j = (person âˆ© skin-LUT) / (person) per label,
+	// Per-instance skin fraction ÃÆ’_j = (person Ã¢Ë†Â© skin-LUT) / (person) per label,
 	// sampled at 640x360 (stride 3 to bound cost). IIR'd per label (memory) and
-	// shaped through smoothstep(0.03, 0.12, Ïƒ) â†’ a per-instance amplitude A_j:
-	//   person A (face, Ïƒâ‰ˆ1)  â†’ Aâ‰ˆ1  â†’ full tone preservation
-	//   person B (waist, Ïƒâ‰ˆ0) â†’ Aâ‰ˆ0  â†’ gate off for that person only
-	// NO global pooling â€” each person self-gates, so A can't be penalized by B.
+	// shaped through smoothstep(0.03, 0.12, ÃÆ’) Ã¢â€ â€™ a per-instance amplitude A_j:
+	//   person A (face, ÃÆ’Ã¢â€°Ë†1)  Ã¢â€ â€™ AÃ¢â€°Ë†1  Ã¢â€ â€™ full tone preservation
+	//   person B (waist, ÃÆ’Ã¢â€°Ë†0) Ã¢â€ â€™ AÃ¢â€°Ë†0  Ã¢â€ â€™ gate off for that person only
+	// NO global pooling Ã¢â‚¬â€ each person self-gates, so A can't be penalized by B.
 	{
 		const int N = m_SkinLutN;
 		const float cr0 = m_fSkinLUTCR0, cr1 = m_fSkinLUTCR1, cb0 = m_fSkinLUTCB0, cb1 = m_fSkinLUTCB1;
@@ -4349,7 +4352,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		}
 		m_instSmInit = true;
 	}
-	if (bTiming) tkC = gqpc();    // â† Ïƒ/inst phase end
+	if (bTiming) tkC = gqpc();    // Ã¢â€ Â ÃÆ’/inst phase end
 	for (int y = 0; y < 360; y += 4) {
 		for (int x = 0; x < 640; x += 4) {
 			float mx = 0.0f;
@@ -4367,7 +4370,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	}
 
 	// 1z) No person on screen (empty scene / cut-to-no-one): skip the solve, leave
-	//     a zero gate â€” nothing to blend and no stutter spent solving it.
+	//     a zero gate Ã¢â‚¬â€ nothing to blend and no stutter spent solving it.
 	if (!anyPerson) {
 		std::vector<uint8_t> out(GW * GH, 0);
 		D3D11_BOX box = { 0, 0, 0, GW, GH, 1 };
@@ -4375,7 +4378,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		return;
 	}
 
-	// 2) Eroded plateau pin: 3x3-min x ER â€” u=1 lives DEEP INSIDE the silhouette, so
+	// 2) Eroded plateau pin: 3x3-min x ER Ã¢â‚¬â€ u=1 lives DEEP INSIDE the silhouette, so
 	//    the brightness tail spends itself on the face interior. ER=3 at 160x90
 	//    (= 12 src px, matching the 320x180 ER=5 footprint of ~10 px, so the visual
 	//    behavior is preserved at the coarser grid).
@@ -4390,7 +4393,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 			}
 		er.swap(er2);
 	}
-	// 2b) Dilated zero-pin: 3x3-max x DIL â€” u=0 sits BEYOND the true boundary, so
+	// 2b) Dilated zero-pin: 3x3-max x DIL Ã¢â‚¬â€ u=0 sits BEYOND the true boundary, so
 	//     under motion the gate covers the whole face instead of the stale mask.
 	std::vector<float> gDil = g, gD2 = g;
 	constexpr int DIL = 2;
@@ -4404,14 +4407,14 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		gDil.swap(gD2);
 	}
 
-	// 2c) Edge-conductivity at the 4 neighbor faces (c = 1/(1+(E/Îº)Â²); blocked
-	//     across strong luma contours â†’ the tail CLAMPS to the person boundary).
+	// 2c) Edge-conductivity at the 4 neighbor faces (c = 1/(1+(E/ÃŽÂº)Ã‚Â²); blocked
+	//     across strong luma contours Ã¢â€ â€™ the tail CLAMPS to the person boundary).
 	//     Cells are 4 src px wide now (was 2), so a soft edge's Sobel reading is
-	//     ~2x â€” Îº scaled 0.45â†’0.90 to keep the SAME physical clamping (the "good"
+	//     ~2x Ã¢â‚¬â€ ÃŽÂº scaled 0.45Ã¢â€ â€™0.90 to keep the SAME physical clamping (the "good"
 	//     behavior verified at 320x180) at the coarser grid. Clamps tightest where
 	//     the person's real contour is; softer contours in shadow still block.
 	const float kappa = 0.90f;
-	constexpr int cmin = 6;             // low-conductivity clamp (Ã—1/6) â€” prevents
+	constexpr int cmin = 6;             // low-conductivity clamp (Ãƒâ€”1/6) Ã¢â‚¬â€ prevents
 	const float cLow = 1.0f / (float)cmin;   // numerically dead neighbors
 	auto cond = [&](size_t a, size_t b) {
 		float e = std::max(E[a], E[b]);
@@ -4420,9 +4423,9 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	};
 
 	// 3) Anisotropic Jacobi solve (100 iters at 160x90 = the same physical tail reach
-//    as 200 at 320x180 â€” each coarse cell diffuses 2x the distance, so half the
+//    as 200 at 320x180 Ã¢â‚¬â€ each coarse cell diffuses 2x the distance, so half the
 //    iterations dissolve the same residual mask-edge pattern). Pins read the FIXED
-//    seeds (er/gDil at the cell), never the live field â†’ interior magnitude stays
+//    seeds (er/gDil at the cell), never the live field Ã¢â€ â€™ interior magnitude stays
 //    raw-mask-driven.
 	std::vector<float> u = g;
 	const int TW = GW + 2, TH = GH + 2;
@@ -4435,8 +4438,8 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 				const size_t o = (size_t)y * TW + x;
 				const size_t gix = (size_t)(y - 1) * GW + (x - 1);
 				// Interior pin = per-instance skin-presence amplitude (person A face
-				// ~1, person B waist ~0 â†’ that plateau collapses) so the harmonic tail
-				// falls from A_j to 0 exactly as it did from 1.0 â€” indistinguishable
+				// ~1, person B waist ~0 Ã¢â€ â€™ that plateau collapses) so the harmonic tail
+				// falls from A_j to 0 exactly as it did from 1.0 Ã¢â‚¬â€ indistinguishable
 				// for full-face people, fully off for clothes-only people.
 				if (er[gix] >= 0.80f) { pad2[o] = instAmpAt[gix]; continue; }   // solid interior
 				if (gDil[gix] <= 0.05f) { pad2[o] = 0.0f; continue; } // clear exterior
@@ -4463,16 +4466,16 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
 		float sum = 0; long long cnt = 0, eCnt = 0; float eSum = 0;
 		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; eSum += E[i]; if (E[i] > kappa) eCnt++; }
-		// per-instance amplitudes: Aâ‰ˆ1 (face) / Aâ‰ˆ0 (clothes-only) is the gate's
-		// decision â€” person B cannot penalize person A when both are on screen.
+		// per-instance amplitudes: AÃ¢â€°Ë†1 (face) / AÃ¢â€°Ë†0 (clothes-only) is the gate's
+		// decision Ã¢â‚¬â€ person B cannot penalize person A when both are on screen.
 		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f e_mean=%.4f e_strFrac=%.4f  amp1=%.3f amp2=%.3f amp3=%.3f sig1=%.3f sig2=%.3f",
 			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)),
 			(float)(eSum / (GW * GH)), (float)((double)eCnt / (GW * GH)),
 			(double)m_instAmp[1], (double)m_instAmp[2], (double)m_instAmp[3],
 			(double)m_instSkinSm[1], (double)m_instSkinSm[2]);
-		if (bTiming && tkC > 0) {   // per-phase ms split: luma+edge / Ïƒ+inst / solve+upload
+		if (bTiming && tkC > 0) {   // per-phase ms split: luma+edge / ÃÆ’+inst / solve+upload
 			const double e2 = gqpc();
-			fwprintf(m_pMLDebugFile, L"  [lum=%.2fms Ïƒ=%.2fms solve=%.2fms totâ‰ˆ%.2fms]",
+			fwprintf(m_pMLDebugFile, L"  [lum=%.2fms ÃÆ’=%.2fms solve=%.2fms totÃ¢â€°Ë†%.2fms]",
 				tkB - tkA, tkC - tkB, e2 - tkC, e2 - tkA);
 		}
 		fwprintf(m_pMLDebugFile, L"\n");
@@ -4621,7 +4624,7 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 	// The content RECT in the delivered frame's own space, in readback pixels.
 	//
 	// Two mattes stack here and both have to come out:
-	//   1. the PILLARBOX the player adds â€” m_videoRect is the destination rect, so
+	//   1. the PILLARBOX the player adds Ã¢â‚¬â€ m_videoRect is the destination rect, so
 	//      everything outside it is black. On an ultrawide display this is the big
 	//      one: 3840x2160 fitted into a 3440x1440 window is 2560x1440, i.e. 25.6% of
 	//      the frame is black COLUMNS, which no row crop can touch.
@@ -4646,7 +4649,7 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 			m_DeliveredRightCol = (int)ceilf((float)(m_videoRect.left + vidW) / winW * ML_DOWNSAMPLE_W) - 1;
 
 			// Letterbox inside the video rect, mapped from source-readback rows.
-			// contentBottom < 0 means the detector has not produced a band yet â€”
+			// contentBottom < 0 means the detector has not produced a band yet Ã¢â‚¬â€
 			// fall back to the full video rect rather than a zero-height crop.
 			const bool haveBars = (m_MLBarDetected.contentBottom >= m_MLBarDetected.contentTop);
 			const float barTop = haveBars ? (float)m_MLBarDetected.contentTop / ML_DOWNSAMPLE_H : 0.0f;
@@ -4673,7 +4676,7 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 		//
 		// Not m_MLBarDetected: those rows are measured on the convert output, which
 		// is VIDEO-sized, while these caches come off the post-scale chain, which is
-		// WINDOW-sized. Reusing them crops the wrong rows â€” a 2.39:1 film has the same
+		// WINDOW-sized. Reusing them crops the wrong rows Ã¢â‚¬â€ a 2.39:1 film has the same
 		// bar FRACTION in both spaces, so the result looks plausible and is still
 		// wrong, which is why crush sat at a constant 0.258 on every scene no matter
 		// what was playing. Map the content rect through m_videoRect/m_windowRect,
@@ -4767,7 +4770,7 @@ void CDX11VideoProcessor::CreateMLTextures()
 	}
 
 	// DELIVERED-frame instrument: two more caches of the SAME shape. They share
-	// m_MLStaging at read-back time (one Map each, scene rate, sequential â€” the same
+	// m_MLStaging at read-back time (one Map each, scene rate, sequential Ã¢â‚¬â€ the same
 	// thread owns both), so this costs two textures and no extra staging. A failed
 	// create just disables that boundary's measurement; the log says so.
 	hr = m_pDevice->CreateTexture2D(&cache, nullptr, &m_MLDeliveredCurveOut);
@@ -4838,9 +4841,9 @@ void CDX11VideoProcessor::InitMLDebug()
 			L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
 			L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
 			L"featReady,stale,convSeen,texConv,feat0,feat1,pred,dehaze,rolloffCtl,"
-			// Appended 2026-09-20. The swap chain cannot identify the pipeline â€”
+			// Appended 2026-09-20. The swap chain cannot identify the pipeline Ã¢â‚¬â€
 			// it is G22P709 in BOTH "tone mapped" and "not tone mapped" on an SDR
-			// display â€” so a capture with the two could not be told apart, and the
+			// display Ã¢â‚¬â€ so a capture with the two could not be told apart, and the
 			// comparison that mattered was unreadable. `correction` names the
 			// converter actually selected and `mlIsPQ` is the domain the Zion grade
 			// was TOLD its input is; those two must agree.
@@ -4897,7 +4900,7 @@ void CDX11VideoProcessor::LogMLFrame()
 		(m_bMLDebugCopy ? 1 : 0),
 		m_MLDebugFeatReady, m_MLDebugStale, m_MLDebugConvertSeen, m_MLDebugTexConv,
 		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred, (double)m_MLShadowDehazeApplied, (double)m_MLRolloffCtrlApplied,
-		// Four specifiers, four arguments â€” keep them in step. A specifier added
+		// Four specifiers, four arguments Ã¢â‚¬â€ keep them in step. A specifier added
 		// without its argument corrupts the file this log exists to be read from.
 		(int)m_bConvertToSdr,
 		(m_strCorrection ? m_strCorrection : L"-"),
@@ -5336,10 +5339,12 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	BufferDesc = { sizeof(FLOAT) * 4, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pHalfOUtoInterlaceConstantBuffer));
 
-	// 32 floats: [0..16] as before, then the DBLE diagnostic view. [20] view,
-	// [21] tex width, [24..27] the picture's UV rect inside Tex, [28] measured
-	// picture %. 32 floats = 128 bytes, a multiple of 16 as D3D11 requires.
-	BufferDesc = { sizeof(FLOAT) * 32, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+	// 16 floats: [0..1] dither coord scale, [2] cube LUT enabled, [3] cube LUT
+	// size, [4] dither active, [5] LUT mode, [6] display/gamut convert,
+	// [7] source space, [8] target transfer, [9] display black, [10] source
+	// gamma, [11] gamut convert, [12] source gamut, [13] target gamut,
+	// [14..15] reserved. 16 floats = 64 bytes.
+	BufferDesc = { sizeof(FLOAT) * 16, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pFinalPassConstantBuffer));
 
 	BufferDesc = { sizeof(PS_EXTSHADER_CONSTANTS), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
@@ -5362,12 +5367,10 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	HRESULT hr3 = m_Font3D.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 	DLogIf(FAILED(hr3), L"m_Font3D.InitDeviceObjects() failed with error {}", HR2Str(hr3));
-	const HRESULT hrDbleFont = m_DbleFont.InitDeviceObjects(m_pDevice, m_pDeviceContext);
-	DLogIf(FAILED(hrDbleFont), L"m_DbleFont.InitDeviceObjects() failed with error {}", HR2Str(hrDbleFont));
-	const HRESULT hrDbleMeasure = InitDbleMeasure();
-	DLogIf(FAILED(hrDbleMeasure), L"InitDbleMeasure() failed with error {}", HR2Str(hrDbleMeasure));
 	if (SUCCEEDED(hr3)) {
 		hr3 = m_StatsBackground.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+		hr3 = m_DbleRect.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+		hr3 = m_DbleQuad.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Rect3D.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Underlay.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Lines.InitDeviceObjects(m_pDevice, m_pDeviceContext);
@@ -5375,6 +5378,13 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 		DLogIf(FAILED(hr3), L"Geometric primitives InitDeviceObjects() failed with error {}", HR2Str(hr3));
 	}
 	ASSERT(S_OK == hr3);
+
+	// ClipGuard: shaders compiled here, before any ring sizing, so the extra
+	// post-scale step is counted from the first frame.
+	{
+		const HRESULT hrClipGuard = m_Dble.InitDevice(m_pDevice, m_pDeviceContext, GetMLModuleDir());
+		DLogIf(FAILED(hrClipGuard), L"ClipGuard: InitDevice failed with error {}", HR2Str(hrClipGuard));
+	}
 
 	if (m_pFilter->m_inputMT.IsValid()) {
 		if (!InitMediaType(&m_pFilter->m_inputMT)) {
@@ -5748,7 +5758,7 @@ void CDX11VideoProcessor::ApplyInputColorSpaceOverride()
 	// Override BOTH formats: m_srcExFmt drives the D3D11 VP / shader
 	// conversion matrices, m_decExFmt drives SourceIsHDR10orHLG() (and the
 	// PQ/HLG tone-map + swapchain decisions keyed off it). NominalRange is
-	// left to auto-detection (16-235 fallback in SpecifyExtendedFormat) â€”
+	// left to auto-detection (16-235 fallback in SpecifyExtendedFormat) Ã¢â‚¬â€
 	// only the matrix / primaries / transfer are forced to the signal.
 	DXVA2_ExtendedFormat& x = m_srcExFmt;
 	switch (m_InputColorSpaceOverride) {
@@ -5813,7 +5823,7 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 	// High-level: signal/format change arriving at the renderer. Paired with the
 	// DONE line at the end of this function, so a renegotiation is bracketed and
 	// a fault inside it is attributable. (The ml_debug.csv frame log is untouched
-	// â€” that one is for image-quality work.)
+	// Ã¢â‚¬â€ that one is for image-quality work.)
 	m_pFilter->LogLine("renderer: InitMediaType ENTER (media type change; dims reported on the DONE line)");
 
 	if (!VerifyMediaType(pmt)) {
@@ -6206,8 +6216,8 @@ BOOL CDX11VideoProcessor::GetAlignmentSize(const CMediaType& mt, SIZE& Size)
 
 HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 {
-	// â”€ Per-frame trace, always on. The faults land inside the render path with
-	// no engine-side marker, so every frame is bracketed here and along the way â€”
+	// Ã¢â€â‚¬ Per-frame trace, always on. The faults land inside the render path with
+	// no engine-side marker, so every frame is bracketed here and along the way Ã¢â‚¬â€
 	// a crash then shows exactly which sub-step died, on which frame.
 	static unsigned long long s_traceFrames = 0;
 	const unsigned long long seq = ++s_traceFrames;
@@ -6241,19 +6251,19 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 		m_RenderStats.failed++;
 		return hr;
 	}
-	VLog(L"[RT] ProcessSample #{} CopySample done â€” Render ENTER", seq);
+	VLog(L"[RT] ProcessSample #{} CopySample done Ã¢â‚¬â€ Render ENTER", seq);
 
 	// The experimental tone mapper is driven by the same per-frame statistics, so it
-	// keeps them fresh on its own â€” see the extraction gate in Process().
+	// keeps them fresh on its own Ã¢â‚¬â€ see the extraction gate in Process().
 	if (MLStatsNeeded()) {
 		m_bMLFeaturesStale = true; // re-analyze on the next render
 	}
 
 	// always Render(1) a frame after CopySample()
 	hr = Render(1, rtStart);
-	VLog(L"[RT] ProcessSample #{} Render returned hr=0x{:08X} â€” draw stats", seq, (unsigned)hr);
+	VLog(L"[RT] ProcessSample #{} Render returned hr=0x{:08X} Ã¢â‚¬â€ draw stats", seq, (unsigned)hr);
 
-	// [VP-DBG] present-path census: proves the full chain ran â€” sample copied,
+	// [VP-DBG] present-path census: proves the full chain ran Ã¢â‚¬â€ sample copied,
 	// shader pass executed, rect geometry at draw time. First 3, then every 300th.
 	if (seq <= 3 || seq % 300 == 0) {
 		UINT chainW = 0, chainH = 0;
@@ -6406,9 +6416,9 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 			}
 		}
 
-		// Content-side ST 2086 snapshot (see m_hdr10Cllâ€¦ docs): keep the last
+		// Content-side ST 2086 snapshot (see m_hdr10CllÃ¢â‚¬Â¦ docs): keep the last
 		// values the SAMPLE carried. m_lastHdr10 is only written on an HDR10
-		// swapchain (SDR displays skip it and it stays zero) â€” the panel's
+		// swapchain (SDR displays skip it and it stays zero) Ã¢â‚¬â€ the panel's
 		// MaxCLL/MaxFALL/Mastering rows must read this display-independent copy.
 		if (m_hdr10.hdr10.MaxContentLightLevel)
 			m_hdr10Cll = m_hdr10.hdr10.MaxContentLightLevel;
@@ -6778,13 +6788,13 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 	// Feature extraction also lives here (NOT inside the swap-chain4/HDR
 	// metadata block): playback can render through a path where that block is
 	// bypassed, which silently stalled AUTO mode for a whole session.
-	// Feature extraction runs while ML is armed â€” active OR auto-pending â€” so the
+	// Feature extraction runs while ML is armed Ã¢â‚¬â€ active OR auto-pending Ã¢â‚¬â€ so the
 // AUTO path warms from the preloaded pipeline instead of waiting on activation.
 	//
 	// The experimental tone mapper feeds on the same statistics, so it arms the
 	// extractor on its own: a user who selects it with the Zion grade off must
-	// still get a curve, and the alternative â€” quietly reusing whatever stale
-	// statistics were left over â€” reads to the user as "the control does nothing".
+	// still get a curve, and the alternative Ã¢â‚¬â€ quietly reusing whatever stale
+	// statistics were left over Ã¢â‚¬â€ reads to the user as "the control does nothing".
 	// MLStatsNeeded() is the one predicate for "these statistics are wanted"; the
 	// staleness flag and the convert-seen latch below use it too, so the three
 	// cannot drift apart again.
@@ -6797,8 +6807,8 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			m_bMLFeaturesStale = false;
 			UpdateToneLut();
 
-			// DELIVERED instrument. Placed HERE â€” beside the extraction, which is
-			// known to run â€” and throttled on its own frame counter rather than on the
+			// DELIVERED instrument. Placed HERE Ã¢â‚¬â€ beside the extraction, which is
+			// known to run Ã¢â‚¬â€ and throttled on its own frame counter rather than on the
 			// peak anchor's cut/lock state machine. Two earlier placements rode on that
 			// machine and both failed silently: nested inside its "applied peak moved"
 			// branch it never ran, and keyed on `m_SceneFrames == kSceneSettleFrames` it
@@ -6807,7 +6817,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			// 2001 lines a minute are the same bug: a trigger borrowed from someone
 			// else's state.
 			//
-			// 30 render frames is ~0.5 s at 60, ~1.25 s at 24 â€” fine for a scene-level
+			// 30 render frames is ~0.5 s at 60, ~1.25 s at 24 Ã¢â‚¬â€ fine for a scene-level
 			// number, and the read-back (2 Maps) is the only real cost.
 			// m_bTasteProbePending makes a dial move produce a measurement on the next
 			// frame instead of up to 30 frames later: the pending flag is set where the
@@ -6837,8 +6847,8 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			// lag was fixed.
 			//
 			// It is not fixed. Measured 2026-09-20 on a static scene, filt_pq ramped
-			// 0.3202 -> 0.3785 across frames 172-252 â€” about 80 frames, over three
-			// seconds â€” with mix = 0.000 on every line. The hysteresis never fires,
+			// 0.3202 -> 0.3785 across frames 172-252 Ã¢â‚¬â€ about 80 frames, over three
+			// seconds Ã¢â‚¬â€ with mix = 0.000 on every line. The hysteresis never fires,
 			// so nothing snaps and the IIR always wins.
 			//
 			// The cause was the bias term, and it was a real departure from
@@ -6851,7 +6861,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			//
 			// FIXED 2026-09-20: BuildMLFeatures now reports a 16x16 CELL-active
 			// fraction, the workgroup analogue. The consequence of the old behaviour
-			// was not only lag â€” it was CLIPPING. peakSdrUnits = max(peak/sdrNits, 1)
+			// was not only lag Ã¢â‚¬â€ it was CLIPPING. peakSdrUnits = max(peak/sdrNits, 1)
 			// means a stale LOW peak keeps the divisor at hable(1.0), i.e. "85 nits is
 			// white"; cut to a bright scene and everything above 85 nits overflows and
 			// is flattened by the closing saturate(). The normalisation stayed anchored
@@ -6877,8 +6887,8 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			// Step 4 is why this cannot lag. The IIR only wins for deviations BELOW
 			// the low threshold (1 dB); above the high threshold (3 dB) the mix
 			// coefficient reaches 1 and the value JUMPS in a single frame. The filter
-			// is left doing what it is for â€” sub-1 dB drift, which is where noise
-			// lives â€” and a real scene change goes straight through.
+			// is left doing what it is for Ã¢â‚¬â€ sub-1 dB drift, which is where noise
+			// lives Ã¢â‚¬â€ and a real scene change goes straight through.
 			//
 			// An earlier version here used ONE hard threshold at 0.12 PQ, roughly 4x
 			// libplacebo's high threshold. Ordinary scene changes fell into the
@@ -6893,12 +6903,12 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			float avgPq = m_MLFeatures[1];
 			float maxPq = (m_MLPeakPq995 > 0.0f) ? m_MLPeakPq995 : m_MLFeatures[0];
 
-			// Plausibility gate â€” NOT libplacebo's, and the one place this departs
+			// Plausibility gate Ã¢â‚¬â€ NOT libplacebo's, and the one place this departs
 			// from it. PQ 1.0 decodes to 10000 nits and is what the extractor
 			// reports when it saturates (observed live: raw_pq=1.0000 /
 			// raw_nits=10000.0). Fed to the filter it would poison the state for
 			// many frames, so a read outside a sane band is treated as a failed read
-			// and skipped outright â€” the filter simply holds.
+			// and skipped outright Ã¢â‚¬â€ the filter simply holds.
 			const float maxNits = exptm::PqToLinearNits(maxPq);
 			if (maxNits > 10.0f && maxNits < 4000.0f) {
 				// Published every frame, not only on a cut: SetMLParams consumes it and
@@ -6907,7 +6917,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				m_bSceneCut = false;
 
 				if (m_PeakAvgPq == 0.0f) {
-					// No state yet â€” take the first reading outright
+					// No state yet Ã¢â‚¬â€ take the first reading outright
 					// (libplacebo: "if (!obj->peak.avg_pq)"), as a fresh scene.
 					m_PeakAvgPq = avgPq;
 					m_PeakMaxPq = maxPq;
@@ -6947,12 +6957,12 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				// 3. Snap / settle / LOCK, with asymmetric drift (2026-09-22).
 				//
-				// The IIR-20 under this comment used to do BOTH jobs â€” snap on a cut
-				// and smooth within a scene â€” and the two need opposite behaviour:
+				// The IIR-20 under this comment used to do BOTH jobs Ã¢â‚¬â€ snap on a cut
+				// and smooth within a scene Ã¢â‚¬â€ and the two need opposite behaviour:
 				// cuts must arrive instantly, within a scene the anchor should not
 				// move at all. Because the IIR always TRACKS, a bright element that
 				// left frame (a lamp pans off, the sky shrinks) pulled the anchor
-				// down at ~5%/frame and the whole picture LIFTED over ~0.8 s â€” the
+				// down at ~5%/frame and the whole picture LIFTED over ~0.8 s Ã¢â‚¬â€ the
 				// "room breathing" that reads as the picture responding to nothing.
 				//
 				// Three speeds now:
@@ -6961,7 +6971,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				//                                the new scene's true level
 				//   locked                     -> the anchor does NOT follow content;
 				//                                only a slow DOWNWARD leak (period ~200,
-				//                                â‰ˆ8 s) when the peak actually drops,
+				//                                Ã¢â€°Ë†8 s) when the peak actually drops,
 				//                                so the picture may brighten gently but
 				//                                can never DIM within a scene. Dimming
 				//                                pumps are visible; slow brightening is
@@ -6969,8 +6979,8 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				//                                live-vs-anchor on the next frame.
 				constexpr int kSceneSettleFrames = 12;   // ~0.5 s at 24 fps
 				// The LIGHTING-CHANGE gate (2026-09-22): a camera cut within one
-				// physical scene is exposure-matched by the DOP â€” the global mean
-				// stays in a tight band â€” whereas a true SCENE change (new light)
+				// physical scene is exposure-matched by the DOP Ã¢â‚¬â€ the global mean
+				// stays in a tight band Ã¢â‚¬â€ whereas a true SCENE change (new light)
 				// moves it. A frame can snap the anchor only if the mean shifted by
 				// more than this band, so abrupt zone-global changes that carry the
 				// same exposure (camera cuts, whip-pans back into the same light)
@@ -6983,7 +6993,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// 4. Scene-change hysteresis. bias = the non-black CELL fraction, so a
 				// letterboxed or mostly-black frame cannot register a change on its own.
 				// Fixed 2026-09-20: this used to be a PIXEL fraction, which on a sparse
-				// frame scaled delta below thresh_low and pinned mix at 0 â€” the snap
+				// frame scaled delta below thresh_low and pinned mix at 0 Ã¢â‚¬â€ the snap
 				// never fired and the IIR ramp alone set the peak, so a cut to a bright
 				// scene kept the previous scene's normalisation for ~3 seconds and the
 				// highlights clipped against it. See BuildMLFeatures.
@@ -6993,7 +7003,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// has light sources, the other does not), so delta stays under thresh_low,
 				// the hysteresis never fires, and the IIR glides the anchor from the old
 				// scene's value to the new one's over ~0.8 s. The glide is visible in
-				// whichever direction it runs â€” bright settling dim, or dim brightening â€”
+				// whichever direction it runs Ã¢â‚¬â€ bright settling dim, or dim brightening Ã¢â‚¬â€
 				// and both of those were reported, in that order.
 				//
 				// Including the peak catches it: a peak jump IS a scene change. This was
@@ -7002,17 +7012,17 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// across 4198 frames), so it cannot fire spuriously on ordinary frames.
 				// The gate keys on the PEAK deviation alone, deliberately NOT the average
 				// (2026-09-22). A character in dark clothing walking into the frame is
-				// a large AVERAGE change but leaves the p99.5-percentile â€” the top of
-				// the histogram is still the same bright lights/sky â€” essentially
+				// a large AVERAGE change but leaves the p99.5-percentile Ã¢â‚¬â€ the top of
+				// the histogram is still the same bright lights/sky Ã¢â‚¬â€ essentially
 				// untouched. Including |avg - avg_a| in delta made a dark object a
 				// false scene cut: the anchor snapped to the darker reading and the
 				// whole picture reacted. The percentile is the scene-stable statistic
 				// (0.003 PQ across a shot), and it is also exactly what catches the
 				// earlier missed-cut case (identical averages, different peaks).
-				// Spike test, not level test: a real cut is a DISCONTINUITY â€” this frame's
+				// Spike test, not level test: a real cut is a DISCONTINUITY Ã¢â‚¬â€ this frame's
 				// delta dominates its recent baseline. Occlusion (dark clothing
 				// walking past the lamp) and camera reframes move the peak as a RAMP,
-				// where every frame's delta is comparable to its own recent past â€” so
+				// where every frame's delta is comparable to its own recent past Ã¢â‚¬â€ so
 				// the spike test never fires on them, however far p99.5 wanders.
 				// Measured 2026-09-22: filt_pq swung 0.4496..0.5953 inside one scene
 				// because the peak-only level test snapped on every ramp.
@@ -7021,19 +7031,19 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				// BASELINE FIRST, from the PREVIOUS frames only, then insert this one.
 				//
-				// The order this sat in â€” insert, then read the max of a window that now
-				// contains `delta` itself â€” made the spike test read
+				// The order this sat in Ã¢â‚¬â€ insert, then read the max of a window that now
+				// contains `delta` itself Ã¢â‚¬â€ made the spike test read
 				//     delta > 3 * max(delta, recent)
 				// which is `delta > 3*delta`, false for any positive delta. The spike test
 				// could therefore NEVER fire. Measured 2026-10-02 on the user's own clip:
 				// 7638 frames had two or more gates passing, and `base` was 0 on EVERY
-				// one â€” the real cut at frame 102 (zones 0.76, mean shifted 0.357->0.215,
+				// one Ã¢â‚¬â€ the real cut at frame 102 (zones 0.76, mean shifted 0.357->0.215,
 				// peak +0.10 PQ) was rejected by base=0. sceneCut fired ZERO times in 5.5
 				// minutes.
 				//
 				// The consequence is worse than a missed snap. With no cut ever announced,
 				// the anchor LOCKED on a stale peak (held=0.5023 while raw sat at 0.56+),
-				// so `delta` was ~0.06 on EVERY frame â€” the baseline is now honestly ~0.06,
+				// so `delta` was ~0.06 on EVERY frame Ã¢â‚¬â€ the baseline is now honestly ~0.06,
 				// and a cut's step ON TOP of that offset is only ~1.7x the baseline, not 3x.
 				// The stale anchor locks itself in: it persists precisely because the gate
 				// that would refresh it is the one the self-reference killed. Fix the order
@@ -7045,10 +7055,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				m_DeltaHistory[m_DeltaIdx++] = delta;
 				m_DeltaIdx &= 3;
 
-				// Zonal coherence â€” the SPATIAL half of the cut test. A cut is
+				// Zonal coherence Ã¢â‚¬â€ the SPATIAL half of the cut test. A cut is
 				// globally simultaneous: most of the 5x5 zone maxes move together.
 				// Occlusion (a character walking past the lamp) moves only the
-				// zones they touch â€” local, never majority. So this frame is a cut
+				// zones they touch Ã¢â‚¬â€ local, never majority. So this frame is a cut
 				// only if it ALSO clears the zone-majority gate.
 				if (m_ZoneSeen) {
 					int zonesMoved = 0;
@@ -7069,7 +7079,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				const bool gMean  = meanD > kSceneMeanBand;
 				const bool sceneCut = gSpike && gBase && gZone && gMean;
 
-				// CUTCAND â€” the instrument this whole bug needs, and the one the
+				// CUTCAND Ã¢â‚¬â€ the instrument this whole bug needs, and the one the
 				// HABLE_PEAK line below cannot be: it only fires when the applied peak
 				// actually MOVED, so a cut the detector MISSES emits no line at all. The
 				// failure is invisible by construction, and "still not fixed" with no log
@@ -7104,7 +7114,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				// THE SCENE DECISION. `demand` is a shot's mean-nits; the reference is what
 				// the exposure solve is allowed to divide by. Two rules, both aimed at the
-				// same failure â€” adapting once per cut is adapting once per LINE OF
+				// same failure Ã¢â‚¬â€ adapting once per cut is adapting once per LINE OF
 				// DIALOGUE, and a matched reverse angle changes every statistic without
 				// changing the light.
 				//
@@ -7139,7 +7149,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				if (sceneCut) {
 					m_bSceneCut = true;
-					// SNAP â€” a real scene change arrives in ONE frame.
+					// SNAP Ã¢â‚¬â€ a real scene change arrives in ONE frame.
 					//
 					// The CURVE PEAK always follows the cut, whatever the scene decision
 					// says. It is the highlight-safety quantity and it is per-shot by
@@ -7152,7 +7162,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_MeanNitsRobustSmooth = m_MLMeanNitsRobust;
 
 					// A cut that lands BEFORE the previous shot reached its lock means that
-					// shot was never measured to convergence â€” which, at dialogue pacing,
+					// shot was never measured to convergence Ã¢â‚¬â€ which, at dialogue pacing,
 					// means the previous "scene" is still being measured. Rapid cutting is
 					// itself the evidence: a DOP does not re-light between angles 0.7 s
 					// apart. Fold the shots into one cluster and let its median speak.
@@ -7171,7 +7181,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// and pinned ref=21.9 against a shot demand of 3.8.
 					if (m_bSceneSame && refBeforeCut > 0.0f) m_fSceneMeanRef = refBeforeCut;
 
-					// The bands follow the SCENE, not the cut â€” see m_BandPq. This is the
+					// The bands follow the SCENE, not the cut Ã¢â‚¬â€ see m_BandPq. This is the
 					// single change that removes the pump: while the scene holds, the
 					// controller's inputs do not move, so its solve cannot move, so the
 					// grade cannot breathe with the content of a locked shot.
@@ -7203,7 +7213,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						m_MeanNitsRobustSmooth += settleCoeff * (m_MLMeanNitsRobust - m_MeanNitsRobustSmooth);
 					}
 					// Bands converge with the anchor, but only while the scene is allowed
-					// to move â€” a held scene's bands stay held through the settle too.
+					// to move Ã¢â‚¬â€ a held scene's bands stay held through the settle too.
 					if (!m_bSceneSame) {
 						for (int i = 0; i < 3; ++i) {
 							if (m_BandPq[i] < 0.0f) m_BandPq[i] = bandRaw[i];
@@ -7215,7 +7225,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					if (m_SceneFrames >= kSceneSettleFrames) {
 						m_SceneLocked = true;
 						justLocked = true;
-						// LOCK is where a shot's demand becomes trustworthy â€” measured over
+						// LOCK is where a shot's demand becomes trustworthy Ã¢â‚¬â€ measured over
 						// the whole settle, not on the single (often transitional) frame the
 						// cut landed on. Record it, and refine the provisional decision the
 						// cut made from that one frame. Locking onto frame one is how a
@@ -7227,14 +7237,14 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						m_nCluster = 0;
 					}
 				}
-				// LOCKED â€” nothing else moves the anchor, the mean, or the bands. A
+				// LOCKED Ã¢â‚¬â€ nothing else moves the anchor, the mean, or the bands. A
 				// detected cut is the only way back to motion. That is also the honest
 				// limit of this design: a long take whose lighting changes WITHOUT a cut
 				// (a lamp switched on, a dolly into sunlight) is held at the scene's
 				// established level until something cuts. The sustained-drift path that
 				// would catch it is the next piece, not this one.
 
-				// SCENE â€” the verdict, not the measurement. Whether the veto engaged is the
+				// SCENE Ã¢â‚¬â€ the verdict, not the measurement. Whether the veto engaged is the
 				// only way to tell "the scene held, correctly" from "the exposure is stuck",
 				// and the two look identical on screen. Printed on a cut and on the lock
 				// that follows it, so a dialogue exchange reads as a handful of lines and a
@@ -7255,8 +7265,8 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				// THE PEAK IS A MAXIMUM, NOT A LOCKED AVERAGE.
 				//
-				// The snap/settle/LOCK discipline is right for the exposure mean â€” a mean
-				// that follows content is a pump â€” and it is WRONG for the peak, for two
+				// The snap/settle/LOCK discipline is right for the exposure mean Ã¢â‚¬â€ a mean
+				// that follows content is a pump Ã¢â‚¬â€ and it is WRONG for the peak, for two
 				// reasons that compound. A scene's peak is not known at its start; it is
 				// discovered as the scene plays. And the error is asymmetric: under-estimating
 				// the peak slams the top of the range into the clamp, over-estimating costs a
@@ -7265,7 +7275,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				//
 				// Measured 2026-10-04: Gladiator II's Paramount logo fades in from black, the
 				// anchor locked at 127 nits, the sky arrived seconds later, and the curve went
-				// on normalising by a peak that scene had outgrown eight seconds earlier â€” full
+				// on normalising by a peak that scene had outgrown eight seconds earlier Ã¢â‚¬â€ full
 				// blowout, every cloud floor gone.
 				//
 				// So: fast attack, slow release, reset only when a NEW scene is accepted (a
@@ -7276,17 +7286,17 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				const float measPeakNits = exptm::PqToLinearNits(maxPq);
 				// AND THE CEILING MUST SEE THE TRUE MAX, NOT THE PERCENTILE.
 				//
-				// p99.5 is the right statistic for EXPOSURE â€” stable, immune to one lamp â€”
+				// p99.5 is the right statistic for EXPOSURE Ã¢â‚¬â€ stable, immune to one lamp Ã¢â‚¬â€
 				// and structurally the WRONG one for a highlight ceiling, because excluding
 				// the brightest 0.5% excludes exactly the sun, the flare, the specular that
 				// defines where the scene actually tops out. Measured 2026-10-04 on the
 				// Gladiator II ship scene: usePk=130..289 from p99.5 while the flare sat far
 				// above it, so the whole cloud mass was lifted an extra stop into the
-				// shoulder's flattest region and the internal detail flattened out â€” the
+				// shoulder's flattest region and the internal detail flattened out Ã¢â‚¬â€ the
 				// "missing highlight detail" report, and the capture proved it was a LIFT,
 				// not a clip (nothing reached 250).
 				//
-				// The true max is noisy â€” a grain spike is an anecdote â€” so it is debounced:
+				// The true max is noisy Ã¢â‚¬â€ a grain spike is an anecdote Ã¢â‚¬â€ so it is debounced:
 				// a candidate must be seen on three consecutive frames before it raises the
 				// ceiling. A flare repeats; grain does not.
 				const float rawMaxNits  = exptm::PqToLinearNits(m_MLFeatures[0]);
@@ -7299,19 +7309,19 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// This quantity rescales the ENTIRE image, so the rule is different from the
 				// one that governs the exposure mean: it may move RARELY and it may move in
 				// STEPS, but it may never move continuously. The first cut violated exactly
-				// that â€” it decayed every single frame and snapped up whenever grain happened
+				// that Ã¢â‚¬â€ it decayed every single frame and snapped up whenever grain happened
 				// to line up for three frames. A continuous slide punctuated by jumps, on the
 				// one number that re-weights every pixel, is precisely "visible shimmer".
 				//
 				//   margin      a rise must clear 10%. Below that it is not distinguishable
 				//               from film grain on a bright sky, which is the noise source
-				//               here â€” maxscl is a MAX, so grain shows up in it directly.
+				//               here Ã¢â‚¬â€ maxscl is a MAX, so grain shows up in it directly.
 				//   persistence five consecutive frames. A flare sustains; a dither spike
 				//               does not.
 				//   release     once per second, and only then. 4% per tick gives a ~25 s
 				//               time constant, which is what lets a long take come back down
 				//               after one flare. The point is not the rate, it is that the
-				//               other 23 frames of that second change NOTHING â€” between ticks
+				//               other 23 frames of that second change NOTHING Ã¢â‚¬â€ between ticks
 				//               the curve is bit-identical, so there is nothing to shimmer.
 				//
 				// Net: the ceiling moves in deliberate >=10% steps, at most a few times a
@@ -7343,7 +7353,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				//
 				// The guard MUST be in the gain divisor. Reverted 2026-10-04: moving it out
 				// and giving it only the pre-compressor knee blew the highlights completely,
-				// because a knee can re-spread content that lands NEAR the ceiling â€” it cannot
+				// because a knee can re-spread content that lands NEAR the ceiling Ã¢â‚¬â€ it cannot
 				// rescue content aimed FAR above it. The gain error from a flare-excluded peak
 				// was ~3.5x; the knee's whole authority is a fraction of the ceiling. There is
 				// no local mechanism that substitutes for the global one here.
@@ -7352,11 +7362,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				// LATCH the scene peak.
 				//
-				// m_HableScenePeakNits is deliberately a fast quantity â€” the running max
+				// m_HableScenePeakNits is deliberately a fast quantity Ã¢â‚¬â€ the running max
 				// rises for a flare and decays 4% every second. That is correct for a
 				// curve that only divides by it, and catastrophic for one that is SOLVED
 				// from it: every tick re-solves g, p and k, and the picture breathes once
-				// a second forever. Measured immediately after the toe shipped â€” the toe
+				// a second forever. Measured immediately after the toe shipped Ã¢â‚¬â€ the toe
 				// removed the clamp on k that had been accidentally absorbing those moves,
 				// and the constant adjustment appeared the same build.
 				//
@@ -7381,10 +7391,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// A scene lock is what stops the curve pumping, but a lock taken at a cut
 				// describes the shot's OPENING, and shots evolve: measured on the same
 				// frame, GT7 (which tracks) delivered mean 114 while this curve (locked at
-				// the cut) delivered 133 â€” brighter than its own target, because the target
+				// the cut) delivered 133 Ã¢â‚¬â€ brighter than its own target, because the target
 				// was solved against a darker moment of the same shot.
 				//
-				// So a locked scene may re-latch when its level has genuinely departed â€”
+				// So a locked scene may re-latch when its level has genuinely departed Ã¢â‚¬â€
 				// more than 35% from the locked mean. That is rare and deliberate, a snap
 				// rather than a creep; creeping toward the live mean is exactly the pump
 				// the lock exists to prevent, and 35% is far outside anything content
@@ -7401,15 +7411,15 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 				// Solve AFTER the guarded peak exists and BEFORE anything reads the
 				// parameters. The ordering is the whole design: the solver consumes
-				// m_HableScenePeakNits, m_BandPq and m_fSceneMeanRef â€” quantities only
-				// this block may move â€” so the curve cannot respond to anything the cut
+				// m_HableScenePeakNits, m_BandPq and m_fSceneMeanRef Ã¢â‚¬â€ quantities only
+				// this block may move Ã¢â‚¬â€ so the curve cannot respond to anything the cut
 				// detector and the scene lock have not already approved. Solving earlier
 				// made it read the previous frame's peak; solving anywhere else would
 				// hand a per-frame statistic to a function that rescales every pixel.
 				SolveDynamicAutoCurve();
 
 				// AUTO EXPOSURE. Solved here because m_PeakAvgPq snaps at cuts, settles
-				// briefly and then LOCKS â€” exactly the cadence at which an exposure
+				// briefly and then LOCKS Ã¢â‚¬â€ exactly the cadence at which an exposure
 				// change is tolerable. Per-frame it would be auto-gain; per-title it
 				// would need a hand dial, which is what this replaces.
 				//
@@ -7425,25 +7435,25 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// averages in nits over the content rows.
 				if (m_bAutoRefWhite && m_fCurvePeakNits > 10.0f && m_iSDRDisplayNits > 0) {
 					// THE CURRENT SCENE, not the title's brightest. This used to divide by
-					// a running MAX of the scene mean over the title. That is monotone â€” it
-					// only ever grows and never resets mid-title â€” so every brighter scene
+					// a running MAX of the scene mean over the title. That is monotone Ã¢â‚¬â€ it
+					// only ever grows and never resets mid-title Ã¢â‚¬â€ so every brighter scene
 					// ticked srcAvg up and every later scene ticked refWhite DOWN to match
 					// the title's single brightest moment. Measured 2026-10-02 on the user's
 					// clip: refWhite marched 107.7 -> 90 -> 40 (its floor) while the scene
 					// means swung 2.4..43 nits, and the picture "just stayed dim altogether"
 					// and got dimmer as the title ran. The ratchet was added to stop
-					// night->noon pumping, but it did that by making exposure scene-blind â€”
+					// night->noon pumping, but it did that by making exposure scene-blind Ã¢â‚¬â€
 					// the exact opposite of the relative behaviour asked for.
 					//
 					// Now that the cut detector fires and the whole exposure chain SNAPS on
 					// the cut (see m_bSceneCut), a per-scene mean changes exposure only at
 					// shot boundaries, instantly, and LOCKS within a shot (m_MeanNitsSmooth
-					// does not move while m_SceneLocked) â€” so there is nothing left to pump.
+					// does not move while m_SceneLocked) Ã¢â‚¬â€ so there is nothing left to pump.
 					// The night->noon case the max was protecting against is now handled
 					// correctly: the dark shot snaps to the dark shot's exposure. The
 					// shoulder ceiling below still bounds how far a dark scene may climb, so
 					// the "dark interior loses its highlights" regression the max was
-					// originally dodging stays dodged â€” by the ceiling, which is the right
+					// originally dodging stays dodged Ã¢â‚¬â€ by the ceiling, which is the right
 					// tool for it, not by blinding the solver to the scene.
 					if (m_MeanNitsSmooth > m_MeanNitsMax) {
 						m_MeanNitsMax = m_MeanNitsSmooth;   // kept for the log/fallback only
@@ -7452,7 +7462,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// the output of decideScene(): it snaps when the light genuinely changes
 					// and holds at the ensemble median when the cut is another angle on the
 					// light it already knows. Reading m_MeanNitsSmooth here instead would
-					// re-expose on every cut â€” which at the 0.7 s shot lengths measured in
+					// re-expose on every cut Ã¢â‚¬â€ which at the 0.7 s shot lengths measured in
 					// this clip is a strobe, not an adaptation.
 					const float srcAvg = (m_fSceneMeanRef > 0.0f) ? m_fSceneMeanRef
 					                                              : m_MeanNitsSmooth;
@@ -7472,10 +7482,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						// bogus metadata) that no formula should be allowed to answer.
 						want = std::clamp(want, 40.0f, 240.0f);
 						// Slew-limit the steady state, NEVER an accepted scene change. The
-						// Â±33%/frame band exists so exposure cannot hunt between adjacent
+						// Ã‚Â±33%/frame band exists so exposure cannot hunt between adjacent
 						// frames; when the scene decision says the LIGHT changed, every
 						// input has already jumped in one step and a limit there does not
-						// stop hunting â€” it just delays the correct answer by two or three
+						// stop hunting Ã¢â‚¬â€ it just delays the correct answer by two or three
 						// frames, which is a visible climb. A held cut needs no bypass: the
 						// reference did not move, so `want` barely moves either.
 						if (m_fRefWhiteAuto > 0.0f && !(sceneCut && !m_bSceneSame)) {
@@ -7495,7 +7505,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					                              // otherwise only sent on settings changes
 					// Logged on PUSH so the filter can be watched: filt_pq is what the
 					// curve normalises by, raw is the frame's own measurement, and mix
-					// is the hysteresis coefficient â€” 0 = filtered, 1 = jumped.
+					// is the hysteresis coefficient Ã¢â‚¬â€ 0 = filtered, 1 = jumped.
 					if (m_bMLDebug && m_pMLDebugFile) {
 						fwprintf(m_pMLDebugFile,
 							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f delta=%.4f zones=%.2f meanD=%.4f\n",
@@ -7653,8 +7663,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 	// DBLE overlay, after the picture and the stats so it is never measured by
 	// the fix; toggled by the app's OSD row and Ctrl+Alt shortcuts.
-	if (m_bDbleOsdEnabled) {
+	if (m_Dble.Ready() && (m_Dble.OverlayVisible() || m_Dble.ShowViewNote() || m_Dble.HasLogNote())) {
 		DrawDbleOverlay(pBackBuffer);
+	}
+	if (m_Dble.Ready() && m_Dble.LogPending()) {
+		m_Dble.SaveLog(pBackBuffer);
 	}
 
 	if (m_bAlphaBitmapEnable) {
@@ -7817,9 +7830,9 @@ void CDX11VideoProcessor::UpdatePostScaleTexures()
 		|| m_SwapChainFmt == DXGI_FORMAT_R10G10B10A2_UNORM && m_InternalTexFmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
 	m_bDitherActive = (m_bUseDither && needDither && m_TexDither.pTexture);
-	// A loaded calibration LUT forces the final pass even with dithering off â€”
+	// A loaded calibration LUT forces the final pass even with dithering off Ã¢â‚¬â€
 	// it is the last display-referred stage and nothing else can host it.
-	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled || DisplayTransferActive() || GamutTransferActive() || m_bDbleEnabled || m_bDbleOsdEnabled;
+	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled || DisplayTransferActive() || GamutTransferActive();
 	if (m_bFinalPass) {
 		m_pPSFinalPass.Release();
 		m_bFinalPass = SUCCEEDED(CreatePShaderFromResource(
@@ -7871,12 +7884,12 @@ HRESULT CDX11VideoProcessor::UpdateConvertColorShader()
 		: (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping) && m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG) ? SHADER_CONVERT_TO_PQ
 		: SHADER_CONVERT_NONE;
 
-	// On the shader-conversion path (no hardware VP â€” e.g. P210 10-bit 4:2:2,
+	// On the shader-conversion path (no hardware VP Ã¢â‚¬â€ e.g. P210 10-bit 4:2:2,
 	// which has no D3D11 VP input format) the generated TO_SDR converter runs
 	// upstream's fixed curve and NONE of the fork's dials reach it: measured
 	// 2026-10-24, every [SHADER-CB] push landed in a buffer nothing sampled.
 	// Leave the HDR transfer in the converter output and let the correction
-	// pass â€” the fork's curve stack, same constant buffer the VP path uses â€”
+	// pass Ã¢â‚¬â€ the fork's curve stack, same constant buffer the VP path uses Ã¢â‚¬â€
 	// do the tone mapping. Chroma upsampling (KrigBilateral 4:2:2) stays in the
 	// converter, where it belongs.
 	{
@@ -8065,7 +8078,7 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 		resizerY = (h1 == h2) ? nullptr : (h1 > h2) ? m_pShaderDownscaleY.p : m_pShaderUpscaleY.p;
 	}
 
-	// NEAR-1:1 â€” do NOT run a ringing kernel. The renderer's window is often a
+	// NEAR-1:1 Ã¢â‚¬â€ do NOT run a ringing kernel. The renderer's window is often a
 	// few pixels smaller than the source (measured 31 Oct: 3840x2160 source into
 	// a 3834x2154 window), so the 4:2:2 (P210) shader path resampled by 0.16 %
 	// through Jinc/Lanczos. On high-contrast text those kernels ring and the
@@ -8141,7 +8154,7 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 
 HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect)
 {
-	// DELIVERED instrument, boundary B: `Tex` is the post-grade frame â€” after the
+	// DELIVERED instrument, boundary B: `Tex` is the post-grade frame Ã¢â‚¬â€ after the
 	// Zion shadow/highlight/gamma steps, after the custom post-scale chain, and
 	// after micro contrast in its post-warp position (NLS active), before the
 	// calibration LUT and the dither this pass adds. Sampled FIRST, before
@@ -8152,14 +8165,8 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		m_bDeliveredB = true;
 	}
 
-	// DBLEFix measurement: the finished SDR picture at 128x72 cells. Read the
-	// measurement taken two frames ago (a staging Map with DO_NOT_WAIT never
-	// stalls), then queue this frame's. Runs whenever the fix or its overlay is
-	// on; the trigger is independent of the ML grade.
-	if ((m_bDbleEnabled || m_bDbleOsdEnabled) && !m_bHDRPassthroughRaw) {
-		ReadDbleMeasurement();
-		MeasureDblePicture(Tex, srcRect);
-	}
+	// ClipGuard measures and applies the finished SDR picture in the post-scale
+	// chain (Process), before this final display pass. Nothing is measured here.
 
 	CComPtr<ID3D11RenderTargetView> pRenderTargetView;
 
@@ -8210,74 +8217,21 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 	const float gamutSrc = (float)SourceGamutId();
 	const float gamutDst = (m_iOutputGamut == 2) ? 2.0f : (m_iOutputGamut == 1 ? 1.0f : 0.0f);
 
-	// DBLE compensation. The trigger is the MEASURED brightness of the finished
-	// SDR picture, in percent of SDR white, exactly as the contributed DBLEFix
-	// does; no model or scene statistic is involved. The roll-off itself stays in
-	// target code, after the display encode in this pass.
-	bool dble = m_bDbleEnabled && !m_bHDRPassthroughRaw && m_bDbleHaveMeasure;
-	float dbleCeil = 0.0f, dbleKnee = 0.0f;
-	if (dble) {
-		const float trig = fmaxf(m_fDbleTriggerPct, 0.1f);
-		const float t = std::clamp((trig - m_fDblePicturePct) / (0.75f * trig), 0.0f, 1.0f);
-		const float amount = std::clamp(m_fDbleStrength, 0.0f, 1.0f)
-		                   * (t * t * (3.0f - 2.0f * t));
-		m_fDbleSmooth = (m_fDbleSmooth < 0.0f || m_bDbleCut) ? amount
-		              : 0.10f * amount + 0.90f * m_fDbleSmooth;
-		dbleCeil = 1.0f - 0.5f * m_fDbleSmooth;
-		dbleKnee = fminf(std::clamp(m_fDbleKnee, 0.20f, 0.95f), dbleCeil - 0.05f);
-		if (dbleCeil > 0.999f) dble = false;   // strength 0 -> identity
-	}
-	m_bDbleCut = false;   // consumed by the snap above
-	m_bDbleLastActive = dble;
-	m_fDbleLastAmount = std::max(m_fDbleSmooth, 0.0f);
-	m_fDbleLastCeil   = dbleCeil;
-	m_fDbleLastKnee   = dbleKnee;
-
-	// DBLE instrument: one line every 2 s while the feature is enabled, so a
-	// validation run can say whether it acted instead of guessing from the
-	// picture. Written by the renderer's always-on trace to mpcvr_trace.log
-	// beside the .ax; the engine's renderer sink is disabled in the app.
-	static ULONGLONG s_dbleTrace = 0;
-	const ULONGLONG dbleNow = GetTickCount64();
-	if (m_bDbleEnabled && dbleNow - s_dbleTrace >= 2000) {
-		s_dbleTrace = dbleNow;
-		char line[224];
-		snprintf(line, sizeof(line),
-			"[DBLE] active=%d picture=%.3f%% smooth=%.3f ceil=%.3f knee=%.3f trig=%.2f%% str=%.2f clip=%.4f",
-			dble ? 1 : 0, (double)m_fDblePicturePct, (double)m_fDbleSmooth,
-			(double)dbleCeil, (double)dbleKnee,
-			(double)m_fDbleTriggerPct, (double)m_fDbleStrength, (double)m_fDbleClipFrac);
-		mpcvr::TraceLog(line);
-	}
-
-	// The picture's UV rect inside Tex, for the Split view's divider and halves.
-	const float srcMapX = Tex.desc.Width  ? (float)srcRect.left    / Tex.desc.Width  : 0.0f;
-	const float srcMapY = Tex.desc.Height ? (float)srcRect.top     / Tex.desc.Height : 0.0f;
-	const float srcMapW = Tex.desc.Width  ? (float)srcRect.Width() / Tex.desc.Width  : 1.0f;
-	const float srcMapH = Tex.desc.Height ? (float)srcRect.Height()/ Tex.desc.Height : 1.0f;
-
-	const FLOAT constants[32] = {
+	// ClipGuard runs in the post-scale chain; this pass only encodes the target.
+	const FLOAT constants[16] = {
 		(float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size,
 		m_bCubeLutEnabled ? 1.0f : 0.0f, (float)m_iCubeLutSize,
 		m_bDitherActive ? 1.0f : 0.0f,
 		(float)m_iCubeLutMode,
 		convert ? 1.0f : 0.0f,
-		dble ? 1.0f : 0.0f,
 		srcSpace,
 		dstSpace,
 		DisplayBlackNorm(),
 		srcGamma,
-		dbleCeil, dbleKnee,
 		gamutConvert ? 1.0f : 0.0f,
 		gamutSrc,
 		gamutDst,
-		0, 0, 0,
-		(float)std::clamp(m_iDbleView, 0, 2),
-		(float)Tex.desc.Width,
-		0, 0,
-		srcMapX, srcMapY, srcMapW, srcMapH,
-		m_fDblePicturePct,
-		0, 0, 0
+		0.0f, 0.0f
 	};
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFinalPassConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
@@ -8493,7 +8447,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			StepSetting();
 
 			// Experimental tone curve on t1/s1. TextureCopyRect only binds t0/s0 and
-			// b0, so anything bound here survives into the draw â€” the same trick the
+			// b0, so anything bound here survives into the draw Ã¢â‚¬â€ the same trick the
 			// final pass uses for its dither and cube LUT. Unbound when inactive: the
 			// shader branches on toneLutEnable, so a disabled mapper never samples it.
 			const bool bToneLut = !m_bHDRPassthroughRaw && ToneLutActive();
@@ -8513,7 +8467,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 			// DELIVERED instrument, boundary A: the frame the tone curve just wrote.
 			// StepSetting advanced pTex to the chain texture this step rendered INTO,
-			// so *pTex is the correction's output â€” unless the correction is the last
+			// so *pTex is the correction's output Ã¢â‚¬â€ unless the correction is the last
 			// step and drew straight to the swap chain, in which case there is no
 			// texture to sample and boundary A reports n/a.
 			if (m_bMLDebug && pRT != pRenderTarget) {
@@ -8572,7 +8526,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 							// from the buffer the draw actually had bound: this is what
 							// proves "GT7 ran" rather than "GT7 was asked for".
 							f8 = pf[8]; f21 = pf[21];
-							// [19] refWhite and [13] the scene peak â€” the two inputs to
+							// [19] refWhite and [13] the scene peak Ã¢â‚¬â€ the two inputs to
 							// the GT7 adapted gain. If the picture is "blown" the first
 							// suspect is one of these being a value we did not intend:
 							// refWhite=0 (silent, fallback to 1.0) or sPk<=10 (silent,
@@ -8582,7 +8536,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 							// softKnee pre-compressor gate. The GT7 branch now reads slot
 							// 9 directly as its scene peak; on the file path m_lastHdr10
 							// may not populate, and the CPU falls back (<=10 -> mMax ->
-							// <=10 -> titlePeak clamped to as low as 100) â€” which would
+							// <=10 -> titlePeak clamped to as low as 100) Ã¢â‚¬â€ which would
 							// make cbuffer[9] ~100 instead of 991 and blow the gain 10x.
 							f9 = pf[9]; f15 = pf[15];
 							m_pDeviceContext->Unmap(m_pCbProbeStaging, 0);
@@ -8600,7 +8554,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 		if (m_pPSHDR10ToneMapping) {
 			// Raw HDR/DV passthrough: keep the pipeline (and the ring step count)
-			// intact but bind the copy shader so no tone compression happens â€”
+			// intact but bind the copy shader so no tone compression happens Ã¢â‚¬â€
 			// the SDR display then shows the unprocessed HDR/DV signal.
 			StepSetting();
 
@@ -8614,7 +8568,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		}
 
 		if (m_bMLActive && m_pPSMLGamma && m_pMLParams) {
-			// Zion ML grade â€” hook order matches libplacebo: shadow -> highlight -> gamma
+			// Zion ML grade Ã¢â‚¬â€ hook order matches libplacebo: shadow -> highlight -> gamma
 			// MLDebugPassthrough: bind the proven copy shader to all three steps
 			// to bisect "bad ML shader math" vs "broken step plumbing".
 			// Raw HDR/DV passthrough also copies every ML step (ring stays intact).
@@ -8662,7 +8616,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 					m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height,
 					(double)uvOffX, (double)uvOffY, (double)uvScX, (double)uvScY);
 				// The exact UVs the per-frame cbuffer refresh just pushed for the
-				// sky mask â€” the shader computes cuv=(input.Tex-uvOff)/uvSc.
+				// sky mask Ã¢â‚¬â€ the shader computes cuv=(input.Tex-uvOff)/uvSc.
 				fwprintf(m_pMLDebugFile, L" SKYUV=(%.4f,%.4f,%.4f,%.4f) sfrac=%.4f pfrac=%.4f luma=%.3f pDbg=%.0f pStr=%.3f\n",
 					(double)m_lastMLParams.MLSkyUVOffX, (double)m_lastMLParams.MLSkyUVOffY,
 					(double)m_lastMLParams.MLSkyUVScX, (double)m_lastMLParams.MLSkyUVScY,
@@ -8680,8 +8634,8 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				fwprintf(m_pMLDebugFile, L"MLPASS enter step=%u\n", (unsigned)(step + 1));
 			}
 
-			// Order: highlight (passthrough) â†’ gamma tone curve â†’ micro-contrast
-			// â€” the MC pass runs on the post-tone-curve I_norm (what you see).
+			// Order: highlight (passthrough) Ã¢â€ â€™ gamma tone curve Ã¢â€ â€™ micro-contrast
+			// Ã¢â‚¬â€ the MC pass runs on the post-tone-curve I_norm (what you see).
 			StepSetting();
 			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
@@ -8692,8 +8646,8 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				m_pDeviceContext->PSSetSamplers(2, 1, &m_pSamplerSky.p);
 			}
 			// Seg preview = the PRESENTED content rect (the same geometry cuv samples in
-			// the shaders). Keying the mask to the presentation â€” not the full source
-			// convert â€” keeps it aligned under player crop/zoom/pillarbox on any display
+			// the shaders). Keying the mask to the presentation Ã¢â‚¬â€ not the full source
+			// convert Ã¢â‚¬â€ keeps it aligned under player crop/zoom/pillarbox on any display
 			// aspect (e.g. ultrawide 2.39:1 with a 2.39 picture auto-cropped to fill).
 			// Staged in the next ExtractMLFeatures (1-frame latency, pre-existing).
 			{
@@ -8706,7 +8660,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				}
 			}
 			// Skin tone-preservation: pre-grade source (t3) for srcLumAt + the
-			// Poisson-relaxed personÃ—skin gate (t4). Unbound right after the gamma
+			// Poisson-relaxed personÃƒâ€”skin gate (t4). Unbound right after the gamma
 			// draw; t2 stays for MC person .g.
 			if (m_TexConvertOutput.pShaderResource && m_pSamplerSky) {
 				m_pDeviceContext->PSSetShaderResources(3, 1, &m_TexConvertOutput.pShaderResource.p);
@@ -8716,7 +8670,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				m_pDeviceContext->PSSetShaderResources(4, 1, &m_SkinGateSRV.p);
 				m_pDeviceContext->PSSetSamplers(4, 1, &m_pSamplerGate.p);
 			}
-			// Trained P(skin) LUT on t1/s1 for the gamma pass's skin-gated top-up â€”
+			// Trained P(skin) LUT on t1/s1 for the gamma pass's skin-gated top-up Ã¢â‚¬â€
 			// the SAME LUT the chroma pass uses, sampled with the same derivation so
 			// both passes agree on what counts as skin. t1 is free in this pass:
 			// t0=tex, t2=sky/person mask, t3=source, t4=gate.
@@ -8744,11 +8698,11 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				fflush(m_pMLDebugFile);
 			}
 			// MC pass: skin LUT (t1) for person-gated skin damping; the R8G8 semseg
-			// mask stays on t2 from the gamma step (person .g damping only â€” the
+			// mask stays on t2 from the gamma step (person .g damping only Ã¢â‚¬â€ the
 			// SKY channel was removed from MC in skyMC-decouple-v3).
 			//
 			// With NLS active the engine sets MLPostWarpMC and this draw moves to
-			// after the custom post-scale chain â€” the ring step is consumed there
+			// after the custom post-scale chain Ã¢â‚¬â€ the ring step is consumed there
 			// instead of here, so the count (and the ring sizing) is unchanged.
 			// The advance must move WITH the draw: an unmatched StepSetting leaves
 			// the last pass writing into a ring texture instead of the target.
@@ -8762,7 +8716,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				LogMLFrameStats(*pInputTexture, L"IN");
 			}
 
-			// 4. chroma vector tuning (skin-guarded) â€” LUT on t1, semseg mask on t2 (person .g)
+			// 4. chroma vector tuning (skin-guarded) Ã¢â‚¬â€ LUT on t1, semseg mask on t2 (person .g)
 			hrs[3] = S_OK;
 			if (m_pPSMLChroma && m_SkinLUTSRV) {
 				StepSetting();
@@ -8818,8 +8772,8 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		if (m_pPSTaste && m_pTasteParams) {
 			StepSetting();
 			// Which curves the SHAPE dials run on. They were locked to the Unplugged
-			// (Reference) curve â€” inherited from when the operators lived in the
-			// converter â€” and that lock is what made "exposure / shadow detail / punch do
+			// (Reference) curve Ã¢â‚¬â€ inherited from when the operators lived in the
+			// converter Ã¢â‚¬â€ and that lock is what made "exposure / shadow detail / punch do
 			// nothing" a reported symptom on GT7 Adapt: the dials were real, the values
 			// reached the cbuffer, and this stage simply refused to draw. A control the
 			// user can see and move has to behave the same on every curve that delivers
@@ -8868,7 +8822,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 					fwprintf(m_pMLDebugFile,
 						// gate= reports the curve test ACTUALLY used, not the reference
-						// flag â€” otherwise a dial failing under GT7 looks like a dial
+						// flag Ã¢â‚¬â€ otherwise a dial failing under GT7 looks like a dial
 						// failing for a different reason.
 						L"TASTE_DRAW step=%u hr=%x apply=%d lift=%.2f punch=%.2f dbg=%.0f trim=%d(pre-curve) "
 						L"gate=%d anyDial=%d pqOut=%d raw=%d\n",
@@ -8945,13 +8899,130 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		// chain (NLS crop+warp, deband, sharpen) so its kernel operates on the
 		// geometry the viewer actually sees: no 4x-wide halos at the stretched
 		// edges, and no black band under the kernel. This is the SAME single draw
-		// the grade block skipped above â€” the ring step count is unchanged.
+		// the grade block skipped above Ã¢â‚¬â€ the ring step count is unchanged.
 		if (m_bMLPostWarpMC && m_bMLActive && m_pPSMLShadow && m_pMLParams) {
 			StepSetting();
 			const HRESULT hrMc = DrawMLMicroContrast(pInputTexture, pRT, rect);
 			if (FAILED(hrMc)) {
 				DLog(L"ML post-warp MC failed: {}", HR2Str(hrMc));
 			}
+		}
+
+		// ClipGuard: measure the finished SDR picture, then apply the highlight
+		// compensation (and the test views) with look-ahead. After every Unplugged
+		// stage and the custom shaders; before interlaced output and the final
+		// display encode / calibration LUT / dither.
+		if (m_Dble.Ready()) {
+			StepSetting();
+			const bool bPqOut = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+			const bool bBypass = bPqOut || m_bHDRPassthroughRaw;
+			m_Dble.BeginFrame(bBypass, (m_bMLFeaturesReady && m_MLMeanNitsRaw > 0.0f) ? m_MLMeanNitsRaw : -1.0f);
+			{
+				static ULONGLONG s_cgTrace = 0;
+				const ULONGLONG cgNow = GetTickCount64();
+				if (cgNow - s_cgTrace >= 2000) {
+					s_cgTrace = cgNow;
+					char line[192];
+					snprintf(line, sizeof(line),
+						"[CG] en=%d pic=%.2f%% fix=%.3f white=%.3f hot=%d view=%d la=%d grid=%d",
+						m_clipGuard.enabled ? 1 : 0, (double)m_Dble.PicturePct(),
+						(double)m_Dble.FixAmount(), (double)m_Dble.WhiteCeil(),
+						m_Dble.HotActive() ? 1 : 0, m_clipGuard.view,
+						m_clipGuard.lookAhead, m_clipGuard.grid);
+					mpcvr::TraceLog(line);
+				}
+			}
+
+			const float inW = (float)pInputTexture->desc.Width;
+			const float inH = (float)pInputTexture->desc.Height;
+			const float offX = (float)rect.left / inW;
+			const float offY = (float)rect.top / inH;
+			const float scX = (float)rect.Width() / inW;
+			const float scY = (float)rect.Height() / inH;
+			const bool bSrc = m_TexConvertOutput.pShaderResource && (m_D3D11VP.IsReady() || m_PSConvColorData.bEnable);
+			const bool bSrcPQ = MLFeatureDomainIsPq();
+			auto bindSource = [&]() {
+				if (bSrc) {
+					m_pDeviceContext->PSSetShaderResources(1, 1, &m_TexConvertOutput.pShaderResource.p);
+					m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerLinear.p);
+				}
+			};
+			auto unbindSource = [&]() {
+				ID3D11ShaderResourceView* nul = nullptr;
+				m_pDeviceContext->PSSetShaderResources(1, 1, &nul);
+			};
+
+			m_Dble.GpuBegin();
+			if (!bBypass && rect.Width() > 0 && rect.Height() > 0) {
+				m_Dble.FillMeasureCB(scX / m_Dble.CellsX(), scY / m_Dble.CellsY(), offX, offY, scX, scY, bSrc, bSrcPQ);
+				bindSource();
+				const HRESULT hrM = TextureCopyRect(*pInputTexture, m_Dble.MeasureTex(), rect,
+					CRect(0, 0, m_Dble.CellsX(), m_Dble.CellsY()), m_Dble.PSMeasure(), m_Dble.CBMeasure(), 0, false);
+				unbindSource();
+				if (SUCCEEDED(hrM)) {
+					m_Dble.EndMeasure();
+				}
+			}
+
+			// Look-ahead: keep the last frames and show the one from N frames ago.
+			// The measurement just read is from 2 frames ago, so at N = 2 the fix
+			// lands on the frame it was measured on; beyond 2 it can also start
+			// fading a new spot in before the light appears.
+			const Tex2D_t* pShow = pInputTexture;
+			const UINT la = (UINT)m_Dble.LookAheadFrames();
+			if (!bBypass && la > 0) {
+				const UINT ring = la + 1;
+				if (ring != m_DbleDelayRing) {
+					for (auto& t : m_DbleDelay) t.Release();
+					m_DbleDelayRing = ring;
+					m_DbleDelayN = 0;
+					m_DbleDelayPos = 0;
+				}
+				const D3D11_TEXTURE2D_DESC& d = pInputTexture->desc;
+				bool ok = true;
+				for (UINT i = 0; i < ring; i++) {
+					Tex2D_t& t = m_DbleDelay[i];
+					if (t.desc.Width != d.Width || t.desc.Height != d.Height || t.desc.Format != d.Format) {
+						m_DbleDelayN = 0;
+						if (FAILED(t.Create(m_pDevice, d.Format, d.Width, d.Height, Tex2D_DefaultShader))) ok = false;
+					}
+				}
+				if (ok && pInputTexture->pTexture) {
+					m_pDeviceContext->CopyResource(m_DbleDelay[m_DbleDelayPos].pTexture, pInputTexture->pTexture);
+					if (m_DbleDelayN >= la) {
+						pShow = &m_DbleDelay[(m_DbleDelayPos + 1) % ring];
+					}
+					m_DbleDelayPos = (m_DbleDelayPos + 1) % ring;
+					m_DbleDelayN = std::min(m_DbleDelayN + 1, ring);
+				}
+			} else if (m_DbleDelayRing) {
+				for (auto& t : m_DbleDelay) t.Release();
+				m_DbleDelayN = 0;
+				m_DbleDelayRing = 0;
+			}
+
+			m_Dble.FillMainCB(bBypass, offX, offY, scX, scY, bSrc, bSrcPQ, inW);
+			bindSource();
+			hr = TextureCopyRect(*pShow, pRT, rect, rect, m_Dble.PSMain(), m_Dble.CBMain(), 0, false);
+			unbindSource();
+			m_Dble.UnbindMask();
+
+			// While the overlay shows: measure the picture as sent (after the fix),
+			// for the before/after ADL and peak readout.
+			if (!bBypass && SUCCEEDED(hr) && m_Dble.OverlayVisible() && rect.Width() > 0 && rect.Height() > 0) {
+				D3D11_TEXTURE2D_DESC od = {};
+				pRT->GetDesc(&od);
+				if (SUCCEEDED(m_DbleOut.CheckCreate(m_pDevice, od.Format, od.Width, od.Height, Tex2D_DefaultShader))) {
+					const D3D11_BOX box = { (UINT)rect.left, (UINT)rect.top, 0, (UINT)rect.right, (UINT)rect.bottom, 1 };
+					m_pDeviceContext->CopySubresourceRegion(m_DbleOut.pTexture, 0, (UINT)rect.left, (UINT)rect.top, 0, pRT, 0, &box);
+					const HRESULT hrO = TextureCopyRect(m_DbleOut, m_Dble.MeasureOutTex(), rect,
+						CRect(0, 0, m_Dble.CellsX(), m_Dble.CellsY()), m_Dble.PSMeasure(), m_Dble.CBMeasure(), 0, false);
+					if (SUCCEEDED(hrO)) {
+						m_Dble.EndMeasureOut();
+					}
+				}
+			}
+			m_Dble.GpuEnd();
 		}
 
 		if (m_pPSHalfOUtoInterlace) {
@@ -8982,7 +9053,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	}
 
 	// Latch "a convert output exists" for whoever wants the statistics. Gated on the
-	// same predicate as the extraction itself â€” gating it on the Zion grade alone
+	// same predicate as the extraction itself Ã¢â‚¬â€ gating it on the Zion grade alone
 	// was what left the experimental mapper permanently unbuilt.
 	if (MLStatsNeeded() && m_TexConvertOutput.pTexture) {
 		m_bMLConvertSeen = true;
@@ -9492,13 +9563,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_bHdrLocalToneMapping = config.bHdrLocalToneMapping;
 		m_iHdrLocalToneMappingType = config.iHdrLocalToneMappingType;
 
-		// changeHDR belongs to the ENABLE toggle only â€” and the split matters more
+		// changeHDR belongs to the ENABLE toggle only Ã¢â‚¬â€ and the split matters more
 		// than it looks, for two reasons.
 		//
 		// 1. changeHDR is expensive and dangerous on an HDR source: it reaches
 		//    ReleaseSwapChain() + m_pFilter->Init(true) + InitMediaType() (see the
 		//    `if (changeHDR)` block ~line 7676). That is the exact teardown the
-		//    bHDRPassthroughRaw comment below records as a hard fault â€” and the
+		//    bHDRPassthroughRaw comment below records as a hard fault Ã¢â‚¬â€ and the
 		//    diagnosis there was that the FAULT LAY IN THE TEARDOWN, not in the
 		//    setting. Dragging a curve row should not rebuild the graph.
 		// 2. It also made the live path dead code. That block `return`s, and
@@ -9511,7 +9582,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		// to SetHDR10ShaderParams() re-read per frame on the HDR-output path (which
 		// creates that shader lazily), a stats/OSD string, and the ToneLutActive()
 		// predicate. The two sites that CREATE the HDR10 tone-map shader gate on
-		// m_bHdrLocalToneMapping, never on the type â€” which is why the enable toggle
+		// m_bHdrLocalToneMapping, never on the type Ã¢â‚¬â€ which is why the enable toggle
 		// keeps changeHDR and the type does not.
 		if (bEnableChanged) {
 			changeHDR = true;
@@ -9523,7 +9594,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.bHDRPassthroughRaw != m_bHDRPassthroughRaw) {
 		m_bHDRPassthroughRaw = config.bHDRPassthroughRaw;
-		// NO changeHDR â€” deliberately, and this is the crash fix.
+		// NO changeHDR Ã¢â‚¬â€ deliberately, and this is the crash fix.
 		//
 		// The raw toggle only changes WHICH shader the render loop binds: per frame
 		// it picks m_pPS_Simple over the correction / HDR10-tone-map shader, and
@@ -9532,7 +9603,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		//
 		// changeHDR did not do that. It took the HDR-output path, and because the
 		// source is HDR10 that meant ReleaseSwapChain() + m_pFilter->Init(true) +
-		// InitMediaType() â€” tearing the swap chain and media type out from under a
+		// InitMediaType() Ã¢â‚¬â€ tearing the swap chain and media type out from under a
 		// live render thread. Observed as a hard fault on toggling the row:
 		//   Unplugged.exe, faulting module MpcVideoRenderer64.ax v0.10.8.2637,
 		//   exception 0xc0000005 at offset 0x93ccf.
@@ -9550,7 +9621,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		// it here. On the HDR path the tone-map cbuffer is refreshed below.
 		changeNumTextures = true;
 		// Read from the correction shader's constant buffer, so it needs the SAME
-		// update mechanism as iSDRDisplayNits just below â€” changeLuminanceParams
+		// update mechanism as iSDRDisplayNits just below Ã¢â‚¬â€ changeLuminanceParams
 		// -> SetShaderLuminanceParams(). NOT changeConvertShader: that flag
 		// rebuilds the YCbCr->RGB shader and left the gamut value never reaching
 		// the GPU, which made the control appear to do nothing.
@@ -9568,28 +9639,22 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeNumTextures = true;
 	}
 
-	if (config.bDbleEnabled != m_bDbleEnabled) {
-		m_bDbleEnabled = config.bDbleEnabled;
-		// DBLE also lives in the final pass; toggling it must create/remove it.
-		changeNumTextures = true;
-		m_fDbleSmooth = -1.0f;
+	if (config.clipGuard.logRequest != m_clipGuard.logRequest)
+		m_Dble.RequestLog(config.clipGuard.logRequest);
+	m_clipGuard = config.clipGuard;
+	m_Dble.SetNativeSettings(m_clipGuard);
+	{
+		static bool s_cgTrace = false;
+		if (!s_cgTrace) {
+			s_cgTrace = true;
+			char line[160];
+			snprintf(line, sizeof(line), "[CG] native en=%d osd=%d view=%d safe=%d,%d %dx%d",
+				m_clipGuard.enabled ? 1 : 0, m_clipGuard.osd ? 1 : 0,
+				m_clipGuard.view, m_clipGuard.osdX, m_clipGuard.osdY,
+				m_clipGuard.osdW, m_clipGuard.osdH);
+			mpcvr::TraceLog(line);
+		}
 	}
-	m_fDbleStrength    = config.fDbleStrength;
-	m_fDbleTriggerPct  = config.fDbleTriggerPct;
-	m_fDbleKnee        = config.fDbleKnee;
-	m_iDbleView        = config.iDbleView;
-	// The OSD can be the only reason the final pass (and the measurement) runs,
-	// so a toggle must create/remove the ring just like the fix itself.
-	if (config.bDbleOsd != m_bDbleOsdEnabled) {
-		m_bDbleOsdEnabled = config.bDbleOsd;
-		changeNumTextures = true;
-	}
-	m_bDbleOsdPinned   = config.bDbleOsdPinned;
-	m_iDbleOsdSelected = config.iDbleOsdSelected;
-	m_iDbleOsdX        = config.iDbleOsdX;
-	m_iDbleOsdY        = config.iDbleOsdY;
-	m_iDbleOsdW        = config.iDbleOsdW;
-	m_iDbleOsdH        = config.iDbleOsdH;
 
 	if (config.fHdrDisplayMinNits != m_fHdrDisplayMinNits) {
 		m_fHdrDisplayMinNits = config.fHdrDisplayMinNits;
@@ -9597,7 +9662,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		// next call picks the new value up without a media-type or swap-chain
 		// rebuild. Same treatment as iHdrDisplayMaxNits above.
 		//
-		// The experimental curve reads it too, and as its OUTPUT BLACK â€” force a
+		// The experimental curve reads it too, and as its OUTPUT BLACK Ã¢â‚¬â€ force a
 		// rebuild, or the new black waits for the next scene change to appear.
 		if (m_iExperimentalToneMapper != 0) {
 			m_bToneLutReady = false;
@@ -9617,12 +9682,12 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.fHdrHableKnee != m_fHdrHableKnee) {
 		m_fHdrHableKnee = config.fHdrHableKnee;
 		// Shader-constant only: the Hable branch reads it from the converter's
-		// cbuffer, so a re-push is enough. No curve rebuild â€” it is a per-pixel
+		// cbuffer, so a re-push is enough. No curve rebuild Ã¢â‚¬â€ it is a per-pixel
 		// blend weight, not a table.
 		changeLuminanceParams = true;
 	}
 
-	// Soft-plus pre-compressor parameters â€” shader-constant only, cbuffer re-push.
+	// Soft-plus pre-compressor parameters Ã¢â‚¬â€ shader-constant only, cbuffer re-push.
 	if (config.fSoftKnee != m_fSoftKnee ||
 		config.fSoftKneeRatio != m_fSoftKneeRatio ||
 		config.fSoftKneeWidth != m_fSoftKneeWidth) {
@@ -9632,13 +9697,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeLuminanceParams = true;
 	}
 
-	// Hable reference white â€” shader-constant only, cbuffer re-push.
+	// Hable reference white Ã¢â‚¬â€ shader-constant only, cbuffer re-push.
 	if (config.fHdrRefWhiteNits != m_fHdrRefWhiteNits) {
 		m_fHdrRefWhiteNits = config.fHdrRefWhiteNits;
 		changeLuminanceParams = true;
 	}
 
-	// Highlight neutral roll â€” shader-constant only, cbuffer re-push. A live drag
+	// Highlight neutral roll Ã¢â‚¬â€ shader-constant only, cbuffer re-push. A live drag
 	// on the rail therefore re-fills the converter's cbuffer alone (no curve
 	// rebuild, no graph op): the picture changes in real time.
 	if (config.fHdrHighlightNeutral != m_fHdrHighlightNeutral) {
@@ -9653,7 +9718,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeLuminanceParams = true;
 	}
 
-	// GT7 operator knobs â€” cbuffer[21..23], live re-push like the two above, so a
+	// GT7 operator knobs Ã¢â‚¬â€ cbuffer[21..23], live re-push like the two above, so a
 	// drag on the rail changes the picture without a curve rebuild or a graph op.
 	// The fade window is validated as a PAIR: an inverted or degenerate window would
 	// make smoothstep return garbage, and the shader falls back to Polyphony's
@@ -9678,7 +9743,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeLuminanceParams = true;
 	}
 	// The shoulder's reach. Bounded away from 1.0, where k = (LS-1)/(alpha-1) divides
-	// by zero, and from 0 â€” the shader reads 0 as "unset" and falls back to Polyphony's
+	// by zero, and from 0 Ã¢â‚¬â€ the shader reads 0 as "unset" and falls back to Polyphony's
 	// 0.25, so a clamped-to-zero value would silently mean something else.
 	if (config.fHdrGt7Alpha != m_fHdrGt7Alpha) {
 		m_fHdrGt7Alpha = std::clamp(config.fHdrGt7Alpha, 0.02f, 0.90f);
@@ -9747,7 +9812,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		if (m_iExperimentalToneMapper == 0) {
 			m_MLToneMaxSmooth = -1.0f;
 		}
-		// Reads the correction shader's constant buffer â€” same flag as iOutputGamut.
+		// Reads the correction shader's constant buffer Ã¢â‚¬â€ same flag as iOutputGamut.
 		changeLuminanceParams = true;
 	}
 
@@ -9773,7 +9838,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		if (SourceIsHDR()) {
 			// Re-select the converter shader DIRECTLY. This used to ask for a full
 			// VP re-init (changeVP) and that request is silently dropped in several
-			// situations â€” Configure() clears changeVP for Dolby Vision sources, and
+			// situations Ã¢â‚¬â€ Configure() clears changeVP for Dolby Vision sources, and
 			// a re-init that lands before the media type has settled does nothing.
 			// Whenever it was dropped, the control simply had no effect, which is
 			// why Convert to SDR behaved intermittently: the setting was stored
@@ -9781,7 +9846,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			// happened to follow it.
 			//
 			// bConvertToSdr is not a shader constant, it decides WHICH shader exists,
-			// so it cannot be pushed as one â€” but it can be re-selected in place,
+			// so it cannot be pushed as one Ã¢â‚¬â€ but it can be re-selected in place,
 			// which is all a re-init was achieving.
 			UpdateCorrectionShader();
 			// The correction pass is one step of the post-scale ring, so the ring's
@@ -9805,7 +9870,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		DLog(L"renderer: [SDR] display nits {} -> {}  converting={}  (live re-push)",
 			m_iSDRDisplayNits, config.iSDRDisplayNits, config.bConvertToSdr ? 1 : 0);
 		m_iSDRDisplayNits = config.iSDRDisplayNits;
-		// ALWAYS re-push: sdrNits is the OUTPUT/DISPLAY scale â€” LuminanceScale in
+		// ALWAYS re-push: sdrNits is the OUTPUT/DISPLAY scale Ã¢â‚¬â€ LuminanceScale in
 		// the converter cbuffer. The old `if (SourceIsHDR())` gate silently broke
 		// live drags on the file path, where m_decExFmt carries no colour info
 		// (flags=0 -> SourceIsHDR()==false) even though the picture IS an HDR
@@ -9860,7 +9925,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
 		m_fMLGammaTopUp = config.fMLGammaTopUp;
 		m_fMLShadowPedestal = std::clamp(config.fMLShadowPedestal, 0.0f, 0.08f);
-		// 0 is a meaningful value here â€” it means OFF, manual top-up only â€” so the
+		// 0 is a meaningful value here Ã¢â‚¬â€ it means OFF, manual top-up only Ã¢â‚¬â€ so the
 		// clamp must not be an enable test.
 		m_fMLTargetMid = std::clamp(config.fMLTargetMid, 0.0f, 0.95f);
 		m_fMLHighlight = config.fMLHighlight;
@@ -9931,7 +9996,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		UpdateMLActive();
 	}
 
-	// forced input colour space (live HDMI / DeckLink) â€” re-derive the media
+	// forced input colour space (live HDMI / DeckLink) Ã¢â‚¬â€ re-derive the media
 	// type so the override lands on m_srcExFmt + m_decExFmt before the tone-map
 	// and swapchain decisions read them (mirrors the changeHDR path).
 	if (config.iInputColorSpace != m_InputColorSpaceOverride) {
@@ -9949,11 +10014,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	// High-level: a settings application that will RENEGOTIATE the media type or
-	// the swap chain. These are the destructive Configure paths â€” the ones this
-	// project has already faulted on â€” so the trigger and the thread it runs on
+	// the swap chain. These are the destructive Configure paths Ã¢â‚¬â€ the ones this
+	// project has already faulted on Ã¢â‚¬â€ so the trigger and the thread it runs on
 	// are exactly what a post-mortem needs.
 	if (changeWindow || changeInputColor || changeHDR) {
-		m_pFilter->LogLine("renderer: Configure â€” renegotiation triggered  window=%d inputColor=%d hdr=%d "
+		m_pFilter->LogLine("renderer: Configure Ã¢â‚¬â€ renegotiation triggered  window=%d inputColor=%d hdr=%d "
 			"ics=%d active=1", changeWindow ? 1 : 0, changeInputColor ? 1 : 0, changeHDR ? 1 : 0,
 			m_InputColorSpaceOverride);
 	}
@@ -9973,7 +10038,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (changeInputColor) {
 		// force re-derive of the input colour space (ICS override or back to
-		// Auto) â€” invalidate the PQ/HLG transition latch so the HDR-toggle and
+		// Auto) Ã¢â‚¬â€ invalidate the PQ/HLG transition latch so the HDR-toggle and
 		// shader selection re-evaluate against the new signal.
 		if (m_pMLDebugFile) {
 			fwprintf(m_pMLDebugFile, L"Configure: changeInputColor -> InitMediaType(override=%d)\n",
@@ -10390,312 +10455,256 @@ void CDX11VideoProcessor::UpdateStatsPostProc()
 // with the linear-light weight; the second channel is the cell's brightest
 // sample, which is what finds the picture inside letterbox bars and detects
 // clipping. It writes to a 128x72 R16G16B16A16_FLOAT target.
-static const char kDbleMeasureHLSL[] = R"HLSL(
-Texture2D tex : register(t0);
-SamplerState samp : register(s0);
-
-cbuffer DbleMeasure : register(b0)
-{
-	float2 CellUV;
-	float2 pad0;
-};
-
-struct PS_INPUT
-{
-	float4 Pos : SV_POSITION;
-	float2 Tex : TEXCOORD;
-};
-
-float4 main(PS_INPUT input) : SV_Target
-{
-	const float2 origin = input.Tex - 0.5 * CellUV;
-	float sumL = 0.0;
-	float maxS = 0.0;
-	[loop]
-	for (int y = 0; y < 8; y++) {
-		[loop]
-		for (int x = 0; x < 8; x++) {
-			const float2 uv = origin + (float2(x, y) + 0.5) * (CellUV / 8.0);
-			const float3 c = saturate(tex.SampleLevel(samp, uv, 0).rgb);
-			const float3 lin = pow(c, 2.2);
-			sumL += dot(lin, float3(0.2126, 0.7152, 0.0722));
-			maxS = max(maxS, max(c.r, max(c.g, c.b)));
-		}
-	}
-	return float4(sumL / 64.0, maxS, 0.0, 1.0);
-}
-)HLSL";
-
-static float DbleHalfToFloat(uint16_t h)
-{
-	const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-	uint32_t exp = (h >> 10) & 0x1F;
-	uint32_t mant = h & 0x3FF;
-	uint32_t f;
-	if (exp == 0) {
-		if (mant == 0) {
-			f = sign;
-		} else {
-			exp = 127 - 15 + 1;
-			while (!(mant & 0x400)) { mant <<= 1; exp--; }
-			mant &= 0x3FF;
-			f = sign | (exp << 23) | (mant << 13);
-		}
-	} else if (exp == 31) {
-		f = sign | 0x7F800000 | (mant << 13);
-	} else {
-		f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-	}
-	float out;
-	memcpy(&out, &f, sizeof(out));
-	return out;
-}
-
-HRESULT CDX11VideoProcessor::InitDbleMeasure()
-{
-	ReleaseDbleMeasure();
-	if (!m_pDevice || !m_pDeviceContext) return E_FAIL;
-
-	ID3DBlob* pBlob = nullptr;
-	HRESULT hr = CompileShader(std::string(kDbleMeasureHLSL), nullptr, "ps_4_0", &pBlob);
-	if (SUCCEEDED(hr) && pBlob) {
-		hr = m_pDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(),
-		                                  nullptr, &m_pPSDbleMeasure);
-	}
-	if (pBlob) pBlob->Release();
-	if (FAILED(hr)) return hr;
-
-	D3D11_BUFFER_DESC bd = {};
-	bd.ByteWidth = sizeof(FLOAT) * 4;
-	bd.Usage = D3D11_USAGE_DEFAULT;
-	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	hr = m_pDevice->CreateBuffer(&bd, nullptr, &m_pCBDbleMeasure);
-	if (FAILED(hr)) return hr;
-
-	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = 128;
-	td.Height = 72;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_RENDER_TARGET;
-	hr = m_pDevice->CreateTexture2D(&td, nullptr, &m_pDbleMeasure);
-	if (FAILED(hr)) return hr;
-
-	td.Usage = D3D11_USAGE_STAGING;
-	td.BindFlags = 0;
-	td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-	for (int i = 0; SUCCEEDED(hr) && i < 3; i++) {
-		hr = m_pDevice->CreateTexture2D(&td, nullptr, &m_pDbleStaging[i]);
-	}
-	if (FAILED(hr)) return hr;
-
-	m_dbleFrame = 0;
-	m_bDbleHaveMeasure = false;
-	m_bDbleCut = false;
-	m_fDbleSmooth = -1.0f;
-	return S_OK;
-}
-
-void CDX11VideoProcessor::ReleaseDbleMeasure()
-{
-	m_pPSDbleMeasure.Release();
-	m_pCBDbleMeasure.Release();
-	m_pDbleMeasure.Release();
-	for (auto& s : m_pDbleStaging) s.Release();
-	m_dbleFrame = 0;
-	m_bDbleHaveMeasure = false;
-}
-
-void CDX11VideoProcessor::MeasureDblePicture(const Tex2D_t& Tex, const CRect& srcRect)
-{
-	if (!m_pPSDbleMeasure || !m_pCBDbleMeasure || !m_pDbleMeasure || !m_pDbleStaging[2]) return;
-	if (!Tex.desc.Width || !Tex.desc.Height || srcRect.Width() <= 0 || srcRect.Height() <= 0) return;
-
-	const FLOAT cb[4] = {
-		(float)srcRect.Width()  / Tex.desc.Width  / 128.0f,
-		(float)srcRect.Height() / Tex.desc.Height / 72.0f,
-		0.0f, 0.0f
-	};
-	m_pDeviceContext->UpdateSubresource(m_pCBDbleMeasure, 0, nullptr, cb, 0, 0);
-
-	const HRESULT hr = TextureCopyRect(Tex, m_pDbleMeasure, srcRect,
-	                                   CRect(0, 0, 128, 72), m_pPSDbleMeasure,
-	                                   m_pCBDbleMeasure, 0, false);
-	if (FAILED(hr)) return;
-
-	// Queue for reading two frames from now; the ring is what keeps the Map
-	// below from ever waiting on the GPU.
-	m_pDeviceContext->CopyResource(m_pDbleStaging[m_dbleFrame % 3], m_pDbleMeasure);
-	m_dbleFrame++;
-}
-
-void CDX11VideoProcessor::ReadDbleMeasurement()
-{
-	if (m_dbleFrame < 2) return;
-	ID3D11Texture2D* pStaging = m_pDbleStaging[(m_dbleFrame + 1) % 3];
-	if (!pStaging) return;
-
-	D3D11_MAPPED_SUBRESOURCE mr = {};
-	if (FAILED(m_pDeviceContext->Map(pStaging, 0, D3D11_MAP_READ,
-	                                 D3D11_MAP_FLAG_DO_NOT_WAIT, &mr))) {
-		return;   // not finished yet (or failed): keep the last values
-	}
-
-	const float kContent = 0.04f;   // a cell brighter than this is picture, not a bar
-	bool rowHas[72] = {};
-	bool colHas[128] = {};
-	auto cell = [&](UINT x, UINT y, int ch) {
-		const uint16_t* row = (const uint16_t*)((const uint8_t*)mr.pData + (size_t)y * mr.RowPitch);
-		return DbleHalfToFloat(row[x * 4 + ch]);
-	};
-	for (UINT y = 0; y < 72; y++) {
-		for (UINT x = 0; x < 128; x++) {
-			if (cell(x, y, 1) > kContent) { rowHas[y] = true; colHas[x] = true; }
-		}
-	}
-	int y0 = 0, y1 = 71, x0 = 0, x1 = 127;
-	while (y0 < 72 && !rowHas[y0]) y0++;
-	while (y1 >= 0 && !rowHas[y1]) y1--;
-	while (x0 < 128 && !colHas[x0]) x0++;
-	while (x1 >= 0 && !colHas[x1]) x1--;
-
-	double sum = 0.0;
-	int n = 0, clipped = 0;
-	if (y0 <= y1 && x0 <= x1) {
-		for (int y = y0; y <= y1; y++) {
-			for (int x = x0; x <= x1; x++) {
-				sum += cell(x, y, 0);
-				if (cell(x, y, 1) >= 0.995f) clipped++;
-				n++;
-			}
-		}
-		m_fDbleBottomBarFrac = (float)(71 - y1) / 72.0f;
-	} else {
-		m_fDbleBottomBarFrac = 0.0f;   // black frame: no picture to measure
-	}
-	m_pDeviceContext->Unmap(pStaging, 0);
-
-	const float pic = n ? (float)(sum / n * 100.0) : 0.0f;
-	// Scene cut: the measured brightness jumps by 2x or more. Snap instead of
-	// easing in; this is the contributed DBLEFix cut detector and needs no model.
-	if (m_bDbleHaveMeasure && std::max(pic, m_fDblePicturePct) > 0.2f
-		&& (pic > m_fDblePicturePct * 2.0f || pic < m_fDblePicturePct * 0.5f)) {
-		m_bDbleCut = true;
-	}
-	m_fDblePicturePct = pic;
-	m_fDbleClipFrac = n ? (float)clipped / (float)n : 0.0f;
-	m_bDbleHaveMeasure = true;
-}
-
-// The contributed DBLEFix overlay: its header, six setting rows with the
-// selected one marked, the measured status line, and the Clipping-test legend.
-// White text: the contributor's own DbleFix.h used dim grey (118 selected, 76
-// otherwise) for a quiet setup readout, but this app's overlay must be legible,
-// so every line is white and the '>' marker carries the selection.
-// Sits in the bottom letterbox bar when there is room, otherwise at the bottom
-// left of the picture. Drawn on the back buffer after the video and the stats,
-// so it is never measured by the fix.
 void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
 {
-	if (!m_bDbleOsdEnabled || !m_pDevice || m_windowRect.IsRectEmpty()) return;
-	const SIZE rtSize = m_windowRect.Size();
-	const UINT fontH = (UINT)std::max(14, (int)rtSize.cy / 68);
-	if (fontH != m_dbleFontH) {
-		if (FAILED(m_DbleFont.CreateFontBitmap(L"Consolas", fontH, 0))) return;
-		m_dbleFontH = fontH;
+	if (m_windowRect.IsRectEmpty()) {
+		return;
 	}
-	const SIZE ch = m_DbleFont.GetMaxCharMetric();
-	if (ch.cy <= 0) return;
-
-	static const wchar_t* views[] = { L"Normal", L"Clipping test", L"Split screen" };
-	static const wchar_t* names[] = { L"Fix", L"Strength", L"Trigger", L"Highlight start", L"View", L"Overlay" };
-	wchar_t v[6][48] = {};
-	swprintf_s(v[0], L"%ls", m_bDbleEnabled ? L"On" : L"Off");
-	swprintf_s(v[1], L"%.2f", (double)m_fDbleStrength);
-	swprintf_s(v[2], L"%.1f %%", (double)m_fDbleTriggerPct);
-	swprintf_s(v[3], L"%.2f", (double)m_fDbleKnee);
-	swprintf_s(v[4], L"%ls", views[std::clamp(m_iDbleView, 0, 2)]);
-	swprintf_s(v[5], L"%ls", m_bDbleOsdPinned ? L"Always" : L"Auto-hide");
-
-	struct Line { std::wstring text; bool selected; };
-	std::vector<Line> lines;
-	lines.reserve(10);
-	lines.push_back({ L"DBLEFix   Ctrl+Alt+arrows adjust, Ctrl+Alt+0 hide", false });
-	for (int i = 0; i < 6; i++) {
-		wchar_t buf[112];
-		swprintf_s(buf, L"%ls %-16ls %ls", (i == m_iDbleOsdSelected) ? L">" : L" ",
-		           names[i], v[i]);
-		lines.push_back({ buf, i == m_iDbleOsdSelected });
-	}
-
-	wchar_t st[192];
-	if (m_bHDRPassthroughRaw) {
-		swprintf_s(st, L"HDR output: the fix needs SDR output");
-	} else if (!m_bDbleHaveMeasure) {
-		swprintf_s(st, L"Measuring...");
-	} else {
-		const float scene = (m_MLMeanNitsRaw > 0.0f) ? m_MLMeanNitsRaw : -1.0f;
-		if (scene >= 0.0f) {
-			swprintf_s(st, L"Picture %.1f%%  Fix %.0f%%  White %.0f%%  Scene %.2f nits",
-			           (double)m_fDblePicturePct, (double)std::max(m_fDbleSmooth, 0.0f) * 100.0,
-			           (double)m_fDbleLastCeil * 100.0, (double)scene);
-		} else {
-			swprintf_s(st, L"Picture %.1f%%  Fix %.0f%%  White %.0f%%",
-			           (double)m_fDblePicturePct, (double)std::max(m_fDbleSmooth, 0.0f) * 100.0,
-			           (double)m_fDbleLastCeil * 100.0);
+	{
+		static bool s_cgDraw = false;
+		if (!s_cgDraw) {
+			s_cgDraw = true;
+			mpcvr::TraceLog("[CG] overlay draw entered");
 		}
 	}
-	lines.push_back({ st, false });
-	if (m_iDbleView == 1) {
-		lines.push_back({ L"Green fixable   Red clipped in video   Blue lowered by fix", false });
+	const SIZE rtSize = m_windowRect.Size();
+	m_Dble.EnsureFont(rtSize.cy);
+	const int u = (int)m_Dble.FontH();
+	if (u <= 0) {
+		return;
+	}
+	CD3D11Font& fM = m_Dble.Font();
+	CD3D11Font& fS = m_Dble.FontS();
+	CD3D11Font& fT = m_Dble.FontT();
+
+	CRect video;
+	if (m_clipGuard.osdW > 0 && m_clipGuard.osdH > 0) {
+		video.SetRect(m_clipGuard.osdX, m_clipGuard.osdY,
+		              m_clipGuard.osdX + m_clipGuard.osdW, m_clipGuard.osdY + m_clipGuard.osdH);
+	} else {
+		video = m_videoRect;
+	}
+	video.IntersectRect(video, CRect(0, 0, rtSize.cx, rtSize.cy));
+	if (video.IsRectEmpty()) {
+		video.SetRect(0, 0, rtSize.cx, rtSize.cy);
 	}
 
-	// The overlay is LOCKED to the bottom-left of the app's VIDEO SAFE AREA.
-	// The app sends the rect the chrome does not cover (status rail on the left,
-	// settings rail on the right, transport bar at the bottom); when a panel
-	// opens, Layout recomputes it and the overlay moves with it in one frame.
-	// With no rect (zero size) it falls back to the whole window.
-	const int lineH = (int)ch.cy;
-	const int textH = lineH * (int)lines.size();
-	const int margin = std::max(8, lineH / 2);
-	int safeL = 0, safeB = (int)rtSize.cy;
-	if (m_iDbleOsdW > 0 && m_iDbleOsdH > 0) {
-		safeL = m_iDbleOsdX;
-		safeB = m_iDbleOsdY + m_iDbleOsdH;
-	}
-	safeL = std::clamp(safeL, 0, std::max(0, (int)rtSize.cx));
-	safeB = std::clamp(safeB, 0, (int)rtSize.cy);
-	const int x = safeL + 2 * margin;
-	int y = safeB - textH - margin;
-	y = std::clamp(y, 0, std::max(0, (int)rtSize.cy - textH));
-
-	// Instrument: the overlay must be LOCKED in place. This line proves y does
-	// not move (bar is kept only as a reference; placement no longer uses it).
-	static ULONGLONG s_osdTrace = 0;
-	const ULONGLONG osdNow = GetTickCount64();
-	if (osdNow - s_osdTrace >= 2000) {
-		s_osdTrace = osdNow;
-		char line[220];
-		snprintf(line, sizeof(line),
-			"[DBLE-OSD] win=%dx%d safe=(%d,%d,%d,%d) bar=%.4f lineH=%d lines=%d y=%d",
-			(int)rtSize.cx, (int)rtSize.cy,
-			m_iDbleOsdX, m_iDbleOsdY, m_iDbleOsdW, m_iDbleOsdH,
-			(double)m_fDbleBottomBarFrac, lineH, (int)lines.size(), y);
-		mpcvr::TraceLog(line);
-	}
+	// The overlay is LOCKED to the bottom-left of the app's safe area. The
+	// contribution positioned itself from the measured bars, which moves frame
+	// to frame; the app's rect is the only stable anchor.
+	int actTop = (int)video.top, actBot = (int)video.bottom;
 
 	CComPtr<ID3D11RenderTargetView> pRTV;
-	if (FAILED(m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRTV))) return;
-	for (size_t i = 0; i < lines.size(); i++) {
-		const D3DCOLOR col = D3DCOLOR_XRGB(255, 255, 255);
-		m_DbleFont.Draw2DText(pRTV, rtSize, (float)x, (float)(y + (int)i * lineH),
-		                      col, lines[i].text.c_str());
+	if (FAILED(m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRTV))) {
+		return;
+	}
+
+	// Colours (premultiplied for the see-through ones).
+	auto pm = [](int a, int r, int g, int b) { return D3DCOLOR_ARGB(a, r * a / 255, g * a / 255, b * a / 255); };
+	const D3DCOLOR cPanel = pm(205, 10, 12, 18), cEdge = D3DCOLOR_XRGB(70, 74, 84), cRule = D3DCOLOR_XRGB(55, 58, 66);
+	const D3DCOLOR cSelBar = pm(230, 232, 85, 31), cSelEdge = D3DCOLOR_XRGB(255, 138, 76);
+	const D3DCOLOR cText = D3DCOLOR_XRGB(150, 150, 150), cTextSel = D3DCOLOR_XRGB(195, 200, 210);
+	const D3DCOLOR cDim = D3DCOLOR_XRGB(95, 95, 100), cHead = D3DCOLOR_XRGB(232, 85, 31), cTitle = D3DCOLOR_XRGB(175, 175, 180);
+	const D3DCOLOR cBlue = D3DCOLOR_XRGB(232, 85, 31), cBlueSel = D3DCOLOR_XRGB(255, 138, 76), cYellow = D3DCOLOR_XRGB(200, 175, 70);
+	const D3DCOLOR cKeyCap = D3DCOLOR_XRGB(35, 40, 52), cKeyEdge = D3DCOLOR_XRGB(80, 86, 98), cKeyText = D3DCOLOR_XRGB(170, 175, 185);
+
+	auto fill = [&](int x0, int y0, int x1, int y1, D3DCOLOR c) {
+		if (x1 <= x0 || y1 <= y0) return;
+		m_DbleRect.Set({ x0, y0, x1, y1 }, rtSize, c);
+		m_DbleRect.Draw(pRTV, rtSize);
+	};
+	// Inset of a rounded rectangle's edge on scanline j (0 = top) of r rows.
+	auto inset = [](int j, int r) {
+		const float dy = (float)r - (float)j - 0.5f;
+		return (int)std::lround((float)r - std::sqrt(std::max(0.0f, (float)(r * r) - dy * dy)));
+	};
+	auto fillRound = [&](int x0, int y0, int x1, int y1, int r, D3DCOLOR c) {
+		r = std::min(r, std::min((x1 - x0) / 2, (y1 - y0) / 2));
+		for (int j = 0; j < r; j++) {
+			const int d = inset(j, r);
+			fill(x0 + d, y0 + j, x1 - d, y0 + j + 1, c);
+			fill(x0 + d, y1 - j - 1, x1 - d, y1 - j, c);
+		}
+		fill(x0, y0 + r, x1, y1 - r, c);
+	};
+	// A rounded outline t pixels wide, drawn without covering the inside.
+	auto edgeRound = [&](int x0, int y0, int x1, int y1, int r, int t, D3DCOLOR c) {
+		r = std::min(r, std::min((x1 - x0) / 2, (y1 - y0) / 2));
+		const int ri = std::max(0, r - t);
+		for (int j = 0; j < r; j++) {
+			const int d = inset(j, r);
+			int a, b;
+			if (j < t) { a = x0 + d; b = x1 - d; }
+			else { a = x0 + d; b = x0 + t + inset(j - t, ri); }
+			for (int k = 0; k < 2; k++) {
+				const int yy = k ? (y1 - j - 1) : (y0 + j);
+				if (j < t) fill(a, yy, b, yy + 1, c);
+				else { fill(a, yy, b, yy + 1, c); fill(x1 - (b - x0), yy, x1 - (a - x0), yy + 1, c); }
+			}
+		}
+		fill(x0, y0 + r, x0 + t, y1 - r, c);
+		fill(x1 - t, y0 + r, x1, y1 - r, c);
+	};
+	auto width = [](CD3D11Font& f, const std::wstring& s) {
+		SIZE sz = {};
+		f.GetTextExtent(s.c_str(), &sz);
+		return (int)sz.cx;
+	};
+	auto text = [&](CD3D11Font& f, int x, int y, D3DCOLOR c, const std::wstring& s) {
+		f.Draw2DText(pRTV, rtSize, (float)x, (float)y, c, s.c_str());
+	};
+	auto styleColor = [&](int st, bool sel) {
+		if (st == 3) return cYellow;
+		if (st == 2) return cDim;
+		if (st == 1) return sel ? cBlueSel : cBlue;
+		return sel ? cTextSel : cText;
+	};
+
+	const int x0 = video.left + u * 2;
+	if (m_Dble.OverlayVisible()) {
+		const CDbleFix::OvModel m = m_Dble.Overlay();
+		const int pad = u, rowH = u * 3 / 2, headH = u * 7 / 4, titleH = u * 5 / 2, keyH = u * 4 / 3, lineH = u * 5 / 4;
+		const int nameX = pad + u * 3 / 2;
+		// Width: the widest of the settings, the keys and the readout.
+		int wNames = 0, wVals = 0;
+		for (const auto& r : m.rows) {
+			if (r.heading) continue;
+			wNames = std::max(wNames, width(fM, r.name));
+			wVals = std::max(wVals, width(fM, r.value));
+		}
+		int wKey = 0, wWhat = 0;
+		for (const auto& k : m.keys) {
+			wKey = std::max(wKey, width(fS, k.key));
+			wWhat = std::max(wWhat, width(fS, k.what));
+		}
+		const int keyCol = wKey + u + u / 2 + wWhat + u;
+		int pw = std::max(nameX + wNames + u * 2 + wVals + pad + u / 2, pad * 2 + keyCol * 2);
+		pw = std::max(pw, pad * 2 + width(fT, L"ClipGuard") + u + width(fS, m.version));
+		for (const auto& l : m.lines) pw = std::max(pw, pad * 2 + width(l.style == 2 ? fS : fM, l.text));
+		// Reserve a fixed readout column and a fixed number of readout lines.
+		// Without this the panel resized every time a spot count or a cost value
+		// changed width, which read as the OSD jumping around frame to frame.
+		pw = std::max(pw, pad * 2 + u * 70);
+		pw = std::max(pw, u * 20);
+		const int kReadoutLines = 6;
+		int ph = titleH + headH + (int)((m.keys.size() + 1) / 2) * keyH + u / 2
+		       + std::max((int)m.lines.size(), kReadoutLines) * lineH + pad;
+		for (const auto& r : m.rows) ph += r.heading ? headH : rowH;
+		if (rtSize.cx != m_dblePanelWinW || rtSize.cy != m_dblePanelWinH) {
+			m_dblePanelWinW = rtSize.cx;
+			m_dblePanelWinH = rtSize.cy;
+			m_dblePanelW = 0;
+			m_dblePanelH = 0;
+		}
+		pw = std::max(pw, m_dblePanelW);
+		ph = std::max(ph, m_dblePanelH);
+		m_dblePanelW = pw;
+		m_dblePanelH = ph;
+
+		// Bottom left of the active picture; pinned to its top if it doesn't fit.
+		int px = x0, py = actBot - u - ph;
+		if (py < actTop + u) py = actTop + u;
+		if (py + ph > rtSize.cy) py = std::max(0, (int)rtSize.cy - ph);
+		const int rad = u * 3 / 4, edge = std::max(1, u / 16);
+
+		fillRound(px, py, px + pw, py + ph, rad, cPanel);
+		edgeRound(px, py, px + pw, py + ph, rad, edge, cEdge);
+
+		// Title: a small shield (white edge, blue, yellow light), name and version.
+		{
+			const float s = (float)u / 24.0f;
+			const float ix = (float)(px + pad), iy = (float)(py + u * 3 / 4);
+			auto ndcX = [&](float x) { return x * 2.0f / rtSize.cx - 1.0f; };
+			auto ndcY = [&](float y) { return 1.0f - y * 2.0f / rtSize.cy; };
+			auto shield = [&](float in, D3DCOLOR c) {
+				const float l = ix + in, r = ix + 24 * s - in, t = iy + in * 0.9f, mid = iy + 15 * s, b = iy + 30 * s - in * 1.4f;
+				m_DbleQuad.Set(ndcX(l), ndcY(t), ndcX(r), ndcY(t), ndcX(r), ndcY(mid), ndcX(l), ndcY(mid), c);
+				m_DbleQuad.Draw(pRTV, rtSize);
+				const float cx = ix + 12 * s;
+				m_DbleQuad.Set(ndcX(l), ndcY(mid), ndcX(r), ndcY(mid), ndcX(cx), ndcY(b), ndcX(cx), ndcY(b), c);
+				m_DbleQuad.Draw(pRTV, rtSize);
+			};
+			shield(0.0f, D3DCOLOR_XRGB(200, 200, 200));
+			shield(2.2f * s, D3DCOLOR_XRGB(232, 85, 31));
+			const float cx = ix + 12 * s, cy = iy + 13 * s, rr = 5.5f * s;
+			m_DbleQuad.Set(ndcX(cx - rr * 0.41f), ndcY(cy - rr), ndcX(cx + rr * 0.41f), ndcY(cy - rr), ndcX(cx + rr * 0.41f), ndcY(cy + rr), ndcX(cx - rr * 0.41f), ndcY(cy + rr), D3DCOLOR_XRGB(230, 185, 40));
+			m_DbleQuad.Draw(pRTV, rtSize);
+			m_DbleQuad.Set(ndcX(cx - rr), ndcY(cy - rr * 0.41f), ndcX(cx + rr), ndcY(cy - rr * 0.41f), ndcX(cx + rr), ndcY(cy + rr * 0.41f), ndcX(cx - rr), ndcY(cy + rr * 0.41f), D3DCOLOR_XRGB(230, 185, 40));
+			m_DbleQuad.Draw(pRTV, rtSize);
+			m_DbleQuad.Set(ndcX(cx - rr * 0.8f), ndcY(cy - rr * 0.8f), ndcX(cx + rr * 0.8f), ndcY(cy - rr * 0.8f), ndcX(cx + rr * 0.8f), ndcY(cy + rr * 0.8f), ndcX(cx - rr * 0.8f), ndcY(cy + rr * 0.8f), D3DCOLOR_XRGB(230, 185, 40));
+			m_DbleQuad.Draw(pRTV, rtSize);
+		}
+		const int tx = px + pad + u * 3 / 2;
+		text(fT, tx, py + u / 2, cTitle, L"ClipGuard");
+		text(fS, tx + width(fT, L"ClipGuard") + u / 2, py + u / 2 + (u * 3 / 2 - u * 4 / 5), cDim, m.version);
+		int y = py + titleH;
+		fill(px + pad, y - u / 3, px + pw - pad, y - u / 3 + 1, cRule);
+
+		for (const auto& r : m.rows) {
+			if (r.heading) {
+				text(fS, px + pad, y + u / 2, cHead, r.name);
+				y += headH;
+				continue;
+			}
+			if (r.selected) {
+				const int bx0 = px + u / 2, bx1 = px + pw - u / 2, by0 = y - u / 8, by1 = y + rowH - u / 8;
+				fillRound(bx0, by0, bx1, by1, u / 4, cSelBar);
+				edgeRound(bx0, by0, bx1, by1, u / 4, 1, cSelEdge);
+				text(fM, px + pad - u / 4, y, cTextSel, L">");
+			}
+			text(fM, px + nameX, y, r.selected ? cTextSel : cText, r.name);
+			text(fM, px + pw - pad - u / 2 - width(fM, r.value), y, styleColor(r.style, r.selected), r.value);
+			y += rowH;
+		}
+
+		// Keys, two columns of small key caps.
+		text(fS, px + pad, y + u / 2, cHead, L"KEYS");
+		y += headH;
+		for (size_t i = 0; i < m.keys.size(); i++) {
+			const int kx = px + pad + (int)(i % 2) * keyCol, ky = y + (int)(i / 2) * keyH;
+			const int kw = width(fS, m.keys[i].key);
+			const int capH = u;
+			fillRound(kx, ky, kx + kw + u / 2, ky + capH, u / 6, cKeyCap);
+			edgeRound(kx, ky, kx + kw + u / 2, ky + capH, u / 6, 1, cKeyEdge);
+			text(fS, kx + u / 4, ky + (capH - u * 4 / 5) / 2, cKeyText, m.keys[i].key);
+			text(fS, kx + kw + u, ky + (capH - u * 4 / 5) / 2, cText, m.keys[i].what);
+		}
+		y += (int)((m.keys.size() + 1) / 2) * keyH;
+		fill(px + pad, y + u / 4, px + pw - pad, y + u / 4 + 1, cRule);
+		y += u / 2;
+
+		// Readout.
+		for (const auto& l : m.lines) {
+			text(l.style == 2 ? fS : fM, px + pad, y + u / 8, styleColor(l.style, false), l.text);
+			y += lineH;
+		}
+	} else {
+		// Overlay hidden: the log note (F11) alone, on a small dark backing.
+		const std::wstring note = m_Dble.LogNote();
+		if (!note.empty()) {
+			const int ny = std::clamp(actBot - u * 2, 0, std::max(0, (int)rtSize.cy - u * 2));
+			fillRound(x0 - u / 2, ny - u / 3, x0 + width(fM, note) + u / 2, ny + u * 4 / 3, u / 3, cPanel);
+			text(fM, x0, ny, cText, note);
+		}
+	}
+	if (m_Dble.ShowViewNote()) {
+		// Above the picture: in the top letterbox bar (Side by side: the black above
+		// the half-size pictures), else above the video, else at the picture's top.
+		const int lineH = u * 5 / 4, margin = u / 2;
+		const float vh = (float)video.Height();
+		const int topPx = (m_Dble.View() == 3) ? (int)(0.25f * vh + 0.5f * m_Dble.TopBarFrac() * vh) : (int)(m_Dble.TopBarFrac() * vh);
+		int ny;
+		if (topPx >= lineH + margin) {
+			ny = video.top + (topPx - lineH) / 2;
+		} else if (video.top >= lineH + 4) {
+			ny = video.top - lineH - 2;
+		} else {
+			ny = video.top + margin;
+		}
+		text(fM, x0, ny, cText,
+			L"For evaluation only: this view changes the picture, so the projector's laser dimming behaves differently than in Normal view");
 	}
 }
-
 HRESULT CDX11VideoProcessor::DrawStats(ID3D11Texture2D* pRenderTarget)
 {
 	if (m_windowRect.IsRectEmpty()) {

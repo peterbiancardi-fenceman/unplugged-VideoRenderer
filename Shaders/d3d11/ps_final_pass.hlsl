@@ -23,30 +23,16 @@ cbuffer PS_CONSTANTS : register(b0)
     // 4=2.0. srcSpace 0 is the tone map's native 2.2; destination 0..4 is the
     // user's explicit target (Follow source never enables the conversion).
     float  convertEnabled;
-    float  dbleEnabled;
     float  srcSpace;
     float  dstSpace;
     float  displayBlack;     // normalized black for BT.1886
     float  srcGamma;
-    // DBLE compensation (dark-scene highlight roll-off). The feature sets
-    // these; with dbleEnabled 0 the pass is identity.
-    float  dbleCeil;
-    float  dbleKnee;
     // Gamut conversion for the SDR path (the HDR tone map already converted).
     // Spaces: 0=BT.709, 1=BT.2020, 2=DCI-P3 (D65).
     float  gamutConvert;
     float  gamutSrc;
     float  gamutDst;
-    float3 _padG;
-    // DBLE diagnostic views (the contributed overlay). 0 normal, 1 clipping
-    // test, 2 split screen. dbleSrcMap is the picture's UV rect inside tex;
-    // dbleTexW turns the divider width into texels.
-    float  dbleView;
-    float  dbleTexW;
-    float2 _padD;
-    float4 dbleSrcMap;
-    float  dblePicture;
-    float3 _padE;
+    float2 _pad;
 };
 
 #include "../convert/colorspace_gamut_conversion.hlsl"
@@ -95,27 +81,6 @@ float EncodeTarget(float lin, float space, float black)
     return lin;
 }
 
-float4 DbleRolloff(float4 c)
-{
-    if (dbleEnabled <= 0.5 || dbleCeil <= 0.001 || dbleCeil > 0.999) return c;
-    const float k = dbleKnee;
-    const float m = max(c.r, max(c.g, c.b));
-    if (m <= k) return c;
-    const float r = (dbleCeil - k) / max(1.0 - k, 1e-4);
-    const float t = (m - k) / max(1.0 - k, 1e-4);
-    const float m2 = k + (1.0 - k) * t / (1.0 + t * (1.0 / max(r, 1e-4) - 1.0));
-    c.rgb *= m2 / m;
-    return c;
-}
-
-// The contributed overlay's tint: keep the picture's own light in the colour,
-// so the diagnostic reads as a coloured picture rather than a flat mask.
-float3 DbleTint(float3 picture, float3 tint, float amount)
-{
-    const float g = dot(picture, float3(0.2126, 0.7152, 0.0722));
-    return lerp(picture, tint * (0.35 + 0.65 * g), amount);
-}
-
 float4 main(PS_INPUT input) : SV_Target
 {
     float4 pixel = tex.Sample(samp, input.Tex);
@@ -136,42 +101,8 @@ float4 main(PS_INPUT input) : SV_Target
         pixel.b = EncodeTarget(lin.b, dstSpace, displayBlack);
     }
 
-    // DBLE compensation is defined in TARGET code, so it runs after the
-    // transfer and before the panel calibration LUT.
-    const float4 beforeFix = pixel;
-    pixel = DbleRolloff(pixel);
-
-    // Diagnostic views are part of the FIX. They must never tint the picture when
-    // the fix is off (the Clipping-test view once painted red highlights with
-    // DBLE disabled: the saved View outlived the Enable switch).
-    if (dbleEnabled > 0.5 && dbleView > 0.5) {
-        if (dbleView < 1.5) {
-            // CLIPPING TEST, the contributed overlay's view:
-            //   green = above the knee and fixable (the fix can act here)
-            //   red   = already clipped in the video (input at/over white)
-            //   blue  = actually lowered by the fix
-            // "Lowered" is tested before "fixable" so a changed pixel reads
-            // blue; a pixel the fix cannot change stays green.
-            const float before = max(beforeFix.r, max(beforeFix.g, beforeFix.b));
-            const float after  = max(pixel.r, max(pixel.g, pixel.b));
-            if (before >= 0.995) {
-                pixel.rgb = DbleTint(pixel.rgb, float3(1.0, 0.0, 0.0), 0.8);
-            } else if (after < before * 0.995) {
-                pixel.rgb = DbleTint(pixel.rgb, float3(0.0, 0.3, 1.0), 0.8);
-            } else if (before > dbleKnee && dbleEnabled > 0.5 && dbleCeil < 0.999) {
-                pixel.rgb = DbleTint(pixel.rgb, float3(0.0, 1.0, 0.0), 0.8);
-            }
-        } else {
-            // SPLIT SCREEN: left half without the fix, right half with it.
-            const float u  = (input.Tex.x - dbleSrcMap.x) / max(dbleSrcMap.z, 1e-6);
-            const float dx = abs(input.Tex.x - (dbleSrcMap.x + 0.5 * dbleSrcMap.z)) * dbleTexW;
-            if (dx < 1.5) {
-                pixel = float4(0.3, 0.3, 0.3, pixel.a);
-            } else {
-                pixel = (u < 0.5) ? beforeFix : pixel;
-            }
-        }
-    }
+    // ClipGuard runs in the post-scale chain, before this display-referred pass.
+    // This shader only encodes the target and applies the calibration LUT/dither.
 
     // Display calibration LUT (.cube). This pass is the last display-referred
     // stage — after tone mapping, after the ML grade, after scaling — which is

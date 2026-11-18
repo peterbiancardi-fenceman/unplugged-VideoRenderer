@@ -85,14 +85,23 @@
 // Final display-referred encode: 0=2.2, 1=2.4, 2=BT.1886, 3=sRGB, 4=2.0,
 // 5=follow source (the 2.1.0 pass-through).
 #define OPT_DisplayTransfer                L"DisplayTransfer"
-// DBLE compensation. Strength/trigger/knee are stored as MILLI-units in a
-// DWORD like the other fractional settings.
-#define OPT_DbleEnabled                    L"DbleEnabled"
-#define OPT_DbleStrength                   L"DbleStrength"
-#define OPT_DbleTriggerPct                 L"DbleTriggerPct"
-#define OPT_DbleKnee                       L"DbleKnee"
-#define OPT_DbleView                       L"DbleView"
-#define OPT_DbleOsd                        L"DbleOsd"
+// ClipGuard: projector highlight compensation. Strength/percent/space values are
+// stored as MILLI-units in DWORDs like the other fractional settings.
+#define OPT_CgEnabled                      L"ClipGuardEnabled"
+#define OPT_CgStrength                     L"ClipGuardStrength"
+#define OPT_CgShape                        L"ClipGuardShape"
+#define OPT_CgFixStart                     L"ClipGuardFixStart"
+#define OPT_CgFullEffect                   L"ClipGuardFullEffect"
+#define OPT_CgKnee                         L"ClipGuardKnee"
+#define OPT_CgColorProtect                 L"ClipGuardColorProtect"
+#define OPT_CgTextSkip                     L"ClipGuardTextSkip"
+#define OPT_CgHotSpot                      L"ClipGuardHotSpot"
+#define OPT_CgHotBelow                     L"ClipGuardHotBelow"
+#define OPT_CgGraded                       L"ClipGuardGraded"
+#define OPT_CgGrid                         L"ClipGuardGrid"
+#define OPT_CgLookAhead                    L"ClipGuardLookAhead"
+#define OPT_CgView                         L"ClipGuardView"
+#define OPT_CgOsd                          L"ClipGuardOsd"
 // Content peak, nits (the top of the range the tone curves map FROM), stored as
 // MILLINITS in a DWORD like HdrDisplayMinNits. Distinct from HdrDisplayNits, which
 // is the DISPLAY's peak.
@@ -460,23 +469,50 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DisplayTransfer, dw)) {
 			m_Sets.iDisplayTransfer = discard<int>(dw, 5, 0, 5);
 		}
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleEnabled, dw)) {
-			m_Sets.bDbleEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgEnabled, dw)) {
+			m_Sets.clipGuard.enabled = !!dw;
 		}
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleStrength, dw)) {
-			m_Sets.fDbleStrength = discard<float>((float)dw / 1000.0f, 1.0f, 0.0f, 1.0f);
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgStrength, dw)) {
+			m_Sets.clipGuard.strength = discard<float>((float)dw / 1000.0f, 0.35f, 0.0f, 1.0f);
 		}
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleTriggerPct, dw)) {
-			m_Sets.fDbleTriggerPct = discard<float>((float)dw / 1000.0f, 5.0f, 0.5f, 30.0f);
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgShape, dw)) {
+			m_Sets.clipGuard.fixShape = discard<int>(dw, 1, 0, 1);
 		}
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleKnee, dw)) {
-			m_Sets.fDbleKnee = discard<float>((float)dw / 1000.0f, 0.30f, 0.20f, 0.95f);
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgFixStart, dw)) {
+			m_Sets.clipGuard.fixStartPct = discard<float>((float)dw / 1000.0f, 10.0f, 1.0f, 50.0f);
 		}
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleView, dw)) {
-			m_Sets.iDbleView = discard<int>(dw, 0, 0, 2);
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgFullEffect, dw)) {
+			m_Sets.clipGuard.fullPct = discard<float>((float)dw / 1000.0f, 3.0f, 0.5f, 49.5f);
 		}
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleOsd, dw)) {
-			m_Sets.bDbleOsd = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgKnee, dw)) {
+			m_Sets.clipGuard.knee = discard<float>((float)dw / 1000.0f, 0.40f, 0.20f, 0.95f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgColorProtect, dw)) {
+			m_Sets.clipGuard.colorProtect = discard<float>((float)dw / 1000.0f, 0.90f, 0.0f, 1.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgTextSkip, dw)) {
+			m_Sets.clipGuard.textSkipPct = discard<float>((float)dw / 1000.0f, 25.0f, 0.0f, 100.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgHotSpot, dw)) {
+			m_Sets.clipGuard.hotSpot = discard<float>((float)dw / 1000.0f, 0.60f, 0.0f, 1.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgHotBelow, dw)) {
+			m_Sets.clipGuard.hotBelowPct = discard<float>((float)dw / 1000.0f, 3.0f, 0.0f, 20.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgGraded, dw)) {
+			m_Sets.clipGuard.gradedSpot = discard<float>((float)dw / 1000.0f, 0.50f, 0.0f, 1.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgGrid, dw)) {
+			m_Sets.clipGuard.grid = discard<int>(dw, 1, 0, 1);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgLookAhead, dw)) {
+			m_Sets.clipGuard.lookAhead = discard<int>(dw, 0, 0, 6);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgView, dw)) {
+			m_Sets.clipGuard.view = discard<int>(dw, 0, 0, 3);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CgOsd, dw)) {
+			m_Sets.clipGuard.osd = !!dw;
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrTitlePeakNits, dw)) {
 			m_Sets.fHdrTitlePeakNits = discard<float>((float)dw / 1000.0f, 1000.0f, 100.0f, 4000.0f);
@@ -699,6 +735,15 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		}
 
 		DLogIf(S_OK == hr, L"Direct3D9 initialization successfully!");
+	}
+
+	// Apply the settings loaded from HKCU to the freshly created processor.
+	// Without this, a renderer-only host (MPC-HC/MPC-BE) runs the processor
+	// defaults until something calls SetSettings — which is why the Zion grade
+	// only appeared after the property page was applied. The Unplugged app
+	// masked this by pushing its settings after graph creation.
+	if (m_VideoProcessor && SUCCEEDED(hr)) {
+		m_VideoProcessor->Configure(m_Sets);
 	}
 
 	*phr = hr;
@@ -2300,12 +2345,21 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_HdrDisplayMinNits,   (DWORD)(m_Sets.fHdrDisplayMinNits * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_OutputGamut,         m_Sets.iOutputGamut);
 		key.SetDWORDValue(OPT_DisplayTransfer,     m_Sets.iDisplayTransfer);
-		key.SetDWORDValue(OPT_DbleEnabled,         m_Sets.bDbleEnabled);
-		key.SetDWORDValue(OPT_DbleStrength,        (DWORD)(m_Sets.fDbleStrength * 1000.0f + 0.5f));
-		key.SetDWORDValue(OPT_DbleTriggerPct,      (DWORD)(m_Sets.fDbleTriggerPct * 1000.0f + 0.5f));
-		key.SetDWORDValue(OPT_DbleKnee,            (DWORD)(m_Sets.fDbleKnee * 1000.0f + 0.5f));
-		key.SetDWORDValue(OPT_DbleView,            m_Sets.iDbleView);
-		key.SetDWORDValue(OPT_DbleOsd,             m_Sets.bDbleOsd);
+		key.SetDWORDValue(OPT_CgEnabled,            m_Sets.clipGuard.enabled);
+		key.SetDWORDValue(OPT_CgStrength,           (DWORD)(m_Sets.clipGuard.strength * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgShape,              m_Sets.clipGuard.fixShape);
+		key.SetDWORDValue(OPT_CgFixStart,           (DWORD)(m_Sets.clipGuard.fixStartPct * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgFullEffect,         (DWORD)(m_Sets.clipGuard.fullPct * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgKnee,               (DWORD)(m_Sets.clipGuard.knee * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgColorProtect,       (DWORD)(m_Sets.clipGuard.colorProtect * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgTextSkip,           (DWORD)(m_Sets.clipGuard.textSkipPct * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgHotSpot,            (DWORD)(m_Sets.clipGuard.hotSpot * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgHotBelow,           (DWORD)(m_Sets.clipGuard.hotBelowPct * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgGraded,             (DWORD)(m_Sets.clipGuard.gradedSpot * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_CgGrid,               m_Sets.clipGuard.grid);
+		key.SetDWORDValue(OPT_CgLookAhead,          m_Sets.clipGuard.lookAhead);
+		key.SetDWORDValue(OPT_CgView,               m_Sets.clipGuard.view);
+		key.SetDWORDValue(OPT_CgOsd,                m_Sets.clipGuard.osd);
 		key.SetDWORDValue(OPT_HdrTitlePeakNits,    (DWORD)(m_Sets.fHdrTitlePeakNits * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_ExperimentalToneMapper, m_Sets.iExperimentalToneMapper);
 		key.SetDWORDValue(OPT_ToneLutContrast,     (DWORD)(m_Sets.fToneLutContrast * 1000.0f + 0.5f));

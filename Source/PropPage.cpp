@@ -137,9 +137,6 @@ const MLSliderRange kHdrSliders[] = {
 	{ IDC_SLIDER24, IDC_EDIT28, 0.0f,   1.0f,    &Settings_t::fHdrGt7Adapt },
 	{ IDC_SLIDER25, IDC_EDIT29, 0.02f,  0.90f,   &Settings_t::fHdrGt7Alpha },
 	{ IDC_SLIDER26, IDC_EDIT30, 0.0f,   1.0f,    &Settings_t::fHdrGt7Desat },
-	{ IDC_SLIDER37, IDC_EDIT41, 0.0f,   1.0f,    &Settings_t::fDbleStrength },
-	{ IDC_SLIDER38, IDC_EDIT42, 0.5f,   30.0f,   &Settings_t::fDbleTriggerPct },
-	{ IDC_SLIDER39, IDC_EDIT43, 0.20f,  0.95f,   &Settings_t::fDbleKnee },
 };
 
 // Zion tab owns: the ML table above plus grade / micro contrast / segments.
@@ -865,9 +862,15 @@ void CVRHdrPPage::SetControls()
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO12, m_SetsPP.iOutputGamut);
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO13, (LONG_PTR)(int)m_SetsPP.fHdrGt7Dbg);
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO15, (LONG_PTR)m_SetsPP.iDisplayTransfer);
-	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO16, (LONG_PTR)m_SetsPP.iDbleView);
-	CheckDlgButton(IDC_CHECK43, m_SetsPP.bDbleEnabled ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK44, m_SetsPP.bDbleOsd ? BST_CHECKED : BST_UNCHECKED);
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO16, (LONG_PTR)m_SetsPP.clipGuard.view);
+	CheckDlgButton(IDC_CHECK43, m_SetsPP.clipGuard.enabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK44, m_SetsPP.clipGuard.osd ? BST_CHECKED : BST_UNCHECKED);
+	SendDlgItemMessageW(IDC_SLIDER37, TBM_SETPOS, 1, (LPARAM)(m_SetsPP.clipGuard.strength * 100.0f + 0.5f));
+	SendDlgItemMessageW(IDC_SLIDER38, TBM_SETPOS, 1, (LPARAM)(m_SetsPP.clipGuard.fixStartPct + 0.5f));
+	SendDlgItemMessageW(IDC_SLIDER39, TBM_SETPOS, 1, (LPARAM)(m_SetsPP.clipGuard.knee * 100.0f + 0.5f));
+	SetDlgItemTextW(IDC_EDIT41, FmtSlider(m_SetsPP.clipGuard.strength).c_str());
+	SetDlgItemTextW(IDC_EDIT42, FmtSlider(m_SetsPP.clipGuard.fixStartPct).c_str());
+	SetDlgItemTextW(IDC_EDIT43, FmtSlider(m_SetsPP.clipGuard.knee).c_str());
 
 	// Curve selection state. Ignore/Passthrough are flag-only states (the stored
 	// type keeps whatever curve was last chosen), so item data encodes them as
@@ -935,12 +938,7 @@ void CVRHdrPPage::Graft(Settings_t& dst) const
 	dst.fHdrDisplayMinNits       = m_SetsPP.fHdrDisplayMinNits;
 	dst.iOutputGamut             = m_SetsPP.iOutputGamut;
 	dst.iDisplayTransfer         = m_SetsPP.iDisplayTransfer;
-	dst.bDbleEnabled             = m_SetsPP.bDbleEnabled;
-	dst.fDbleStrength            = m_SetsPP.fDbleStrength;
-	dst.fDbleTriggerPct          = m_SetsPP.fDbleTriggerPct;
-	dst.fDbleKnee                = m_SetsPP.fDbleKnee;
-	dst.iDbleView                = m_SetsPP.iDbleView;
-	dst.bDbleOsd                 = m_SetsPP.bDbleOsd;
+	dst.clipGuard                = m_SetsPP.clipGuard;
 	dst.fGamutCap                = m_SetsPP.fGamutCap;
 	dst.fMLHiDesat               = m_SetsPP.fMLHiDesat;
 	dst.iHdrExposureTrim         = m_SetsPP.iHdrExposureTrim;
@@ -993,8 +991,11 @@ HRESULT CVRHdrPPage::OnActivate()
 	m_hWnd = m_hwnd;
 	m_pVideoRenderer->GetSettings(m_SetsPP);
 
+	// Engine values: 0 = BT.709, 1 = BT.2020, 2 = DCI-P3 (D65), 3 = follow source.
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"Follow source", 3);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"BT.709 (standard)", 0);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"BT.2020 (wide)", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"DCI-P3 (D65)", 2);
 
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Off", 0);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Chroma scale", 1);
@@ -1012,8 +1013,12 @@ HRESULT CVRHdrPPage::OnActivate()
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"Gamma 2.0", 4);
 
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Normal", 0);
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Clipping test", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Fix areas", 1);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Split screen", 2);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Side by side", 3);
+	SendDlgItemMessageW(IDC_SLIDER37, TBM_SETRANGE, 1, MAKELONG(0, 100));
+	SendDlgItemMessageW(IDC_SLIDER38, TBM_SETRANGE, 1, MAKELONG(1, 50));
+	SendDlgItemMessageW(IDC_SLIDER39, TBM_SETRANGE, 1, MAKELONG(20, 95));
 
 	// The full curve list lives here now (same engine values as the Settings
 	// tab's device block). Item data is the engine type; 0/1 encode the
@@ -1078,16 +1083,12 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 
 		if (action == BN_CLICKED) {
 			if (nID == IDC_CHECK43) {
-				m_SetsPP.bDbleEnabled = IsDlgButtonChecked(IDC_CHECK43) == BST_CHECKED;
-				ApplyOwn();   // live: the roll-off is visible at once
-				SetDirty();
-				return (LRESULT)1;
+				m_SetsPP.clipGuard.enabled = IsDlgButtonChecked(IDC_CHECK43) == BST_CHECKED;
+				ApplyOwn(); SetDirty(); return (LRESULT)1;
 			}
 			if (nID == IDC_CHECK44) {
-				m_SetsPP.bDbleOsd = IsDlgButtonChecked(IDC_CHECK44) == BST_CHECKED;
-				ApplyOwn();   // live: the overlay appears/disappears at once
-				SetDirty();
-				return (LRESULT)1;
+				m_SetsPP.clipGuard.osd = IsDlgButtonChecked(IDC_CHECK44) == BST_CHECKED;
+				ApplyOwn(); SetDirty(); return (LRESULT)1;
 			}
 			if (nID == IDC_CHECK36) {
 				m_SetsPP.bHdrAutoRefWhite = IsDlgButtonChecked(IDC_CHECK36) == BST_CHECKED;
@@ -1109,10 +1110,9 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 			}
 			if (nID == IDC_COMBO16) {
 				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO16);
-				if (lValue != m_SetsPP.iDbleView) {
-					m_SetsPP.iDbleView = (int)lValue;
-					ApplyOwn();   // live diagnostic view
-					SetDirty();
+				if (lValue != m_SetsPP.clipGuard.view) {
+					m_SetsPP.clipGuard.view = (int)lValue;
+					ApplyOwn(); SetDirty();
 				}
 				return (LRESULT)1;
 			}
@@ -1155,6 +1155,25 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 		}
 	}
 	else if (uMsg == WM_HSCROLL) {
+		if ((HWND)lParam == GetDlgItem(IDC_SLIDER37)) {
+			const float v = (float)SendDlgItemMessageW(IDC_SLIDER37, TBM_GETPOS, 0, 0) / 100.0f;
+			m_SetsPP.clipGuard.strength = v;
+			SetDlgItemTextW(IDC_EDIT41, FmtSlider(v).c_str());
+			ApplyOwn(); SetDirty(); return (LRESULT)1;
+		}
+		if ((HWND)lParam == GetDlgItem(IDC_SLIDER38)) {
+			const float v = (float)SendDlgItemMessageW(IDC_SLIDER38, TBM_GETPOS, 0, 0);
+			m_SetsPP.clipGuard.fixStartPct = v;
+			if (m_SetsPP.clipGuard.fullPct > v - 0.5f) m_SetsPP.clipGuard.fullPct = v - 0.5f;
+			SetDlgItemTextW(IDC_EDIT42, FmtSlider(v).c_str());
+			ApplyOwn(); SetDirty(); return (LRESULT)1;
+		}
+		if ((HWND)lParam == GetDlgItem(IDC_SLIDER39)) {
+			const float v = (float)SendDlgItemMessageW(IDC_SLIDER39, TBM_GETPOS, 0, 0) / 100.0f;
+			m_SetsPP.clipGuard.knee = v;
+			SetDlgItemTextW(IDC_EDIT43, FmtSlider(v).c_str());
+			ApplyOwn(); SetDirty(); return (LRESULT)1;
+		}
 		for (const auto& r : kHdrSliders) {
 			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
 				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
