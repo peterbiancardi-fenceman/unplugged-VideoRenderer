@@ -634,7 +634,7 @@ struct Settings_t {
 		bVPScaling                      = true;
 		iVPSuperRes                     = SUPERRES_Disable;
 		bVPRTXVideoHDR                  = false;
-		iChromaScaling                  = CHROMA_Bilinear;
+		iChromaScaling                  = CHROMA_Krig;
 		iUpscaling                      = UPSCALE_CatmullRom;
 		iDownscaling                    = DOWNSCALE_Hamming;
 		bInterpolateAt50pct             = true;

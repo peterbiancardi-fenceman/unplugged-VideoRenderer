@@ -44,9 +44,9 @@
 
 #define MyAppName      "Unplugged Video Renderer"
 ; The PACKAGE version. The standalone renderer ships independently of the
-; Unplugged application now: 2.2.1 is a renderer-only update for 2.2.x users.
-; build_renderer_setup.ps1 no longer requires this to match the app release.
-#define MyAppVersion   "2.2.1"
+; Unplugged application now: 2.2.2 restores KrigBilateral as the default chroma
+; upsampler. build_renderer_setup.ps1 no longer requires this to match the app.
+#define MyAppVersion   "2.2.2"
 #define MyAppPublisher "unplugged"
 
 ; The renderer BINARY build (Include\Version.h + revision.h). It names the

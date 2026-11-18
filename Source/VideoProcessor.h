@@ -54,7 +54,7 @@ protected:
 	int  m_iVPDeinterlacing                = DEINT_Enable;
 	bool m_bDeintDouble                    = true;
 	bool m_bVPScaling                      = true;
-	int  m_iChromaScaling                  = CHROMA_Bilinear;
+	int  m_iChromaScaling                  = CHROMA_Krig;
 	int  m_iUpscaling                      = UPSCALE_CatmullRom; // interpolation
 	int  m_iDownscaling                    = DOWNSCALE_Hamming;  // convolution
 	bool m_bInterpolateAt50pct             = true;
