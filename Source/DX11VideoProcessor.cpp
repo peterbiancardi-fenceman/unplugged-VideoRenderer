@@ -1020,7 +1020,7 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	if (m_pPSTaste && m_pTasteParams) {
 		nSteps++;
 	}
-	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
+	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bMLTransition && !m_bHDRPassthroughRaw) {
 		nSteps++; // P0 bar repaint
 	}
 	// ClipGuard pass: counted whenever it is ready, so the ring is sized for it.
@@ -2359,6 +2359,10 @@ void CDX11VideoProcessor::UpdateMLActive()
 		return;
 	}
 	m_bMLActive = bActive;
+	// The first frame of the new state runs the ML steps as a copy: the params
+	// and the feature textures were just reset, and the step count changed.
+	m_bMLTransition = true;
+	DLog(L"CDX11VideoProcessor::UpdateMLActive() transition frame -> copy (active={})", bActive);
 
 	// Transition: reset per-activation state, not resources.
 	m_lastMLParams = {};
@@ -8405,7 +8409,7 @@ HRESULT CDX11VideoProcessor::DrawMLMicroContrast(Tex2D_t* pInput, ID3D11Texture2
 	if (!m_pPSMLShadow || !m_pMLParams) {
 		return S_OK;      // grade resources not built: nothing to draw, not an error
 	}
-	const bool bCopy = m_bMLDebugCopy || m_bHDRPassthroughRaw;
+	const bool bCopy = m_bMLDebugCopy || m_bHDRPassthroughRaw || m_bMLTransition;
 	// Skin LUT (t1) for person-gated skin damping, semseg mask (t2) for the
 	// person .g term. Re-bound here because the deferred position runs after the
 	// taste and custom post-scale passes, which do not preserve these slots.
@@ -8645,7 +8649,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// MLDebugPassthrough: bind the proven copy shader to all three steps
 			// to bisect "bad ML shader math" vs "broken step plumbing".
 			// Raw HDR/DV passthrough also copies every ML step (ring stays intact).
-			const bool bCopy = m_bMLDebugCopy || m_bHDRPassthroughRaw;
+			const bool bCopy = m_bMLDebugCopy || m_bHDRPassthroughRaw || m_bMLTransition;
 			ID3D11PixelShader* psHighlight = bCopy ? m_pPS_Simple.p : m_pPSMLHighlight.p;
 			ID3D11PixelShader* psGamma     = bCopy ? m_pPS_Simple.p : m_pPSMLGamma.p;
 			// psShadow (the MC shader) is bound inside DrawMLMicroContrast, which is
@@ -8917,7 +8921,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				LogSkinMetric(pRT, rect);
 			}
 
-			if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
+			if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bMLTransition && !m_bHDRPassthroughRaw) {
 			StepSetting();
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLBars, m_pMLParams, 0, false);
 			if (m_bMLDebug && m_pMLDebugFile) {
@@ -9137,6 +9141,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	}
 
 	DLogIf(FAILED(hr), L"CDX11VideoProcessor::Process() : failed with error {}", HR2Str(hr));
+
+	// The transition frame has been drawn through the copy shaders; the next one
+	// uses the real grade with the new state.
+	m_bMLTransition = false;
 
 	return hr;
 }

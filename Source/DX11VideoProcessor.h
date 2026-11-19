@@ -545,6 +545,11 @@ private:
 	float m_MLDebugPred = 0.0f;
 	bool m_bMLActive = false;
 	bool m_bMLFeaturesReady = false;
+	// One frame after an ML on/off transition: bind the copy shader for the ML
+	// steps. UpdateMLActive() resets the per-activation state and the step count
+	// changes, so without this the transition frame is drawn with reset
+	// parameters and reads as a bright/garbled flash.
+	bool m_bMLTransition = false;
 	bool m_bMLFeaturesStale = false;
 	bool m_bMLConvertSeen = false; // a previous frame's convert output exists
 	bool m_bMLModelLoadTried = false;
