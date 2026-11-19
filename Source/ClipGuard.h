@@ -1,5 +1,5 @@
 /*
- * ClipGuard 2.25.4 (formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
+ * ClipGuard 2.60.0 (formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
  * dark pictures first, so after the projector's gain they land below clipping.
@@ -10,7 +10,9 @@
  * final calibration-LUT / dither pass). Nothing upstream is changed.
  *
  * Settings come from ClipGuard.exe through shared memory (live, with hotkeys and
- * the on-screen overlay) or, without it, from clipguard.ini next to this filter.
+ * the on-screen overlay) while it runs. Without it: Unplugged's native settings
+ * block (Settings_t, Unplugged 2.3.0) when the app sent one, otherwise
+ * clipguard.ini next to this filter.
  *
  * This file is part of a modified Unplugged / MPC Video Renderer, GNU GPL v3.
  */
@@ -26,6 +28,7 @@
 #include <cwchar>
 #include <cstdint>
 #include <cstring>
+#include <dwrite.h>
 #include <d3dcommon.h>
 #include "D3DUtil/D3D11Font.h"
 #include "ClipGuardSettings.h"
@@ -36,9 +39,9 @@ HRESULT CompileShader(const std::string& srcCode, const D3D_SHADER_MACRO* pDefin
 // ---- shared memory with ClipGuard.exe ----------------------------------------
 // Layout must match ClipGuard.cs (StructLayout Sequential, Pack = 4). 256 bytes.
 #pragma pack(push, 4)
-struct DbleShared
+struct ClipGuardShared
 {
-	uint32_t magic;          // kDbleMagic
+	uint32_t magic;          // kClipGuardMagic
 	uint32_t version;        // 1
 	// written by ClipGuard.exe
 	int32_t  enabled;
@@ -79,7 +82,7 @@ struct DbleShared
 	int32_t  unused124;         // was the warm spot count
 	// written by ClipGuard.exe
 	int32_t  grid;              // 0 = normal measuring grid (128x72), 1 = fine (256x144)
-	int32_t  lookAhead;         // frames the picture is held back: 0, 2, 4 or 6 (1 = 2, from 2.12.0)
+	int32_t  lookAhead;         // frames the picture is held back: 0, 2, 4, 6, 12 = High Performance (1 = 2, from 2.12.0)
 	// log (F11): ClipGuard.exe asks, the renderer saves, ClipGuard.exe uploads
 	uint32_t logRequest;        // written by ClipGuard.exe: id of the latest log asked for (0 = none)
 	uint32_t logDone;           // written by the renderer: id of the last log saved
@@ -89,15 +92,31 @@ struct DbleShared
 	float    hotBelowPct;       // "Hot spot below": no hot spot in pictures brighter than this % (0 = off)
 	float    gradedSpot;        // "Graded spot" 0..1: gentle local highlight dimming of small graded highlights (was Grain until 2.22.0)
 	int32_t  buildKind;         // written by ClipGuard.exe: 0 = public build, 1 = test build (auto-update, log upload)
-	uint32_t reserved[23];
+	// written by the renderer: hot spot test video end-of-part code, (count << 8) | part (0 = none seen)
+	uint32_t testMarker;
+	// written by ClipGuard.exe
+	int32_t  spotMask;          // "Hot spot mask": 0 = Patch (the whole patch), 1 = Pixel (only the light, feathered)
+	int32_t  infoOn;            // F6: 1 = the info banner is shown along the top of the picture
+	float    gpuLoad;           // written by ClipGuard.exe while the banner shows: the graphics card's load in % + 1 (0 = not known)
+	int32_t  dimFire;           // written by ClipGuard.exe: "Dim fire": 1 = orange and red lights are hot spots too, 0 = they are left alone
+	int32_t  upscaler;          // written by ClipGuard.exe: "Upscaler": 0 = Normal, 1 = FSRCNNX (2.43.0)
+	int32_t  edition;           // written by ClipGuard.exe: 0 = ClipGuard, 1 = ClipGuard+ (High Performance, Upscaler, Kaleidescape) (2.44.0)
+	int32_t  kscape;            // written by ClipGuard.exe: 1 = Kaleidescape is playing and Look-ahead was switched for it (2.44.0)
+	int32_t  dither;            // written by ClipGuard.exe: "Dither": 0 = Static, 1 = Temporal (2.45.0)
+	int32_t  projector;         // written by ClipGuard.exe: "Projector": 0 = Universal, 1 = Titan Noir Max (Predictive) (2.46.0); Valerion (2) removed again in 2.51.2
+	int32_t  lutOff;            // written by ClipGuard.exe: F5, calibration LUT off for comparing (2.48.2)
+	int32_t  lut;               // written by ClipGuard.exe: "LUT": 0 = None, 1 = Titan (titan.cube), 2 = Valerion (valerion.cube) (2.50.0)
+	int32_t  source;            // written by ClipGuard.exe (Test): "Source": 0 = Video Processor, 1 = Media Player (Plex) (2.52.0)
+	uint32_t reserved[10];
 };
 #pragma pack(pop)
-static_assert(sizeof(DbleShared) == 256, "DbleShared must stay 256 bytes (ClipGuard.cs mirrors it)");
+static_assert(sizeof(ClipGuardShared) == 256, "ClipGuardShared must stay 256 bytes (ClipGuard.cs mirrors it)");
 
-constexpr uint32_t kDbleMagic   = 0x454C4244; // "DBLE"
-constexpr wchar_t  kDbleMapName[] = L"Local\\ClipGuard_v1";
+constexpr uint32_t kClipGuardMagic   = 0x454C4244; // "DBLE"
 
-struct DbleSettings
+constexpr wchar_t  kClipGuardMapName[] = L"Local\\ClipGuard_v1";
+
+struct CgRunSettings
 {
 	bool  enabled    = true;
 	float strength   = 0.35f;
@@ -110,10 +129,21 @@ struct DbleSettings
 	float hotBelow = 3.0f;   // hot spot only in pictures darker than this %
 	int   fixShape = 1;      // 0 = Normal, 1 = Anchor
 	float gradedSpot = 0.5f; // graded spot dimming (0 = off)
+	int   spotMask = 1;      // 0 = Patch, 1 = Pixel
+	bool  dimFire = false;   // "Dim fire": false = clearly orange or red lights (flames, candles) are not hot spots
+	int   upscaler = 0;      // "Upscaler": 0 = Normal, 1 = FSRCNNX (neural 2x for 1080p on 4K)
+	bool  plus = false;      // ClipGuard+ (2.44.0): High Performance, Upscaler and Kaleidescape are offered only here
+	bool  kscape = false;    // Look-ahead set by ClipGuard+ for a playing Kaleidescape
+	int   dither = 0;        // "Dither": 0 = Static (the renderer's fixed pattern), 1 = Temporal (moved every frame)
+	bool  lutOff = false;    // F5: the calibration LUT off for comparing (not saved)
+	int   projector = 0;     // "Projector": 0 = Universal (Reactive), 1 = Titan Noir Max (Predictive)
+	int   lut = 0;           // 2.50.0: "LUT": 0 = None, 1 = Titan, 2 = Valerion
+	int   source = 0;        // 2.52.0 (Test): "Source": 0 = Video Processor, 1 = Media Player
 	int   grid = 1;
 	int   lookAhead = 4;  // frames: 0, 2, 4, 6
 	int   view       = 0;
 	bool  overlayOn  = false;
+	bool  infoOn     = false;  // info banner (F6)
 	bool  pinned     = false;
 	bool  testBuild  = false;  // ClipGuard Test: Restart & update, logs sent
 	int   selected   = 0;
@@ -122,21 +152,19 @@ struct DbleSettings
 
 // ---- shaders (compiled at device creation with d3dcompiler_47) --------------
 
-static const char kDbleMeasureHLSL[] = R"HLSL(
+static const char kClipGuardMeasureHLSL[] = R"HLSL(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
-Texture2D srcTex : register(t1);
-SamplerState sampSrc : register(s1);
 
-cbuffer DbleMeasure : register(b0)
+cbuffer ClipGuardMeasure : register(b0)
 {
 	float2 CellUV;
 	float2 pad0;
 	float4 SrcMap;
-	float  HasSource;
-	float  SrcIsPQ;
-	float  MKnee;
 	float  pad1;
+	float  pad2;
+	float  MKnee;
+	float  pad3;
 };
 
 struct PS_INPUT
@@ -144,23 +172,6 @@ struct PS_INPUT
 	float4 Pos : SV_POSITION;
 	float2 Tex : TEXCOORD;
 };
-
-float PqToNits(float e)
-{
-	const float m1 = 0.1593017578125;
-	const float m2 = 78.84375;
-	const float c1 = 0.8359375;
-	const float c2 = 18.8515625;
-	const float c3 = 18.6875;
-	float p = pow(saturate(e), 1.0 / m2);
-	return 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
-}
-
-float SourceLight(float3 s)
-{
-	float m = max(s.r, max(s.g, s.b));
-	return (SrcIsPQ > 0.5) ? PqToNits(m) : 100.0 * pow(saturate(m), 2.2);
-}
 
 // Per cell: R = mean linear luminance, G = brightest signal,
 // B = highlight samples in a bright-on-black cell, A = highlight samples.
@@ -171,6 +182,8 @@ float SourceLight(float3 s)
 // levels, so those cells are not.
 // A also carries, as 100 x n, the samples within 0.01 of the cell's brightest
 // (a flat core: a bulb, a headlamp; skin and lit surfaces are graded).
+// B also carries, as 100 x w, how warm the cell's bright half is: w = 0..99
+// for (red - blue) / red of the samples at half the cell's peak or more.
 float4 main(PS_INPUT input) : SV_Target
 {
 	const float2 origin = input.Tex - 0.5 * CellUV;
@@ -190,6 +203,8 @@ float4 main(PS_INPUT input) : SV_Target
 	float bright = 0.0;
 	float textN = 0.0;
 	float flat = 0.0;
+	float sumR = 0.0;
+	float sumB = 0.0;
 	if (maxS > min(MKnee, 0.75)) {
 		float mid = 0.0;
 		float dark = 0.0;
@@ -201,6 +216,7 @@ float4 main(PS_INPUT input) : SV_Target
 				const float3 c = saturate(tex.SampleLevel(samp, uv, 0).rgb);
 				const float m = max(c.r, max(c.g, c.b));
 				if (m >= maxS - 0.01) flat += 1.0;
+				if (m >= 0.5 * maxS) { sumR += c.r; sumB += c.b; }
 				if (m > MKnee) bright += 1.0;
 				else if (m > 0.08) mid += 1.0;
 				else dark += 1.0;
@@ -208,28 +224,27 @@ float4 main(PS_INPUT input) : SV_Target
 		}
 		if (mid <= 4.0 && dark >= 8.0) textN = bright;
 	}
-	return float4(sumL / 64.0, maxS, textN, bright + 100.0 * flat);
+	const float warm = sumR > 0.0 ? saturate((sumR - sumB) / sumR) : 0.0;
+	return float4(sumL / 64.0, maxS, textN + 100.0 * floor(warm * 99.0 + 0.5), bright + 100.0 * flat);
 }
 )HLSL";
 
-static const char kDbleMainHLSL[] = R"HLSL(
+static const char kClipGuardMainHLSL[] = R"HLSL(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
-Texture2D srcTex : register(t1);
-SamplerState sampSrc : register(s1);
 Texture2D spotMask : register(t2);
 SamplerState sampMask : register(s2);
 
-cbuffer DbleMain : register(b0)
+cbuffer ClipGuardMain : register(b0)
 {
 	float Ceil;
 	float Knee;
 	float Bypass;
 	float View;
 	float4 SrcMap;
-	float HasSource;
-	float SrcIsPQ;
-	float SrcFrameMax;
+	float Pad0;
+	float Pad1;
+	float Pad2;
 	float TexW;
 	float ColorProtect;
 	float SpotScale;
@@ -241,6 +256,14 @@ cbuffer DbleMain : register(b0)
 	float GradeCeil;       // where peak white goes inside a graded spot patch
 	float GradeOn;
 	float4 SpotEase[4];    // per hot spot: 1 = full dimming, less = a large light, eased
+	float SpotPixel;       // Hot spot mask Pixel: 1 = only the light itself is dimmed
+	float SpotRad;         // its feather radius, in texture UV (height)
+	float RampCeil;        // Projector Titan Noir Max: the highest signal the laser can show now (1 = no ramp squeeze)
+	float RampKnee;        // ramp squeeze: untouched below this signal
+	float RampPeak;        // ramp squeeze: the shown frame's peak (top of the squeeze)
+	float RampKeep;        // while the laser climbs: pixels at or above this keep their level (2 = none)
+	float RampPad1;
+	float RampPad2;
 };
 
 struct PS_INPUT
@@ -299,7 +322,61 @@ float3 RolloffM(float3 c, float m, float ceil, float k)
 // dimming still sees it, gently lower just below it, so every pixel keeps its
 // ratio to its neighbours and the detail (curtain folds) stays as it is.
 // Inside a graded spot patch the normal squeeze applies.
-float3 Fix(float3 c, float wRaw, float wGrade, float wAnchor, float gAnchor)
+// Hot spot mask Pixel: how much of the light is around this pixel. The
+// pixels near it that reach the hot level (smooth from kLo to kHi, by the
+// strongest channel) are averaged over two rings, so the mask follows the
+// light's own outline and fades out softly over about SpotRad around it: a
+// face or a wall next to the light keeps its level.
+// Up to Hot spot 0.60 (peak white down to about 57%) the hot level is 60-85%.
+// A deeper cut would leave the light's core darker than the glow just outside
+// that level (a grey centre with a bright rim), so from 0.60 to 0.65 the level
+// slides down to Highlight start .. the cut's peak: everything the cut can
+// reach in the light and its glow is lowered together and stays in order.
+float LightMask(float2 uv)
+{
+	const float deep = saturate((0.5672 - SpotScale) / (0.5672 - 0.5415));
+	const float kLo = lerp(0.60, Knee, deep);
+	const float kHi = lerp(0.85, max(SpotScale, Knee + 0.04), deep);
+	float tw, th;
+	tex.GetDimensions(tw, th);
+	const float2 r = float2(SpotRad * th / max(tw, 1.0), SpotRad);
+	float sum = smoothstep(kLo, kHi, Max3(tex.SampleLevel(samp, uv, 0).rgb)) * 2.0;
+	float n = 2.0;
+	[unroll]
+	for (int i = 0; i < 8; i++) {
+		const float a = 0.785398 * i;
+		const float2 d = float2(cos(a), sin(a));
+		sum += smoothstep(kLo, kHi, Max3(tex.SampleLevel(samp, uv + d * r * 0.5, 0).rgb)) * 1.5;
+		sum += smoothstep(kLo, kHi, Max3(tex.SampleLevel(samp, uv + float2(cos(a + 0.392699), sin(a + 0.392699)) * r, 0).rgb));
+		n += 2.5;
+	}
+	return saturate(2.0 * sum / n);
+}
+
+// Projector Titan Noir Max (2.46.0): after a dark scene the laser comes back
+// up over about 2 s, and until it does every level above what it can show is
+// crushed to one flat level; and lights too small for DBLE to count are
+// crushed the same way at any time (2.47.0). Highlights between RampKnee and
+// the frame's peak are squeezed under RampCeil so they keep their detail.
+// While the laser climbs, the pixels at the level DBLE goes by (RampKeep)
+// keep it, so the projector still brings its laser up as it would.
+float3 Ramp(float3 c)
+{
+	if (RampCeil >= 0.999)
+		return c;
+	const float m = Max3(c);
+	const float P = RampPeak;
+	const float k = RampKnee;
+	if (P <= RampCeil + 0.005 || m <= k)
+		return c;
+	const float t = (m - k) / max(P - k, 1e-4);
+	const float r = (RampCeil - k) / max(P - k, 1e-4);
+	float m2 = k + (P - k) * t / (1.0 + t * (1.0 / max(r, 1e-4) - 1.0));
+	m2 = lerp(m2, m, smoothstep(RampKeep - 0.06, RampKeep - 0.03, m));
+	return c * (m2 / m);
+}
+
+float3 FixGuard(float3 c, float wRaw, float wGrade, float wAnchor, float gAnchor, float2 uv)
 {
 	const float wg = (GradeOn > 0.5) ? saturate(wGrade) : 0.0;
 	float3 o = Rolloff(c, Ceil, Knee);
@@ -316,19 +393,31 @@ float3 Fix(float3 c, float wRaw, float wGrade, float wAnchor, float gAnchor)
 			o = lerp(o, RolloffM(c, Max3(c), min(Ceil, GradeCeil), Knee), w);
 	}
 	if (SpotOn > 0.5) {
-		// Hot spots: a soft patch over each small, very bright spot is exposed
-		// darker instead of squeezed. Everything in it (the core, its falloff, the
-		// glow) is scaled by the same factor, so the light keeps its shape and the
+		// Hot spots: inside a soft patch over each small, very bright spot only
+		// the highlights are lowered: everything up to Highlight start is left
+		// as it is (a face, a body or a wall next to the light keeps its level),
+		// and what is above it is scaled down so peak white lands where the
+		// exposure cut puts it (SpotScale). The light keeps its shape and the
 		// core stays the brightest point; the patch fades out to the normal fix.
-		// Deep shadows in the patch are kept: the exposure cut eases in from
-		// black up to Highlight start.
-		const float w = wRaw * SpotFade;
+		float w = wRaw * SpotFade;
+		if (w > 0.001 && SpotPixel > 0.5)
+			w *= LightMask(uv);
 		if (w > 0.001) {
-			const float lift = smoothstep(0.0, max(Knee, 0.2), Max3(c));
-			o = lerp(o, c * lerp(1.0, SpotScale, lift), saturate(w));
+			const float m = Max3(c);
+			const float k = Knee;
+			if (m > k) {
+				const float g = clamp((SpotScale - k) / max(1.0 - k, 1e-4), 0.15, 1.0);
+				const float m2 = k + (m - k) * g;
+				o = lerp(o, c * (m2 / m), saturate(w));
+			}
 		}
 	}
 	return o;
+}
+
+float3 Fix(float3 c, float wRaw, float wGrade, float wAnchor, float gAnchor, float2 uv)
+{
+	return Ramp(FixGuard(c, wRaw, wGrade, wAnchor, gAnchor, uv));
 }
 
 float4 main(PS_INPUT input) : SV_Target
@@ -355,7 +444,7 @@ float4 main(PS_INPUT input) : SV_Target
 		if (!right)
 			return s;
 		const float4 sm = spotMask.SampleLevel(sampMask, q, 0);
-		return float4(Fix(s.rgb, sm.r, sm.g, sm.b, sm.a), s.a);
+		return float4(Fix(s.rgb, sm.r, sm.g, sm.b, sm.a, SrcMap.xy + q * SrcMap.zw), s.a);
 	}
 
 	// Hot spot map and pixel size, read here (outside any branch) for the
@@ -365,7 +454,7 @@ float4 main(PS_INPUT input) : SV_Target
 	const float wEdge = max(fwidth(wRaw), 1e-4);
 	const float2 px = max(float2(abs(ddx(input.Tex.x)), abs(ddy(input.Tex.y))), 1e-7);
 
-	const float3 o = Fix(c.rgb, wRaw, wm.g, wm.b, wm.a);
+	const float3 o = Fix(c.rgb, wRaw, wm.g, wm.b, wm.a, input.Tex);
 
 	if (View < 0.5)
 		return float4(o, c.a);
@@ -422,25 +511,27 @@ float4 main(PS_INPUT input) : SV_Target
 )HLSL";
 
 // HLSL cbuffer mirrors (16-byte aligned)
-struct DbleMeasureCB
+struct ClipGuardMeasureCB
 {
 	float cellU, cellV, pad0, pad1;
 	float srcOffX, srcOffY, srcScX, srcScY;
-	float hasSource, srcIsPQ, knee, pad3;
+	float pad2, pad3, knee, pad4;
 };
-struct DbleMainCB
+struct ClipGuardMainCB
 {
 	float ceil, knee, bypass, view;
 	float srcOffX, srcOffY, srcScX, srcScY;
-	float hasSource, srcIsPQ, srcFrameMax, texW;
+	float pad0, pad1, pad2, texW;
 	float colorProtect, spotScale, spotFade, spotOn;
 	float spotCenter[8][4];
 	float spotCount, anchor, gradeCeil, gradeOn;
 	float spotEase[4][4];
+	float spotPixel, spotRad, rampCeil, rampKnee;
+	float rampPeak, rampKeep, rampPad1, rampPad2;
 };
-static_assert(sizeof(DbleMeasureCB) == 48 && sizeof(DbleMainCB) == 272, "DBLE cbuffer size");
+static_assert(sizeof(ClipGuardMeasureCB) == 48 && sizeof(ClipGuardMainCB) == 304, "DBLE cbuffer size");
 
-class CDbleFix
+class CClipGuard
 {
 public:
 	// Measuring grid: Normal 128x72 cells, Fine 256x144.
@@ -448,7 +539,41 @@ public:
 	static constexpr UINT  kMaxCellsY = 144;
 	static constexpr UINT  kStaging = 3;
 	static constexpr DWORD kOverlayHideMs = 8000;
-	static constexpr int   kRows = 16;
+	static constexpr int   kRows = 23;
+	static constexpr int   kRowUpscaler = 15;
+	// Menu rows shown: ClipGuard (not +) leaves out Upscaler.
+	static constexpr int   kRowSource = 19;   // 2.52.0: Test build only
+	int Rows() const { return kRows - (m_s.plus ? 0 : 1) - (m_s.testBuild ? 0 : 1); }
+	// The setting behind a shown row.
+	int RowOf(int shown) const
+	{
+		shown = std::clamp(shown, 0, Rows() - 1);
+		if (!m_s.plus && shown >= kRowUpscaler) shown++;
+		if (!m_s.testBuild && shown >= kRowSource) shown++;
+		return shown;
+	}
+	// Dim fire (2.40.0). Each cell also measures how warm its bright half is:
+	// (red - blue) / red, 0 for white or bluish, about 0.33 for a flame (red
+	// 1.5 x blue). A light is judged by its GLOW only (2.40.1): the cells
+	// around its core that are bright enough to carry a colour. A flame's core
+	// is its palest part (0.20 where its glow is clearly orange), and so is
+	// any light's. With Dim fire off, a light whose glow is at kWarmFull or
+	// warmer is not a hot spot (a flame, a candle, a sodium lamp); between
+	// kWarmStart and kWarmFull its dimming is eased. A light with fewer than
+	// kGlowMinCells glow cells has no glow: it is not fire. The main Guard
+	// still applies to fire.
+	// 2.40.2: the cut-off sits between a glowing figure (Captain Marvel's glow
+	// reads 0.18-0.29 and must stay a hot spot) and fire (0.38-0.46 on the
+	// paused Avengers frames, never under 0.30 as the warmest of a frame).
+	static constexpr float kWarmStart = 0.29f;
+	static constexpr float kWarmFull = 0.33f;
+	// 2.42.5: with Dim fire off a very small fire (a candle flame, a match) is
+	// still a hot spot: full up to kFireSmallStart of the picture (the light's
+	// core), none from kFireSmallFull, so a flame near the limit doesn't snap.
+	static constexpr float kFireSmallStart = 0.0025f;
+	static constexpr float kFireSmallFull = 0.0050f;
+	static constexpr float kWarmLog = 0.20f;   // readout: lights at least this warm count as "warm"
+	static constexpr int   kGlowMinCells = 2;
 	// Hot spots: compact bright areas (each fits in kHotBoxW x kHotBoxH of the
 	// picture) peaking at kHotMinPeak or more, each core judged against its own
 	// peak (within kHotMargin). Every light that passes the lamp and flat-core
@@ -471,14 +596,17 @@ public:
 	static constexpr float kLargeStart = 0.004f;
 	static constexpr float kLargeFull = 0.008f;
 	// A light whose core is flat white in the source (a clipped disc, such as a
-	// spotlight) has no detail to save: dimming it only turns it grey. Such a
-	// light is eased too, by how flat its core is (kClipFlatStart..Full) times
-	// how big it is (kClipSizeStart..Full), so small clipped bulbs are still
-	// dimmed. Streetlights read up to about 50% flat, headlights about 10%.
-	static constexpr float kClipFlatStart = 0.55f;
-	static constexpr float kClipFlatFull = 0.75f;
-	static constexpr float kClipSizeStart = 0.001f;
-	static constexpr float kClipSizeFull = 0.003f;
+	// spotlight) is eased by how flat its core is (kClipFlatStart..Full) times
+	// how big it is (kClipSizeStart..Full). Since 2.38.3 a large, very flat
+	// disc gets no hot spot dimming at all: a lamp of 0.26-0.58% of the picture
+	// with a 72-82% flat core was pulled down hard the moment it was found
+	// mid-shot. The lights tuned on are 0.20% or smaller; the larger ones that
+	// are dimmed (streetlights 0.26%, a fire 0.31-0.37%) have cores at most
+	// 64% flat and are not affected.
+	static constexpr float kClipFlatStart = 0.65f;
+	static constexpr float kClipFlatFull = 0.70f;
+	static constexpr float kClipSizeStart = 0.0020f;
+	static constexpr float kClipSizeFull = 0.0025f;
 	// How fast a light's easing follows (per frame; about a second to settle),
 	// so a light that becomes flat or large fades smoothly.
 	static constexpr float kEaseRate = 0.05f;
@@ -519,8 +647,53 @@ public:
 	// to kHotFlatFull (full), so a graded light that only now and then reads
 	// just over kHotFlatMin (a shaded lamp lighting a table) can't pump.
 	static constexpr float kHotFlatFull = 0.09f;
-	// A hot spot that turns graded or a lamp drains its dimming; below this much it is let go.
-	static constexpr float kDrainDone = 0.02f;
+	// A very bright light counts as flat whatever its core: a soft glow (a
+	// glowing figure, an engine) peaking this high is a light. It is treated as
+	// if its core were flat, ramping from kBrightStart (none) to kBrightFull.
+	static constexpr float kBrightStart = 0.86f;
+	static constexpr float kBrightFull = 0.90f;
+	// Hot spot below fades over about a second (per frame), so a scene sitting
+	// at the limit doesn't pump the patches in and out.
+	static constexpr float kGateRate = 0.04f;
+	// 2.42.4: once the picture is above the limit the patches go in about 5
+	// frames. A headlight that bloomed (picture 3% -> 11%) was no longer found
+	// as a hot spot; its small patch stayed where the light had last been and,
+	// with the slow fade, sat as a dark blotch in the glare for a second.
+	static constexpr float kGateFast = 0.35f;
+	// Hysteresis: a hot spot already there stays at full strength while a bright
+	// light is still in its place, even on frames where that light narrowly
+	// fails a check (it reads graded or as a lamp). Only after kReleaseFrames
+	// such frames in a row (about a second) is it let go and faded out.
+	static constexpr int   kReleaseFrames = 30;
+	// Moving lights: each hot spot keeps its speed and direction, looks for its
+	// light where it should be next (the search reaching further the faster it
+	// moves), and a held patch moves with its light. kMaxSpeed caps the speed
+	// (cells per frame); kSpeedRate is how fast it follows.
+	static constexpr float kMaxSpeed = 12.0f;
+	// A held patch follows its light, and a lost one coasts, only when the hot
+	// spot was already moving at least this fast (Fine cells per frame); a still
+	// light's patch stays put, so it can't hop along a strip of lights (mirror
+	// frames) from piece to piece.
+	static constexpr float kMovingSpeed = 1.0f;
+	// A patch that had two or more lights within its reach is treated as a
+	// group of lights for this many frames.
+	static constexpr int   kGroupFrames = 48;
+	// 2.42.1: a patch only becomes a group (and may then stay put) once its
+	// light has been found on kGroupSeen frames and it is not moving. A fast
+	// headlight with flare reflections around it looked like a tight group on
+	// its second frame, so its patch parked where the light had been and
+	// dimmed empty picture for 10 frames while the light raced on.
+	static constexpr int   kGroupSeen = 6;
+	static constexpr float kRefindPeak = 0.08f;   // 2.42.3: how much dimmer a light may be to pick up a patch lost while moving
+	static constexpr float kSpeedRate = 0.5f;
+	// Strip lights (a mirror's light frame, neon tubes) are not hot spots. A
+	// light is a strip piece when its core is thin and long (at most
+	// kStripThin Fine cells across and at least kStripLong times as long), or
+	// when the light it belongs to, grouped down to kStripLevel, is larger than
+	// the compact limits (a strip whose brightness dips stays one light there).
+	static constexpr float kStripThin = 2.0f;
+	static constexpr float kStripLong = 3.0f;
+	static constexpr float kStripLevel = 0.60f;
 	// Graded spots: small bright graded highlights (a lit cheek, a shirt
 	// shoulder; candidates that fail the flat-core check) up to kGradeMaxFrac
 	// of the picture each, in the same dark scenes as Hot spot. Their patch map
@@ -549,12 +722,36 @@ public:
 	static constexpr float kAnchorDip = 1.0f;
 	// Exposure inside a spot at Hot spot 1.00, in stops (3 = one eighth of the light).
 	static constexpr float kSpotStops = 3.0f;
+	// Hot spot mask Pixel: feather radius around the light, share of the picture height.
+	static constexpr float kMaskFeather = 0.006f;
 	static constexpr int   kMaxTracks = kMaxSpots;
 	// Spot tracking: a spot found inside an existing patch moves that patch
 	// (eased) instead of starting a new one; overlapping patches merge. A spot
 	// not found keeps its patch for kHoldFrames measurements, then fades out
 	// (at once after a scene cut).
 	static constexpr int   kHoldFrames = 15;
+	// A bright opening that reads as a strip (a tall window, a doorway) can pass
+	// as one or two small lights for a frame or two while something crosses
+	// it, or on the first frame of a shot; the strip hold then kept that patch
+	// on the whole opening for two to three seconds. Two rules stop that:
+	// a new hot spot can't start where a strip was seen in the last
+	// kStripMemFrames frames (cleared at a scene cut), and a strip (since 2.38.6
+	// a graded or lamp reading too) only holds a patch whose light was seen for
+	// kProbation frames; a younger patch that loses its light for more than a
+	// frame is dropped quickly.
+	// With look-ahead, a new mid-scene light must be found on the next kConfirm
+	// frames as well before its patch reaches the screen: the shown picture is
+	// Lead() frames behind the measurement, so a light gone again within that
+	// time (a window pane passing the hot spot level for two frames as the
+	// shot brightens) is taken out of the frames not yet shown and is never
+	// dimmed. Look-ahead 4 confirms with its 2 frames and the patch then
+	// starts at full on the light's first frame; Look-ahead 6 confirms with 2
+	// and fades the patch in on the 2 frames before, as Look-ahead 4 used to.
+	static constexpr int   kConfirm = 2;
+	static constexpr int   kStripMemFrames = 24;
+	static constexpr int   kProbation = 6;
+	static constexpr float kYoungFadeOut = 0.5f;
+	static constexpr int   kMaxStripMem = 64;
 	// Scene cut: picture brightness changes by this factor or more.
 	static constexpr float kCutRatio = 4.0f;
 	// While a light is tracked, its dimming follows the scene's darkness this
@@ -562,14 +759,70 @@ public:
 	static constexpr float kLockRate = 0.02f;
 	// A new spot mid-scene starts at kFadeStart of its dimming and reaches the full
 	// amount in a few frames. At a scene cut it is full at
-	// once. With look-ahead beyond 2 frames the fade is started early instead, so
-	// it is complete on the light's first frame.
+	// once. With look-ahead beyond 2 frames it is confirmed first (kConfirm) and
+	// is then full on the light's first frame, faded in on the frames before
+	// where the look-ahead leaves room (Look-ahead 6).
 	static constexpr float kFadeStart = 0.5f;
 	static constexpr float kFadeStepHot = 0.25f;   // 0.50, 0.75, 1.00
+	// 2.41.2: a light first found touching the edge of the picture is sliding
+	// into the frame (a moon in a pan). Its patch starts at kFadeEdge and
+	// reaches full in three more frames, at every Look-ahead setting, so the
+	// light doesn't step darker while it is still entering.
+	static constexpr float kFadeEdge = 0.25f;
 	static constexpr float kTrackFadeOut = 0.85f;  // per frame once a lost spot's hold ends
-	static constexpr int   kMaxLead = 4;           // look-ahead 6 = 4 frames of lead
+	static constexpr int   kMaxLead = 10;          // look-ahead 12 = 10 frames of lead
+	// Look-ahead 8, 10 and 12 (2.38.9) only held the picture back longer, to
+	// try out that much audio delay: a new light is confirmed and faded in
+	// exactly as at Look-ahead 6 (kConfirm frames, then at most kMaxPre).
+	static constexpr int   kMaxPre = 2;
+	// High Performance (2.39.0): Look-ahead 12, 10 frames of lead. It uses the
+	// frames it can see ahead of the shown picture:
+	//  - a new light is judged over its first kConfirmHP frames (it may be
+	//    missed on kPendMissHP of them) and starts with the weights it has by
+	//    then, so one that turns into a lamp or a large light is not dimmed;
+	//  - a patch whose light is not found for Lead() frames ends on the
+	//    light's last frame (2.39.1: no fade in before a new light and none
+	//    out after a lost one, so a patch never sits on something else);
+	//  - the Guard level is the average of the frames from Lead() before to
+	//    Lead() after the shown one, within the scene (2.39.1; no lag);
+	//  - the graded spot map is centred on the shown frame: kAheadWeight
+	//    from the average of the frames ahead, the rest the trailing value;
+	//  - a tracked light that reads as a lamp eases its patch out (and back
+	//    in when it reads as a light); one that reads as a lamp or as part
+	//    of a strip for Lead() frames in a row has become one, and its patch
+	//    ends where that began with EndFade steps (2.39.1);
+	//  - a patch's strength follows its light down without the usual lag:
+	//    kAheadWeight from the light's weights on the frames ahead (2.39.1),
+	//    and up as well (2.40.3: a glow that hardens into a light took a
+	//    second to reach full dimming); the ring (lamp) weight stays slow on
+	//    the way up, so a flame's glow coming and going can't pulse its patch.
+	// Off to 6 work exactly as before.
+	static constexpr int   kHPFrames = 12;
+	static constexpr int   kConfirmHP = 8;
+	static constexpr int   kPendMissHP = 2;
+	// 2.42.0: Look-ahead 6 (4 frames of lead) uses the same method, scaled to
+	// what it can see. On the test reel at Look-ahead 4, 78% of patches were
+	// found on fewer than 4 frames (82% on fewer than 8), and 83% of the gaps
+	// a light came back from were 4 frames or shorter (95% at 10). So at 6:
+	// a new light is judged over kConfirmLite frames (it may be missed on
+	// kPendMissLite), a lost one is held for Lead() = 4 frames, and the Guard,
+	// graded map and patch strength take kAheadWeight x 4/10 from the frames
+	// ahead (the Guard as a blend with its trailing value: 9 frames are too
+	// few to average on their own). A lamp or strip reading still has to
+	// last kLampRun frames; the fade-out then starts on the first frame not
+	// yet shown. Off, 2 and 4 are unchanged.
+	static constexpr int   kHPLiteFrames = 6;
+	static constexpr int   kConfirmLite = 4;
+	static constexpr int   kPendMissLite = 1;
+	static constexpr int   kLampRun = 10;
+	static constexpr int   kEndSteps = 3;
+	static float EndFade(int i) { return i == 1 ? 0.60f : (i == 2 ? 0.30f : 0.10f); }
+	static constexpr float kAheadWeight = 0.62f;
+	static constexpr float kGradeRateHP = 0.10f;
+	static constexpr float kLampGone = 0.02f;
+	static constexpr int   kTgHist = 64;
 
-	~CDbleFix() { ReleaseDevice(); CloseShared(); }
+	~CClipGuard() { ReleaseDevice(); CloseShared(); }
 
 	// ---- device ----------------------------------------------------------------
 
@@ -580,13 +833,13 @@ public:
 		m_pContext = pContext;
 		m_iniPath = moduleDir + L"\\clipguard.ini";
 
-		HRESULT hr = CreatePS(kDbleMeasureHLSL, sizeof(kDbleMeasureHLSL) - 1, &m_pPSMeasure);
-		if (SUCCEEDED(hr)) hr = CreatePS(kDbleMainHLSL, sizeof(kDbleMainHLSL) - 1, &m_pPSMain);
+		HRESULT hr = CreatePS(kClipGuardMeasureHLSL, sizeof(kClipGuardMeasureHLSL) - 1, &m_pPSMeasure);
+		if (SUCCEEDED(hr)) hr = CreatePS(kClipGuardMainHLSL, sizeof(kClipGuardMainHLSL) - 1, &m_pPSMain);
 		if (SUCCEEDED(hr)) {
-			D3D11_BUFFER_DESC bd = { sizeof(DbleMeasureCB), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+			D3D11_BUFFER_DESC bd = { sizeof(ClipGuardMeasureCB), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
 			hr = pDevice->CreateBuffer(&bd, nullptr, &m_pCBMeasure);
 			if (SUCCEEDED(hr)) {
-				bd.ByteWidth = sizeof(DbleMainCB);
+				bd.ByteWidth = sizeof(ClipGuardMainCB);
 				hr = pDevice->CreateBuffer(&bd, nullptr, &m_pCBMain);
 			}
 		}
@@ -633,12 +886,15 @@ public:
 			std::fill(std::begin(m_grade), std::end(m_grade), 0.0f);
 			std::fill(std::begin(m_anchorMap), std::end(m_anchorMap), 0.0f);
 			std::fill(std::begin(m_anchorGain), std::end(m_anchorGain), 1.0f);
-			m_maskDirty = true;
 		}
 		if (SUCCEEDED(hr)) {
 			hr = m_Font.InitDeviceObjects(pDevice, pContext);
 			if (SUCCEEDED(hr)) hr = m_FontS.InitDeviceObjects(pDevice, pContext);
 			if (SUCCEEDED(hr)) hr = m_FontT.InitDeviceObjects(pDevice, pContext);
+			if (SUCCEEDED(hr)) hr = m_FontB.InitDeviceObjects(pDevice, pContext);
+			if (SUCCEEDED(hr)) hr = m_FontH.InitDeviceObjects(pDevice, pContext);
+			if (SUCCEEDED(hr)) hr = m_FontL.InitDeviceObjects(pDevice, pContext);
+			if (SUCCEEDED(hr)) hr = m_FontG.InitDeviceObjects(pDevice, pContext);
 			m_fontH = 0;
 		}
 		if (FAILED(hr)) {
@@ -655,6 +911,7 @@ public:
 		m_nNew = 0;
 		m_outFrame = 0;
 		m_haveAfter = false;
+		AreaClear();
 		return hr;
 	}
 
@@ -681,6 +938,10 @@ public:
 		m_Font.InvalidateDeviceObjects();
 		m_FontS.InvalidateDeviceObjects();
 		m_FontT.InvalidateDeviceObjects();
+		m_FontB.InvalidateDeviceObjects();
+		m_FontH.InvalidateDeviceObjects();
+		m_FontL.InvalidateDeviceObjects();
+		m_FontG.InvalidateDeviceObjects();
 		m_fontH = 0;
 		m_pDevice = nullptr;
 		m_pContext = nullptr;
@@ -690,13 +951,13 @@ public:
 	UINT CellsX() const { return m_cx; }
 	UINT CellsY() const { return m_cy; }
 	int LookAheadFrames() const { return m_s.enabled ? m_s.lookAhead : 0; }
-	float PicturePct() const { return m_picture; }
-	float FixAmount() const { return std::max(m_smooth, 0.0f); }
-	float WhiteCeil() const { return m_ceil; }
-	bool  HotActive() const { return m_hotActive; }
-	void RequestLog(unsigned id) { if (id) m_logWant = id; }
 	// Frames the shown picture is behind the newest measurement (look-ahead beyond 2).
 	int Lead() const { return std::max(0, LookAheadFrames() - 2); }
+	// Of those frames, how many confirm a new mid-scene light before its patch
+	// is shown (the rest fade the patch in early). 0 without look-ahead.
+	bool HP() const { return LookAheadFrames() >= kHPLiteFrames; }      // the look-ahead method: 6 and High Performance
+	bool HPFull() const { return LookAheadFrames() >= kHPFrames; }     // High Performance itself
+	int Confirm() const { return HPFull() ? kConfirmHP : (HP() ? kConfirmLite : std::min(Lead(), kConfirm)); }
 
 	ID3D11PixelShader* PSMeasure() const { return m_pPSMeasure; }
 	ID3D11PixelShader* PSMain() const { return m_pPSMain; }
@@ -706,32 +967,6 @@ public:
 	ID3D11Texture2D* MeasureOutTex() const { return m_pMeasureOut[m_grid]; }
 	CD3D11Font& Font() { return m_Font; }
 
-	// Native Unplugged integration: the application owns the settings and pushes
-	// them through Settings_t. No shared memory or clipguard.ini is consulted once
-	// this has been called.
-	void SetNativeSettings(const ClipGuardSettings& s)
-	{
-		m_native = true;
-		m_s.enabled      = s.enabled;
-		m_s.strength     = std::clamp(s.strength, 0.0f, 1.0f);
-		m_s.fixShape     = std::clamp(s.fixShape, 0, 1);
-		m_s.triggerPct   = std::clamp(s.fixStartPct, 1.0f, 50.0f);
-		m_s.fullPct      = std::clamp(s.fullPct, 0.5f, 49.5f);
-		if (m_s.fullPct > m_s.triggerPct - 0.5f) m_s.fullPct = m_s.triggerPct - 0.5f;
-		m_s.knee         = std::clamp(s.knee, 0.20f, 0.95f);
-		m_s.colorProtect = std::clamp(s.colorProtect, 0.0f, 1.0f);
-		m_s.textSkipPct  = std::clamp(s.textSkipPct, 0.0f, 100.0f);
-		m_s.hotSpot      = std::clamp(s.hotSpot, 0.0f, 1.0f);
-		m_s.hotBelow     = std::clamp(s.hotBelowPct, 0.0f, 20.0f);
-		m_s.gradedSpot   = std::clamp(s.gradedSpot, 0.0f, 1.0f);
-		m_s.grid         = std::clamp(s.grid, 0, 1);
-		m_s.lookAhead    = (s.lookAhead == 2 || s.lookAhead == 4 || s.lookAhead == 6) ? s.lookAhead : 0;
-		m_s.view         = std::clamp(s.view, 0, 3);
-		m_s.overlayOn    = s.osd;
-		m_s.pinned       = s.osdPinned;
-		m_s.selected     = std::clamp(s.osdSelected, 0, kRows - 1);
-	}
-
 	// ---- per frame ---------------------------------------------------------------
 
 	// Settings, the latest finished measurement, and the fix amount for this frame.
@@ -739,7 +974,7 @@ public:
 	{
 		CpuFrame();
 		CpuStart();
-		if (!m_native) PollSettings();
+		PollSettings();
 		if (m_s.grid != m_grid) {
 			// Grid changed: start measuring at the new size; patches start fresh.
 			m_grid = std::clamp(m_s.grid, 0, 1);
@@ -752,9 +987,9 @@ public:
 			std::fill(std::begin(m_grade), std::end(m_grade), 0.0f);
 			std::fill(std::begin(m_anchorMap), std::end(m_anchorMap), 0.0f);
 			std::fill(std::begin(m_anchorGain), std::end(m_anchorGain), 1.0f);
-			m_maskDirty = true;
 			m_outFrame = 0;
 			m_haveAfter = false;
+			AreaClear();
 		}
 		m_outputPQ = outputPQ;
 		m_sceneNits = sceneNits;
@@ -801,7 +1036,9 @@ public:
 				const float u = std::clamp((lim - m_picture) / std::max(lim - full, 0.01f), 0.0f, 1.0f);
 				g = u * u * (3.0f - 2.0f * u);
 			}
-			m_hotGate = g;
+			m_gateShut = lim > 0.0f && m_haveMeasure && m_picture > lim;
+			m_hotGate += (m_gateShut ? kGateFast : kGateRate) * (g - m_hotGate);
+			if (std::fabs(g - m_hotGate) < 0.001f) m_hotGate = g;
 		}
 		const bool hot = dark > 0.0f && m_s.hotSpot > 0.0f && m_hotGate > 0.0f && m_tracksLive >= 1;
 		const float hotTarget = hot ? 1.0f : 0.0f; // the patch fades in and out
@@ -810,6 +1047,8 @@ public:
 			m_hotSmooth = a * hotTarget + (1.0f - a) * m_hotSmooth;
 		}
 		const bool cut = m_cut;
+		m_cutFrame = cut;
+		m_targetRaw = target;
 		m_smooth = (m_smooth < 0.0f || cut) ? target : 0.10f * target + 0.90f * m_smooth;
 		m_cut = false;
 		const float kneeUser = std::clamp(m_s.knee, 0.20f, 0.95f);
@@ -828,17 +1067,206 @@ public:
 		if (hot) {
 			const float stops = kSpotStops * std::clamp(m_s.hotSpot, 0.0f, 1.0f) * dark * m_hotGate;
 			const float want = std::pow(2.0f, -stops / 2.2f);
-			m_spotScale = (m_hotSmooth < 0.05f || m_spotFresh || cut || m_s.hotSpot != m_lastHotSet) ? want : kLockRate * want + (1.0f - kLockRate) * m_spotScale;
+			m_spotScale = (m_hotSmooth < 0.05f || m_spotFresh || cut || m_s.hotSpot != m_lastHotSet) ? want : (m_gateShut ? kGateFast : kLockRate) * want + (1.0f - (m_gateShut ? kGateFast : kLockRate)) * m_spotScale;
 		}
 		m_spotFresh = !hot;
 		m_lastHotSet = m_s.hotSpot;   // a changed setting applies at once
 		m_hotActive = m_hotSmooth > 0.02f && m_spotScale < 0.999f;
 
+		UpdateRamp();
 		PushSnap(hot);
 		WriteStatus();
 		LogFrame();
 		CpuStop();
 	}
+
+	// ---- Projector: Titan Noir Max (DBLE High Measured), 2.46.0 / 2.47.0 -----------
+	// Measured with ClipGuard Meter on 2026-11-17, firmware V1.3.38, DBLE High:
+	// - DBLE goes by the bright AREA: lights adding up to less than about 0.05%
+	//   of the screen are ignored (0.03% ignored, 0.1% counted, many small
+	//   lights add up; position and colour make no difference).
+	// - With nothing counted the laser drops to about 23% of full, and every
+	//   level above what that can show (signal about 0.505, level 128) is one
+	//   flat level (diffuser clip test: 160-255 all read the same).
+	// - When something bright enough appears the laser climbs back over about
+	//   2 s (transitions test). 2.51.0: about 1.3 s from 23% (histogram test
+	//   flares, 2026-11-18: 32% in the first 0.3 s, 55% by 0.5 s, 85-98% by 1 s,
+	//   full by 1.3 s); the threshold (0.05%, whatever the background) and the
+	//   level curve were confirmed by the same tests.
+	// So the laser DBLE aims for is the level of the brightest 0.05% of the
+	// picture (m_dbleP), but never below 23%; the squeeze ceiling is the signal
+	// the modelled laser can show (gamma 2.15, measured). Films: 24 frames a second.
+	// 2.60.0: Titan Noir Max DBLE Low (Predictive), measured 2026-11-19 (firmware V1.3.38,
+	// meter at the screen, against DBLE Off): the same 0.05% bright area and the same
+	// small-highlight clip as High (laser about 23.5% with nothing counted), but the
+	// laser stays up much more with mid-level content: after a full mid-grey screen it
+	// was at about 47% where High was at about 27% (fall test), so its target follows
+	// the DBLE level with exponent 1.08 instead of 2.15. A tiny pure white at 255 is
+	// not clipped at all on Low (High: about 88%). Rise: about 2.3 s to 90% from 25%.
+	// Fall (both modes, fall test): the laser comes down steadily, reaching its new
+	// level about 2.3 s after a bright scene cuts to a dark one (it was modelled as
+	// 0.8 s), whether it starts from full or from mid level.
+	static constexpr float kRampDt = 1.0f / 24.0f;
+	static constexpr float kRampFallDur = 2.3f;  // 2.60.0: s for the laser to come down to its new level (measured, both modes)
+	static constexpr float kRampGamma = 2.15f;   // the projector's measured gamma
+	static constexpr float kRampKnee = 0.75f;    // the squeeze starts at this share of its ceiling
+	static constexpr float kLaserFloor = 0.23f;  // the laser with nothing counted (measured)
+	static constexpr float kDbleArea = 0.0005f;  // bright area DBLE counts (measured: between 0.03% and 0.1%; 0.05% on every background, 2.51.0)
+	static constexpr float kRampRise = 1.3f;     // 2.51.0: s for the laser to climb from 25% to full (was 2.0)
+	bool  LowMode() const { return m_s.projector == 3; }   // 2.60.0: Titan Noir Max DBLE Low (Predictive)
+	float RampTarget(float p) const             // the laser DBLE settles at for this brightest-0.05% level
+	{
+		return std::clamp(std::pow(std::max(p, 0.0f), LowMode() ? 1.08f : kRampGamma), LowMode() ? 0.235f : kLaserFloor, 1.0f);
+	}
+	float RampRise() const { return LowMode() ? 2.6f : kRampRise; }   // Low: 90% at about 2.3 s
+	float DbleWhiteP() const { return LowMode() ? 1.0f : kDbleWhiteP; }
+	static float RampShape(float u)              // laser rise from its start (0) to full (1), u = time / rise time
+	{
+		static const float tu[] = { 0.0f, 0.12f, 0.375f, 0.625f, 0.875f, 1.0f };
+		static const float ts[] = { 0.0f, 0.0f, 0.27f, 0.59f, 0.95f, 1.0f };
+		if (u <= 0.0f) return 0.0f;
+		for (int i = 1; i < 6; i++)
+			if (u <= tu[i]) return ts[i - 1] + (ts[i] - ts[i - 1]) * (u - tu[i - 1]) / (tu[i] - tu[i - 1]);
+		return 1.0f;
+	}
+	// 2.49.0: a tiny PURE WHITE light at full level is counted after all (diffuser
+	// clip test on 2026-11-18: a 0.03% white light at 255 read 88% of Off, at 224
+	// it was clipped; red and orange at 255 were not counted). So near-white
+	// (not warm) cells at 250 or more adding up to kDbleWhiteArea lift the DBLE
+	// level to kDbleWhiteP (laser about 88%).
+	static constexpr float kDbleWhiteArea = 0.0002f;
+	static constexpr float kDbleWhiteP = 0.94f;
+	static constexpr float kDbleWhiteMin = 250.0f / 255.0f;
+	static constexpr float kDbleWhiteWarm = 0.1f;
+
+	float m_rampL = 1.0f, m_rampL0 = 1.0f, m_rampT = 0.0f, m_rampDur = 0.0f;
+	bool  m_rampRising = false;
+	bool  m_rampFalling = false;   // 2.60.0: the fall in progress, and the laser it started from
+	float m_rampFallL0 = 1.0f;
+	float m_rampCeil = 1.0f, m_rampKnee = 1.0f, m_rampKeep = 2.0f;
+	float m_dbleP = 1.0f;   // the level of the brightest 0.05% of the picture (what DBLE goes by)
+	float m_dblePs = 1.0f;  // 2.47.1: the same, smoothed: wobbles under kDbleHold are ignored, real changes followed over about half a second
+	static constexpr float kDbleHold = 0.03f;
+	static constexpr float kDbleRate = 0.15f;   // per frame
+	ULONGLONG m_rampTick = 0;   // 2.48.1: when the model last saw a new frame
+	void UpdateRamp()
+	{
+		m_rampTick = GetTickCount64();
+		if (!MeasuredMode() || !m_haveMeasure || m_outputPQ) {
+			m_rampL = 1.0f; m_rampRising = false; m_rampFalling = false; m_dblePs = 1.0f;
+			m_rampCeil = m_rampKnee = 1.0f;
+			m_rampKeep = 2.0f;
+			return;
+		}
+		// 2.47.2: a scene cut jumps straight to the new shot's level; smoothing is only for wobbles within a shot.
+		if (m_cutFrame) m_dblePs = m_dbleP;
+		else if (std::fabs(m_dbleP - m_dblePs) > kDbleHold) m_dblePs += kDbleRate * (m_dbleP - m_dblePs);
+		const float tgt = RampTarget(m_dblePs);
+		if (tgt < m_rampL - 0.001f) {
+			m_rampRising = false;
+			// 2.60.0: a steady fall that reaches the new level in kRampFallDur (measured).
+			if (!m_rampFalling) { m_rampFalling = true; m_rampFallL0 = m_rampL; }
+			const float rate = std::max(0.02f, (m_rampFallL0 - tgt) / kRampFallDur);
+			m_rampL = std::max(tgt, m_rampL - rate * kRampDt);
+		} else if (tgt > m_rampL + 0.001f) {
+			m_rampFalling = false;
+			if (!m_rampRising) {
+				m_rampRising = true;
+				m_rampL0 = m_rampL;
+				m_rampT = 0.0f;
+				const float a = (1.0f - m_rampL0) / 0.75f;
+				m_rampDur = std::max(0.1f, RampRise() * a * a);   // 2.51.0: 1.3 s from 25% (was 2 s), measured; 2.60.0: Low 2.6 s
+			}
+			m_rampT += kRampDt;
+			m_rampL = std::min(tgt, m_rampL0 + (1.0f - m_rampL0) * RampShape(m_rampT / m_rampDur));
+			if (m_rampL >= tgt - 0.001f) m_rampRising = false;
+		} else {
+			m_rampRising = false;
+			m_rampFalling = false;
+		}
+		const bool on = m_s.enabled && m_rampL < 0.995f;
+		m_rampCeil = on ? std::pow(m_rampL, 1.0f / kRampGamma) : 1.0f;
+		m_rampKnee = on ? kRampKnee * m_rampCeil : 1.0f;
+		m_rampKeep = (on && m_rampRising) ? m_dblePs : 2.0f;
+	}
+	bool TitanMode() const { return m_s.projector == 1 || m_s.projector == 3; }
+	// 2.49.0: a measured projector model replaces the Guard and Hot spot rules (2.51.2: the Titan only; the Valerion model was removed).
+	bool MeasuredMode() const { return m_s.projector == 1 || m_s.projector == 3; }
+	// 2.60.0: the projector row's names (3: Titan Noir Max DBLE Low; 2 was the Valerion, retired).
+	const wchar_t* ProjectorName() const
+	{
+		return m_s.projector == 1 ? L"Titan Noir Max DBLE High (Predictive)"
+			: m_s.projector == 3 ? L"Titan Noir Max DBLE Low (Predictive)" : L"Universal (Reactive)";
+	}
+	// 2.48.1: no new video frames for half a second (paused, menu): the prediction is not current.
+	bool RampStale() const { return m_rampTick == 0 || GetTickCount64() - m_rampTick > 500; }
+
+	// ---- 2.48.0: calibration LUT (2.50.0: chosen in its own LUT row) ------------------
+	// titan.cube / valerion.cube next to clipguard.ini (made by ClipGuard Meter's
+	// auto-cal), with a one-line description in titan.txt / valerion.txt. Checked
+	// about every 2 s so a new auto-cal is picked up while playing. Universal, or
+	// no file: no LUT from ClipGuard (one ClipGuard loaded earlier is taken off;
+	// a LUT Unplugged loaded itself is left alone).
+	int  m_lutCheck = 0;
+	std::wstring m_lutPath;            // what ClipGuard has loaded ("" = none)
+	FILETIME m_lutTime = {};
+	bool m_lutOurs = false;            // ClipGuard loaded the current LUT
+	int  m_lutState = 0;               // 0 = none, 1 = loaded, 2 = failed
+	std::wstring m_lutDesc;
+	bool m_lutOffWas = false;
+	std::wstring LutBase() const
+	{
+		if (m_s.lutOff) return L"";   // F5: off for comparing, treated like no LUT
+		const size_t sl = m_iniPath.find_last_of(L"\\/");
+		const std::wstring dir = sl == std::wstring::npos ? L"." : m_iniPath.substr(0, sl);
+		if (m_s.lut == 1) return dir + L"\\titan";
+		if (m_s.lut == 2) return dir + L"\\valerion";
+		return L"";
+	}
+	// True when the renderer should load (path) or clear (empty path) a LUT now.
+	bool LutWanted(std::wstring& path)
+	{
+		if (m_s.lutOff != m_lutOffWas) { m_lutOffWas = m_s.lutOff; m_lutCheck = 0; }   // F5 acts at once
+		if (++m_lutCheck < 48 && m_lutCheck > 1) return false;
+		m_lutCheck = 2;
+		const std::wstring base = LutBase();
+		std::wstring want;
+		FILETIME ft = {};
+		if (!base.empty()) {
+			WIN32_FILE_ATTRIBUTE_DATA fa = {};
+			if (GetFileAttributesExW((base + L".cube").c_str(), GetFileExInfoStandard, &fa)) { want = base + L".cube"; ft = fa.ftLastWriteTime; }
+		}
+		if (want.empty()) {
+			m_lutState = 0;
+			m_lutDesc.clear();
+			if (m_lutOurs) { m_lutOurs = false; m_lutPath.clear(); path.clear(); return true; }
+			return false;
+		}
+		if (want == m_lutPath && CompareFileTime(&ft, &m_lutTime) == 0) return false;
+		m_lutPath = want;
+		m_lutTime = ft;
+		m_lutDesc.clear();
+		FILE* f = nullptr;
+		if (_wfopen_s(&f, (base + L".txt").c_str(), L"rt, ccs=UTF-8") == 0 && f) {
+			wchar_t line[200] = {};
+			if (fgetws(line, 200, f)) { m_lutDesc = line; while (!m_lutDesc.empty() && (m_lutDesc.back() == L'\n' || m_lutDesc.back() == L'\r')) m_lutDesc.pop_back(); }
+			fclose(f);
+		}
+		path = want;
+		return true;
+	}
+	void LutForget() { m_lutPath.clear(); m_lutCheck = 0; }
+	int Projector() const { return m_s.projector; }
+	int Lut() const { return m_s.lut; }
+	void LutLoaded(bool ok, bool cleared) { m_lutOurs = !cleared; m_lutState = cleared ? 0 : (ok ? 1 : 2); if (!ok) m_lutPath.clear(); }
+	// Banner: 0 = none, 1 = loaded (desc), 2 = failed.
+	int LutState() const { return m_s.lutOff ? 3 : m_lutState; }   // 3 = off with F5
+	const std::wstring& LutDesc() const { return m_lutDesc; }
+	// The shown frame: the level DBLE goes by and the level highlights clip at (0-255; 255 = no squeeze).
+	float DbleLevel() const { return ShownSnap().dbleP * 255.0f; }
+	float ClipLevel() const { const float c = ShownSnap().rampCeil; return c < 0.999f ? c * 255.0f : 255.0f; }
+	// The shown frame's ramp: the laser the squeeze follows, % of full (100 = no squeeze).
+	float RampPct() const { const float c = ShownSnap().rampCeil; return c < 0.999f ? std::pow(std::max(c, 0.0f), kRampGamma) * 100.0f : 100.0f; }
 
 	// ---- look-ahead state ------------------------------------------------------------
 	// The state worked out from each measured frame is queued, and the main pass
@@ -846,11 +1274,12 @@ public:
 	// 2 frames the queue also lets a new spot's patch be faded in on the frames
 	// before the light appears.
 
-	struct Track { float cx = 0, cy = 0, r = 0; int miss = 0; float alpha = 0; float fade = 1.0f; float ease = 1.0f; float pkw = 1.0f; float flw = 1.0f; float rgw = 1.0f; };
+	struct Track { float cx = 0, cy = 0, r = 0; int miss = 0; float alpha = 0; float fade = 1.0f; float ease = 1.0f; float pkw = 1.0f; float flw = 1.0f; float rgw = 1.0f; int fail = 0; float vx = 0, vy = 0; float cov = 0; int grp = 0; int seen = 0; int pend = 0; int age = 0; float rE = 1.0f, rP = 1.0f, rF = 1.0f, rR = 1.0f; int lamp = 0; int id = 0; int lm = 0; float lpk = 1.0f; };   // lm: lost while moving (2.42.2)  // vx, vy: cells per frame; cov, grp: a group of close lights under one patch
 
 	struct Snap
 	{
 		float ceil = 1.0f, knee = 0.3f, spotScale = 1.0f, hotSmooth = 0.0f, peak = 1.0f;
+		float rampCeil = 1.0f, rampKnee = 1.0f, rampPeak = 1.0f, rampKeep = 2.0f, dbleP = 1.0f;   // Projector Titan Noir Max: the ramp squeeze for this frame
 		float spotCenter[kMaxSpots][2] = {};
 		float spotEase[kMaxSpots] = {};
 		int   spotDrawn = 0;
@@ -862,6 +1291,11 @@ public:
 		float grade[kMaxCellsX * kMaxCellsY] = {};
 		float anchorMap[kMaxCellsX * kMaxCellsY] = {};
 		float anchorGain[kMaxCellsX * kMaxCellsY] = {};   // anchorMap 0 = no Anchor, so a 0 gain is never used
+		// For High Performance: the frame's own Guard amount (before and after
+		// smoothing), whether it starts a scene, and its graded spot target.
+		float target = 0.0f, smooth = 0.0f;
+		bool  cut = false;
+		float gradeTarget[kMaxCellsX * kMaxCellsY] = {};
 	};
 
 	void PushSnap(bool hot)
@@ -872,6 +1306,11 @@ public:
 			m_snapGrid = m_grid;
 			m_snapCount = 0;
 		}
+		if (m_snapCount == 0) m_tgCount = 0;
+		m_tgHead = (m_tgHead + 1) % kTgHist;
+		m_tgVal[m_tgHead] = m_targetRaw;
+		m_tgCut[m_tgHead] = m_cutFrame;
+		m_tgCount = std::min(m_tgCount + 1, kTgHist);
 		m_snapHead = (m_snapHead + 1) % (kMaxLead + 1);
 		Snap& sn = m_snap[m_snapHead];
 		sn.ceil = m_ceil; sn.knee = m_kneeEff; sn.peak = m_anchorLv;
@@ -881,9 +1320,17 @@ public:
 		sn.spotDrawn = m_spotDrawn;
 		sn.grid = m_grid;
 		sn.gradeCeil = m_gradeCeil;
+		sn.rampCeil = m_rampCeil; sn.rampKnee = m_rampKnee; sn.rampPeak = 1.0f;   // 2.47.1: a fixed curve up to full white, so a level always comes out the same (the frame's peak made lights flicker)
+		// 2.49.0: these two had ended up inside the comment above since 2.47.1, so the
+		// keep was never used and the banner's DBLE level always read 255. The level is
+		// shown again; the keep stays off, as in every build tested since 2.47.1.
+		sn.rampKeep = 2.0f;
+		sn.dbleP = m_dblePs;
+		sn.target = m_targetRaw; sn.smooth = std::max(m_smooth, 0.0f); sn.cut = m_cutFrame;
 		{
 			const size_t nc = (size_t)m_cx * m_cy;
 			memcpy(sn.grade, m_grade, nc * sizeof(float));
+			memcpy(sn.gradeTarget, m_gradeTarget, nc * sizeof(float));
 			memcpy(sn.anchorMap, m_anchorMap, nc * sizeof(float));
 			memcpy(sn.anchorGain, m_anchorGain, nc * sizeof(float));
 		}
@@ -892,16 +1339,22 @@ public:
 			sn.tracks[kMaxTracks + k] = Track();
 		}
 		m_snapCount = std::min(m_snapCount + 1, kMaxLead + 1);
-		// New spots: fade their patch in on the queued frames before this one.
+		// Spots just confirmed (found on the kConfirm frames after their first):
+		// fade their patch in on the queued frames before their first one.
+		const int conf = std::min(lead, Confirm());
+		const int pre = HP() ? 0 : std::min(lead - conf, kMaxPre);   // High Performance: starts on the light's first frame
 		for (int i = 0; i < m_nNew; i++) {
-			const Track& t = m_tracks[m_newSlots[i]];
-			if (!hot) continue;
-			for (int k = 1; k <= lead && k < m_snapCount; k++) {
-				Snap& e = m_snap[(m_snapHead + kMaxLead + 1 - k) % (kMaxLead + 1)];
+			if (!hot || conf >= m_snapCount) continue;
+			// The patch as it was on the light's first frame.
+			Track t = m_snap[(m_snapHead + kMaxLead + 1 - conf) % (kMaxLead + 1)].tracks[m_newSlots[i]];
+			if (t.alpha <= 0.0f) t = m_tracks[m_newSlots[i]];
+			t.pend = 0;
+			for (int k = 1; k <= pre && conf + k < m_snapCount; k++) {
+				Snap& e = m_snap[(m_snapHead + kMaxLead + 1 - conf - k) % (kMaxLead + 1)];
 				for (int j = kMaxTracks; j < 2 * kMaxTracks; j++) {
 					if (e.tracks[j].alpha > 0.0f) continue;
 					e.tracks[j] = t;
-					e.tracks[j].fade = 1.0f - (float)k / (float)(lead + 1);
+					e.tracks[j].fade = t.fade * (1.0f - (float)k / (float)(pre + 1));   // t.fade < 1: a light entering at the edge
 					break;
 				}
 				if (e.hotSmooth < 0.05f) { e.hotSmooth = 1.0f; e.spotScale = m_spotScale; }
@@ -916,6 +1369,87 @@ public:
 		return m_snap[(m_snapHead + kMaxLead + 1 - std::max(back, 0)) % (kMaxLead + 1)];
 	}
 
+	// High Performance: the queued frames after the shown one that belong to
+	// the same scene (up to the next cut). 0 in every other mode.
+	int AheadFrames() const
+	{
+		if (!HP()) return 0;
+		const int back = std::max(std::min(m_snapLead, m_snapCount - 1), 0);
+		int n = 0;
+		for (int f = 1; f <= back; f++) {
+			if (AheadSnap(f).cut) break;
+			n++;
+		}
+		return n;
+	}
+	const Snap& AheadSnap(int f) const   // f frames after the shown one
+	{
+		const int back = std::max(std::min(m_snapLead, m_snapCount - 1), 0);
+		return m_snap[(m_snapHead + kMaxLead + 1 - std::max(back - f, 0)) % (kMaxLead + 1)];
+	}
+	// The Guard amount for the shown frame. High Performance: centred on that
+	// frame instead of trailing it.
+	float ShownSmooth() const
+	{
+		const Snap& sn = ShownSnap();
+		if (!HP() || m_tgCount <= 0) return sn.smooth;
+		if (!HPFull()) {
+			// Look-ahead 6: the trailing value, drawn toward the frames ahead.
+			const int na = AheadFrames();
+			if (na <= 0) return sn.smooth;
+			float ahead = 0.0f;
+			for (int f = 1; f <= na; f++) ahead += AheadSnap(f).target;
+			const float w = kAheadWeight * (float)na / (float)kMaxLead;
+			return (1.0f - w) * sn.smooth + w * ahead / (float)na;
+		}
+		// The frames from Lead() before to Lead() after the shown one, as far
+		// as they belong to its scene.
+		const int back = std::max(std::min(m_snapLead, m_snapCount - 1), 0);
+		auto at = [&](int off) { return (m_tgHead + 2 * kTgHist - back + off) % kTgHist; };   // off frames after the shown one
+		float sum = m_tgVal[at(0)];
+		int n = 1;
+		for (int f = 1; f <= back; f++) {
+			if (m_tgCut[at(f)]) break;
+			sum += m_tgVal[at(f)]; n++;
+		}
+		const int past = std::min(m_snapLead, m_tgCount - 1 - back);
+		for (int p = 1; p <= past; p++) {
+			if (m_tgCut[at(1 - p)]) break;   // the frame after it starts a scene
+			sum += m_tgVal[at(-p)]; n++;
+		}
+		return sum / (float)n;
+	}
+	// How strongly a patch of the shown frame is drawn. High Performance:
+	// its strength follows the light down without the trailing lag, from the
+	// light's own weights on the frames ahead (same patch, same scene).
+	float ShownWeight(const Snap& sn, int k) const
+	{
+		const Track& t = sn.tracks[k];
+		const float trail = t.ease * t.pkw * t.flw * t.rgw;
+		float wt = trail;
+		if (k < kMaxTracks && &sn == &ShownSnap()) {
+			const int na = AheadFrames();
+			float sum = 0.0f, sumUp = 0.0f;
+			int n = 0;
+			for (int f = 1; f <= na; f++) {
+				const Track& e = AheadSnap(f).tracks[k];
+				if (e.alpha <= 0.0f || e.id != t.id) break;
+				const float up = std::min(e.rE, t.ease) * std::max(e.rP, t.pkw) * e.rF;   // the peak weight never pulls a patch down (2.41.1)
+				sumUp += up;
+				sum += up * e.rR;
+				n++;
+			}
+			if (n > 0) {
+				const float w = kAheadWeight * (float)n / (float)kMaxLead;
+				const float m = sum / (float)n;
+				const float mUp = sumUp / (float)n * t.rgw;   // up: peak and flat weights ahead, ring weight as it trails
+				if (m < trail) wt = trail - w * (trail - m);
+				else if (mUp > trail) wt = trail + w * (mUp - trail);
+			}
+		}
+		return t.alpha * t.fade * wt;
+	}
+
 	// Spot maps (r = hot, g = graded). Hot: from a state's patches, 1 over each
 	// spot, fading to 0 over its glow and a soft edge (only the cells near each
 	// patch are visited). Graded: the slowly following graded spot map.
@@ -928,11 +1462,33 @@ public:
 			m_mask[i * 4 + 2] = sn.anchorMap[i];
 			m_mask[i * 4 + 3] = sn.anchorGain[i];
 		}
-		for (const Track& t : sn.tracks) {
+		// High Performance: the graded map is centred on the shown frame too.
+		const int na = AheadFrames();
+		if (na > 0) {
+			const size_t nc = (size_t)cx * cy;
+			static float sum[kMaxCellsX * kMaxCellsY];
+			std::fill(sum, sum + nc, 0.0f);
+			for (int f = 1; f <= na; f++) {
+				const float* g = AheadSnap(f).gradeTarget;
+				for (size_t i = 0; i < nc; i++) sum[i] += g[i];
+			}
+			const float w = kAheadWeight * (float)na / (float)kMaxLead;
+			const float k = w / (float)na;
+			for (size_t i = 0; i < nc; i++) m_mask[i * 4 + 1] = (1.0f - w) * sn.grade[i] + k * sum[i];
+		}
+		{
+			float gm = 0.0f;
+			for (size_t i = 0; i < (size_t)cx * cy; i++) gm = std::max(gm, m_mask[i * 4 + 1]);
+			m_shownGradeMax = gm;
+		}
+		for (int ti = 0; ti < 2 * kMaxTracks; ti++) {
+			const Track& t = sn.tracks[ti];
 			if (t.alpha <= 0.0f) continue;
-			const float rIn = t.r;
-			const float rOut = 2.0f * t.r + 4.0f * gsF();
-			const float wt = t.alpha * t.fade * t.ease * t.pkw * t.flw * t.rgw;
+			// A patch over a group of close lights is full out to the farthest of
+			// them (cov); its soft edge is as wide as ever.
+			const float rIn = std::max(t.r, t.cov);
+			const float rOut = 2.0f * t.r + 4.0f * gsF() + (rIn - t.r);
+			const float wt = ShownWeight(sn, ti);
 			const int xa = std::max(0, (int)std::floor(t.cx - rOut)), xb = std::min(cx - 1, (int)std::ceil(t.cx + rOut));
 			const int ya = std::max(0, (int)std::floor(t.cy - rOut)), yb = std::min(cy - 1, (int)std::ceil(t.cy + rOut));
 			for (int y = ya; y <= yb; y++) {
@@ -962,26 +1518,27 @@ public:
 		m_outFrame++;
 	}
 
-	void FillMeasureCB(float cellU, float cellV, float offX, float offY, float scX, float scY, bool hasSource, bool srcIsPQ)
+	void FillMeasureCB(float cellU, float cellV, float offX, float offY, float scX, float scY)
 	{
-		DbleMeasureCB cb = { cellU, cellV, 0, 0, offX, offY, scX, scY, hasSource ? 1.0f : 0.0f, srcIsPQ ? 1.0f : 0.0f,
+		ClipGuardMeasureCB cb = { cellU, cellV, 0, 0, offX, offY, scX, scY, 0, 0,
 			std::clamp(m_s.knee, 0.20f, 0.95f), 0 };
 		m_pContext->UpdateSubresource(m_pCBMeasure, 0, nullptr, &cb, 0, 0);
 	}
 
-	void FillMainCB(bool bypass, float offX, float offY, float scX, float scY, bool hasSource, bool srcIsPQ, float texW)
+	void FillMainCB(bool bypass, float offX, float offY, float scX, float scY, float texW)
 	{
 		CpuStart();
 		const Snap& sn = ShownSnap();
-		DbleMainCB cb = {};
+		ClipGuardMainCB cb = {};
 		cb.ceil = sn.ceil;
 		cb.knee = sn.knee;
+		if (HP()) {
+			cb.ceil = 1.0f - 0.5f * ShownSmooth();
+			cb.knee = std::min(std::clamp(m_s.knee, 0.20f, 0.95f), cb.ceil - 0.05f);
+		}
 		cb.bypass = bypass ? 1.0f : 0.0f;
 		cb.view = (float)std::clamp(m_s.view, 0, 3);
 		cb.srcOffX = offX; cb.srcOffY = offY; cb.srcScX = scX; cb.srcScY = scY;
-		cb.hasSource = hasSource ? 1.0f : 0.0f;
-		cb.srcIsPQ = srcIsPQ ? 1.0f : 0.0f;
-		cb.srcFrameMax = m_srcMax;
 		cb.texW = texW;
 		cb.colorProtect = std::clamp(m_s.colorProtect, 0.0f, 1.0f);
 		cb.spotScale = sn.spotScale;
@@ -997,6 +1554,19 @@ public:
 		cb.gradeOn = (!bypass && m_s.enabled && sn.gradeCeil < 0.999f) ? 1.0f : 0.0f;
 		for (int i = 0; i < kMaxSpots; i++) {
 			cb.spotEase[i / 4][i % 4] = sn.spotEase[i];
+		}
+		cb.spotPixel = (m_s.spotMask == 1) ? 1.0f : 0.0f;
+		cb.spotRad = kMaskFeather * scY;
+		cb.rampCeil = bypass ? 1.0f : sn.rampCeil;
+		cb.rampKnee = sn.rampKnee;
+		cb.rampPeak = sn.rampPeak;
+		cb.rampKeep = sn.rampKeep;
+		if (MeasuredMode()) {
+			// Titan Noir Max / Valerion Max: the measured model replaces the Guard and Hot spot rules.
+			cb.ceil = 1.0f;
+			cb.spotOn = 0.0f;
+			cb.gradeOn = 0.0f;
+			cb.anchor = 0.0f;
 		}
 		m_pContext->UpdateSubresource(m_pCBMain, 0, nullptr, &cb, 0, 0);
 		BuildMask(sn);
@@ -1061,6 +1631,9 @@ public:
 
 	// ---- overlay -------------------------------------------------------------------
 
+	int Upscaler() const { return m_s.upscaler; }
+	bool TemporalDither() const { return m_s.dither == 1; }
+
 	bool OverlayVisible() const
 	{
 		if (!m_s.overlayOn) return false;
@@ -1071,55 +1644,164 @@ public:
 	float BottomBarFrac() const { return m_bottomBarFrac; }
 	// Top letterbox bar, fraction of the video height (0 when unknown).
 	float TopBarFrac() const { return (m_haveMeasure && m_by0 <= m_by1) ? (float)m_by0 / (float)m_cy : 0.0f; }
+	// The bars around the largest picture area seen so far, for placing the
+	// overlay: in a very dark shot the picture's edge rows read as bar on some
+	// frames, and the overlay must not move with that.
+	float StableTopBarFrac() const { return (m_stickY0 <= m_stickY1) ? (float)m_stickY0 / (float)m_cy : 0.0f; }
+	float StableBottomBarFrac() const { return (m_stickY0 <= m_stickY1) ? (float)((int)m_cy - 1 - m_stickY1) / (float)m_cy : 0.0f; }
 	int View() const { return m_s.view; }
 	// Split screen and Side by side change the picture the projector gets, so
 	// its dimming reacts differently: a note is shown above the picture.
 	bool ShowViewNote() const { return !m_outputPQ && (m_s.view == 2 || m_s.view == 3); }
 
-	// Fonts follow the window: the main one about 1/120 of its height (the
-	// whole overlay scales with it), a small one for headings, keys and the
-	// cost line, and a bold title.
+	// Fonts follow the window: the main one about 1/96 of its height (the whole
+	// overlay scales with it), a small one for hints and the cost line, a bold
+	// small one for headings, a bold title and a large bold one for the info
+	// banner's badges. Inter (the Unplugged menu's font) when it is installed,
+	// else Segoe UI.
+	static const wchar_t* FontFamily()
+	{
+		static int have = -1;   // -1 = not checked yet
+		if (have < 0) {
+			have = 0;
+			CComPtr<IDWriteFactory> pFactory;
+			if (SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&pFactory))) && pFactory) {
+				CComPtr<IDWriteFontCollection> pFonts;
+				if (SUCCEEDED(pFactory->GetSystemFontCollection(&pFonts, FALSE)) && pFonts) {
+					UINT32 index = 0;
+					BOOL exists = FALSE;
+					if (SUCCEEDED(pFonts->FindFamilyName(L"Inter", &index, &exists)) && exists) have = 1;
+				}
+			}
+		}
+		return have == 1 ? L"Inter" : L"Segoe UI";
+	}
 	void EnsureFont(int windowH)
 	{
-		const UINT h = (UINT)std::max(11, windowH / 120);
+		const UINT h = (UINT)std::max(14, windowH / 96);
+		const wchar_t* family = FontFamily();
 		if (h != m_fontH
-			&& SUCCEEDED(m_Font.CreateFontBitmap(L"Segoe UI", h, 0))
-			&& SUCCEEDED(m_FontS.CreateFontBitmap(L"Segoe UI", std::max(9u, h * 4 / 5), 0))
-			&& SUCCEEDED(m_FontT.CreateFontBitmap(L"Segoe UI", h * 3 / 2, D3DFONT_BOLD))) {
+			&& SUCCEEDED(m_Font.CreateFontBitmap(family, h, 0))
+			&& SUCCEEDED(m_FontS.CreateFontBitmap(family, std::max(9u, h * 4 / 5), 0))
+			&& SUCCEEDED(m_FontH.CreateFontBitmap(family, std::max(9u, h * 4 / 5), D3DFONT_BOLD))
+			&& SUCCEEDED(m_FontT.CreateFontBitmap(family, h * 3 / 2, D3DFONT_BOLD))
+			&& SUCCEEDED(m_FontB.CreateFontBitmap(family, h * 3, D3DFONT_BOLD))
+			&& SUCCEEDED(m_FontL.CreateFontBitmap(family, h * 31 / 20, 0))
+			&& SUCCEEDED(m_FontG.CreateFontBitmap(family, h * 13 / 10, D3DFONT_BOLD))) {
 			m_fontH = h;
 		}
 	}
 	UINT FontH() const { return m_fontH; }
 	CD3D11Font& FontS() { return m_FontS; }
 	CD3D11Font& FontT() { return m_FontT; }
+	CD3D11Font& FontB() { return m_FontB; }
+	CD3D11Font& FontHd() { return m_FontH; }
+	CD3D11Font& FontL() { return m_FontL; }
+	CD3D11Font& FontG() { return m_FontG; }
+
+	// ---- info banner (F6) --------------------------------------------------------
+	bool InfoVisible() const { return m_s.infoOn; }
+	// The graphics card's load in % as Windows reports it (Task Manager's 3D
+	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
+	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
+	const wchar_t* VersionText() const { return L"2.60.0"; }
+	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
+	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
+	float PicturePct() const { return m_picture; }
+	float FixPct() const { return std::max(m_smooth, 0.0f) * 100.0f; }
+	int SpotsDimmed() const { return m_hotActive ? m_spots : 0; }
+	bool PixelMask() const { return m_s.spotMask == 1; }
+	double GpuMs() const { return m_costGpuAvg; }
+	double CpuMs() const { return m_costCpuAvg; }
+	// What the info banner shows of the fix and the hot spots.
+	struct InfoStats {
+		float picture, peak, fix, white, strength, hotSpot, hotBelow, gate, gradeCeil;
+		int lights, spots, lamps, strips, graded, lookAhead, grid, fixShape, fires;
+		bool dimmed, spread, dimFire, kscape;
+	};
+	InfoStats GetInfo() const
+	{
+		InfoStats i = {};
+		i.picture = m_picture; i.peak = m_framePeak * 100.0f; i.fix = std::max(m_smooth, 0.0f) * 100.0f; i.white = m_ceil * 100.0f;
+		i.strength = m_s.strength; i.hotSpot = m_s.hotSpot; i.hotBelow = m_s.hotBelow; i.gate = m_hotGate; i.gradeCeil = m_gradeCeil * 100.0f;
+		i.lights = m_spreadLights; i.spots = m_spots; i.lamps = m_litSpots; i.strips = m_stripPieces; i.graded = m_gradedSpots;
+		i.lookAhead = m_s.lookAhead; i.grid = m_s.grid; i.fixShape = m_s.fixShape;
+		i.dimmed = m_hotActive; i.spread = m_spread;
+		i.fires = m_fireSpots; i.dimFire = m_s.dimFire; i.kscape = m_s.kscape;
+		return i;
+	}
+	// The picture inside the black bars as a share of the frame (the stable
+	// area, see AreaPush); false until something has been measured.
+	// A new file: forget the picture shape remembered from the last one, so
+	// the menu and banner land inside the new picture at once (2.42.1).
+	void AreaReset() { AreaClear(); }
+	bool PictureArea(float& wFrac, float& hFrac) const
+	{
+		if (m_stickY0 > m_stickY1 || m_stickX0 > m_stickX1 || !m_cx || !m_cy) return false;
+		wFrac = (float)(m_stickX1 - m_stickX0 + 1) / (float)m_cx;
+		hFrac = (float)(m_stickY1 - m_stickY0 + 1) / (float)m_cy;
+		return true;
+	}
 
 	// The overlay as data: rows (headings and settings) and readout lines.
 	// style: 0 = normal, 1 = blue (values, what is active), 2 = dim, 3 = yellow (Off, Skipped)
 	struct OvRow { bool heading; std::wstring name, value; bool selected; int style; };
 	struct OvLine { std::wstring text; int style; };
 	struct OvKey { std::wstring key, what; };
-	struct OvModel { std::wstring version; std::vector<OvRow> rows; std::vector<OvKey> keys; std::vector<OvLine> lines; };
+	struct OvModel { std::wstring title; std::wstring version; std::vector<OvRow> rows; std::vector<OvKey> keys; std::vector<OvLine> lines; std::wstring help; };   // help: what the selected setting does and how to set it
 
 	OvModel Overlay() const
 	{
 		OvModel m;
-		m.version = m_s.testBuild ? L"2.25.4 Test" : L"2.25.4";
+		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
+		m.version = m_s.testBuild ? L"2.60.0 Test" : L"2.60.0";
 		const auto vals = Lines();
-		static const wchar_t* names[kRows] = { L"Fix", L"Strength", L"Fix shape", L"Fix starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Graded spot", L"Grid", L"Look-ahead", L"View", L"Overlay", L"Restart & update" };
+		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"Source", L"View", L"Overlay", L"Restart & update" };
+		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it
 		for (int i = 0; i < kRows; i++) {
-			if (i == 0) m.rows.push_back({ true, L"FIX", L"", false, 2 });
+			if (i == kRowUpscaler && !m_s.plus) continue;
+			if (i == kRowSource && !m_s.testBuild) continue;
+			if (i == 0) m.rows.push_back({ true, L"GUARD", L"", false, 2 });
 			if (i == 8) m.rows.push_back({ true, L"SPOTS", L"", false, 2 });
-			if (i == 11) m.rows.push_back({ true, L"DISPLAY", L"", false, 2 });
+			if (i == 13) m.rows.push_back({ true, L"DISPLAY", L"", false, 2 });
 			std::wstring v = vals[i];
 			int st = (v == L"Off") ? 3 : (i == kRows - 1 ? 2 : 1);
-			const bool sel = (i == m_s.selected);
-			if (sel) v = L"< " + v + L" >";
+			const bool sel = (vis++ == m_s.selected);
 			m.rows.push_back({ false, (i == kRows - 1 && !m_s.testBuild) ? L"Restart" : names[i], v, sel, st });
+		}
+		// What the selected setting does, and how to set it (2.41.0).
+		static const wchar_t* help[kRows] = {
+			L"Turns the whole fix on or off. Same as F8. Leave on; turn off to compare.",
+			L"How far highlights are pulled down in dark scenes. Start at 0.35. Raise it if highlights still clip, lower it if dark scenes look dull.",
+			L"Anchor keeps the brightest parts and eases the areas around them; Normal lowers all highlights together. Anchor suits most films.",
+			L"The Guard begins when the picture is darker than this. 10% is a good start. Higher makes it act in brighter scenes too.",
+			L"The Guard is at full Strength when the picture is darker than this. 3% is a good start. Keep it below Guard starts.",
+			L"Only parts brighter than this are touched. 0.40 is a good start. Lower if mid-bright areas clip, higher to leave more of the picture alone.",
+			L"Higher leaves strongly coloured highlights alone. 0.90 is a good start. Lower it if bright reds or blues clip.",
+			L"Leaves titles, credits and star fields alone. 25% works for most films. 0 turns it off.",
+			L"Dims small, very bright lights in dark scenes, such as headlights. Start at 0.60. Raise it if lights still clip, lower it if they look dull. F10 turns it on and off.",
+			L"Hot spot only works when the picture is darker than this. 3% is a good start. Raise it if lights clip in slightly brighter scenes.",
+			L"Pixel dims only the light itself; Patch dims a soft area around it. Pixel suits most films. Try Patch if a dimmed light looks cut out.",
+			L"Gently dims small soft highlights that aren't hot spots, such as a lit cheek. 0.50 is a good start. 0 turns it off.",
+			L"No leaves fire and other orange or red lights alone, except very small flames such as a candle. Choose Yes if fire clips on your projector.",
+			L"Fine finds small lights better, for a little more work. Use Fine unless frames are being skipped.",
+			L"Holds the picture back so the fix lands on time. Add the same audio delay. 4 suits most setups. High Performance works best but needs half a second of delay and a capable graphics card.",
+			L"FSRCNNX sharpens 1080p on a 4K screen with a small neural network; Normal uses the usual scaler. Try FSRCNNX; go back to Normal if frames are skipped or edges look harsh.",
+			L"Static keeps the fine dither pattern still; Temporal moves it every frame so dark gradients look smoother. Compare on a dark, smooth scene; Static if you see a fine shimmer.",
+			L"Universal (Reactive) works with any laser projector, reacting to what is on screen with the Guard and Hot spot settings. Titan Noir Max DBLE High / DBLE Low (Predictive) predict DBLE from meter measurements (firmware V1.3.38) and squeeze only the highlights it would clip; they replace the Guard and Hot spot settings, shown as Predictive. Set the projector's DBLE to the same mode. On a Valerion Max use Universal (Reactive).",
+			L"The calibration LUT from ClipGuard Meter's auto-cal: Titan loads titan.cube, Valerion loads valerion.cube; None uses no LUT. F5 turns it off and on to compare.",
+			L"Video Processor shows the HDMI input. Media Player opens your Plex movies; pick one and it plays here with ClipGuard. F4 goes back to the library while a film plays.",
+			L"Normal for watching. The other views show where the Guard is working, or compare it on and off.",
+			L"Auto-hide closes this menu after a few seconds. Always keeps it up while you adjust.",
+			L"Press Right to restart Unplugged and ClipGuard." };
+		{
+			const int sel = RowOf(m_s.selected);
+			m.help = (sel == kRows - 1 && m_s.testBuild) ? L"Press Right to restart Unplugged and ClipGuard and update to the newest build." : help[sel];
 		}
 		m.keys = {
 			{ L"Up / Down", L"select" }, { L"Left / Right", L"change" },
-			{ L"F7", L"show / hide menu" }, { L"F8", L"fix on / off" },
-			{ L"F9", L"fix areas view" }, { L"F10", L"hot spot on / off" },
+			{ L"F6", L"info banner" }, { L"F7", L"show / hide menu" }, { L"F8", L"guard on / off" },
+			{ L"F9", L"guard areas view" }, { L"F10", L"hot spot on / off" },
 			{ L"F11", m_s.testBuild ? L"send log" : L"save log" } };
 		if (m_s.testBuild) m.keys.push_back({ L"Ctrl+Alt+U", L"restart & update" });
 		m.lines = Readout();
@@ -1129,7 +1811,7 @@ public:
 	// The settings' values, as shown.
 	std::vector<std::wstring> Lines() const
 	{
-		static const wchar_t* views[] = { L"Normal", L"Fix areas", L"Split screen", L"Side by side" };
+		static const wchar_t* views[] = { L"Normal", L"Guard areas", L"Split screen", L"Side by side" };
 		wchar_t v[kRows][48];
 		swprintf_s(v[0], L"%ls", m_s.enabled ? L"On" : L"Off");
 		swprintf_s(v[1], L"%.2f", m_s.strength);
@@ -1144,14 +1826,25 @@ public:
 		else swprintf_s(v[8], L"Off");
 		if (m_s.hotBelow > 0.0f) swprintf_s(v[9], L"%.1f %%", m_s.hotBelow);
 		else swprintf_s(v[9], L"Off");
-		if (m_s.gradedSpot > 0.0f) swprintf_s(v[10], L"%.2f", m_s.gradedSpot);
-		else swprintf_s(v[10], L"Off");
-		swprintf_s(v[11], L"%ls", m_s.grid ? L"Fine" : L"Normal");
-		if (m_s.lookAhead > 0) swprintf_s(v[12], L"%d frames", m_s.lookAhead);
-		else swprintf_s(v[12], L"Off");
-		swprintf_s(v[13], L"%ls", views[std::clamp(m_s.view, 0, 3)]);
-		swprintf_s(v[14], L"%ls", m_s.pinned ? L"Always" : L"Auto-hide");
-		swprintf_s(v[15], L"Press Right");
+		swprintf_s(v[10], L"%ls", m_s.spotMask == 1 ? L"Pixel" : L"Patch");
+		if (m_s.gradedSpot > 0.0f) swprintf_s(v[11], L"%.2f", m_s.gradedSpot);
+		else swprintf_s(v[11], L"Off");
+		swprintf_s(v[12], L"%ls", m_s.dimFire ? L"Yes" : L"No");
+		swprintf_s(v[13], L"%ls", m_s.grid ? L"Fine" : L"Normal");
+		if (m_s.kscape) swprintf_s(v[14], L"%d frames (Kaleidescape)", m_s.lookAhead);
+		else if (m_s.lookAhead >= kHPFrames) swprintf_s(v[14], L"High Performance");
+		else if (m_s.lookAhead > 0) swprintf_s(v[14], L"%d frames", m_s.lookAhead);
+		else swprintf_s(v[14], L"Off");
+		swprintf_s(v[15], L"%ls", m_s.upscaler == 1 ? L"FSRCNNX" : L"Normal");
+		swprintf_s(v[16], L"%ls", m_s.dither == 1 ? L"Temporal" : L"Static");
+		swprintf_s(v[17], L"%ls", ProjectorName());
+		swprintf_s(v[18], L"%ls", m_s.lut == 1 ? L"Titan" : (m_s.lut == 2 ? L"Valerion" : L"None"));
+		if (MeasuredMode())
+			for (int i = 1; i <= 12; i++) swprintf_s(v[i], L"Predictive");   // the measured model replaces these
+		swprintf_s(v[19], L"%ls", m_s.source == 1 ? L"Media Player" : L"Video Processor");
+		swprintf_s(v[20], L"%ls", views[std::clamp(m_s.view, 0, 3)]);
+		swprintf_s(v[21], L"%ls", m_s.pinned ? L"Always" : L"Auto-hide");
+		swprintf_s(v[22], L"Press Right");
 		std::vector<std::wstring> out;
 		for (int i = 0; i < kRows; i++) out.push_back(v[i]);
 		return out;
@@ -1163,14 +1856,14 @@ public:
 		std::vector<OvLine> out;
 		wchar_t st[384];
 		if (m_outputPQ) {
-			out.push_back({ L"HDR output: the fix needs SDR output", 3 });
+			out.push_back({ L"HDR output: the guard needs SDR output", 3 });
 		} else if (!m_haveMeasure) {
 			out.push_back({ L"Measuring...", 2 });
 		} else {
 			wchar_t text[32];
 			if (m_brightSamples >= 16.0f) swprintf_s(text, L"%.0f%%", m_textPct);
 			else swprintf_s(text, L"-");
-			swprintf_s(st, L"Picture %.1f%%   Text %ls%ls   Fix %.0f%%   White %.0f%%   Peak %.0f%%",
+			swprintf_s(st, L"Picture %.1f%%   Text %ls%ls   Guard %.0f%%   White %.0f%%   Peak %.0f%%",
 				m_picture, text, m_textSkipped ? L" Skipped" : L"", m_smooth * 100.0f, m_ceil * 100.0f, m_framePeak * 100.0f);
 			out.push_back({ st, 0 });
 			wchar_t hotTxt[192] = L"Hot -";
@@ -1244,14 +1937,13 @@ public:
 		if (!ExeAlive()) return L"";
 		const int st = (int)m_pShared->logState;
 		if (st <= 0 || (DWORD)(GetTickCount() - m_pShared->logStateTick) > 10000) return L"";
-		switch (st) {
-		case 1: return L"Log: saving...";
-		case 2: return L"Log: sending...";
-		case 3: return L"Log: sent";
-		case 5: return L"Log: saved, not sent (no GitHub token in clipguard.ini)";
-		case 6: return L"Log: saved to %LOCALAPPDATA%\\ClipGuard\\logs";
-		default: return L"Log: saved, sending failed (kept in %LOCALAPPDATA%\\ClipGuard\\logs)";
-		}
+		// 2.45.1: sending and sent are shown again (asked for, so a second F11
+		// is not pressed while the first log is still being sent).
+		if (st == 2) return L"Log: sending...";
+		if (st == 3) return L"Log sent";
+		if (st == 5) return L"Log: saved, not sent (no GitHub token in clipguard.ini)";
+		if (st == 4) return L"Log: saved, sending failed (kept in %LOCALAPPDATA%\\ClipGuard\\logs)";
+		return L"";
 	}
 	bool HasLogNote() const { return !LogNote().empty(); }
 
@@ -1267,11 +1959,17 @@ public:
 			const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
 			if (n == 0 || n >= MAX_PATH) return;
 			dir = buf;
-			dir += L"\\Unplugged";
-			CreateDirectoryW(dir.c_str(), nullptr);
-			dir += L"\\logs";
-			CreateDirectoryW(dir.c_str(), nullptr);
-			dir += L"\\clipguard";
+			if (m_usingNative) {
+				dir += L"\\Unplugged";   // Unplugged 2.3.0: %LOCALAPPDATA%\\Unplugged\\logs\\clipguard
+				CreateDirectoryW(dir.c_str(), nullptr);
+				dir += L"\\logs";
+				CreateDirectoryW(dir.c_str(), nullptr);
+				dir += L"\\clipguard";
+			} else {
+				dir += L"\\ClipGuard";
+				CreateDirectoryW(dir.c_str(), nullptr);
+				dir += L"\\logs";
+			}
 			CreateDirectoryW(dir.c_str(), nullptr);
 		}
 		wchar_t stem[64];
@@ -1283,15 +1981,29 @@ public:
 
 private:
 	struct LogSpot { float x, y, size, pk, fl, rg, nr, ease; };
+	// Every tracked light of the frame: where it is (cells), how strongly it is
+	// dimmed (w, the product of the weights after it) and why. miss = frames
+	// its light was not found; hold = frames it is held while its light reads
+	// graded, as a lamp or as a strip.
+	struct LogTrack { float cx, cy, w, fade, ease, pkw, flw, rgw; short miss, hold; };
 	static constexpr int kLogSpots = 4;
 	struct LogRec {
 		double t;
 		float picture, peak, fix, white, hotFrac, flat, ring, nearSh, largest, text, sceneNits;
-		int spots, lights, lamps, graded, hotActive, spread, skipped;
+		int spots, lights, lamps, graded, hotActive, spread, skipped, strips, marker;
 		float gradeMax, gradeCeil;
 		float gate;
 		int nSpot;
 		LogSpot spot[kLogSpots];
+		int nTrk;
+		LogTrack trk[kMaxTracks];
+		// What was put on screen with this row: the state of the frame
+		// Look-ahead - 2 frames earlier (its patches, Guard amount, graded map).
+		float shFix, shGrade, warm, warmCore, warmLow, fireSize;
+		float laser, rampCeil, dbleP;
+		int fires;
+		int nSh;
+		float sh[kMaxTracks][3];
 	};
 	static constexpr int kLogRecs = 4096;   // 30 s at up to ~120 frames a second
 	std::vector<LogRec> m_log;
@@ -1309,11 +2021,36 @@ private:
 		r.picture = m_picture; r.peak = m_framePeak; r.fix = m_smooth; r.white = m_ceil;
 		r.hotFrac = m_hotFrac; r.flat = m_hotFlat; r.ring = m_hotRing; r.nearSh = m_hotNear;
 		r.largest = m_largest; r.text = m_textPct; r.sceneNits = m_sceneNits;
-		r.spots = m_spots; r.lights = m_spreadLights; r.lamps = m_litSpots; r.gate = m_hotGate;
+		r.spots = m_spots; r.lights = m_spreadLights; r.lamps = m_litSpots; r.strips = m_stripPieces; r.marker = m_markPart; r.gate = m_hotGate;
 		r.graded = m_gradedSpots; r.gradeMax = m_gradeMax; r.gradeCeil = m_gradeCeil; r.hotActive = m_hotActive ? 1 : 0;
 		r.spread = m_spread ? 1 : 0; r.skipped = m_textSkipped ? 1 : 0;
 		r.nSpot = m_logSpotN;
 		for (int i = 0; i < kLogSpots; i++) r.spot[i] = m_logSpot[i];
+		r.nTrk = 0;
+		for (int k = 0; k < kMaxTracks; k++) {
+			const Track& t = m_tracks[k];
+			if (t.alpha <= 0.0f) continue;
+			LogTrack& lt = r.trk[r.nTrk++];
+			lt.cx = t.cx; lt.cy = t.cy;
+			lt.w = t.alpha * t.fade * t.ease * t.pkw * t.flw * t.rgw;
+			lt.fade = t.alpha * t.fade; lt.ease = t.ease; lt.pkw = t.pkw; lt.flw = t.flw; lt.rgw = t.rgw;
+			lt.miss = t.pend ? (short)-1 : (short)std::min(t.miss, 9999);   // -1: not yet confirmed (not shown if it is lost) lt.hold = (short)std::min(t.fail, 9999);
+		}
+		{
+			const Snap& sn = ShownSnap();
+			r.laser = m_rampL; r.rampCeil = sn.rampCeil; r.dbleP = m_dbleP;
+			r.fires = m_fireSpots; r.warm = m_warmMax; r.warmCore = m_warmCore; r.warmLow = m_warmLow; r.fireSize = m_fireSize;
+			r.shFix = ShownSmooth();
+			r.shGrade = m_shownGradeMax;
+			r.nSh = 0;
+			for (int k = 0; k < 2 * kMaxTracks; k++) {
+				const Track& t = sn.tracks[k];
+				if (t.alpha <= 0.0f || r.nSh >= kMaxTracks) continue;
+				r.sh[r.nSh][0] = t.cx; r.sh[r.nSh][1] = t.cy;
+				r.sh[r.nSh][2] = ShownWeight(sn, k);
+				r.nSh++;
+			}
+		}
 		m_logHead = (m_logHead + 1) % kLogRecs;
 		m_logCount = std::min(m_logCount + 1, kLogRecs);
 	}
@@ -1322,22 +2059,45 @@ private:
 	{
 		FILE* f = nullptr;
 		if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return;
-		fprintf(f, "# ClipGuard 2.25.4 log, last 30 s\n");
-		fprintf(f, "# settings: fix=%d strength=%.2f fixStarts=%.1f fullEffect=%.1f highlightStart=%.2f colorProtect=%.2f textSkip=%.0f hotSpot=%.2f hotSpotBelow=%.1f fixShape=%d gradedSpot=%.2f grid=%d lookAhead=%d view=%d\n",
+		fprintf(f, "# ClipGuard 2.60.0 log, last 30 s\n");
+		fprintf(f, "# settings: fix=%d strength=%.2f fixStarts=%.1f fullEffect=%.1f highlightStart=%.2f colorProtect=%.2f textSkip=%.0f hotSpot=%.2f hotSpotBelow=%.1f fixShape=%d gradedSpot=%.2f hotSpotMask=%d dimFire=%d grid=%d lookAhead=%d view=%d upscaler=%d plus=%d kscape=%d dither=%d projector=%d lut=%d\n",
 			m_s.enabled ? 1 : 0, m_s.strength, m_s.triggerPct, m_s.fullPct, m_s.knee, m_s.colorProtect, m_s.textSkipPct,
-			m_s.hotSpot, m_s.hotBelow, m_s.fixShape, m_s.gradedSpot, m_s.grid, m_s.lookAhead, m_s.view);
-		fprintf(f, "# limits: ring %.2f-%.2f flat %.2f-%.2f hot spot full up to %.2f x Hot spot below\n", kHotRingFull, kHotLitRing, kHotFlatMin, kHotFlatFull, kHotBelowFull);
-		fprintf(f, "t_s,picture,peak,fix,white,text,hot_pct,spots,lights,lamps,gate,graded,spread,dimmed,flat,ring,near,largest,skipped,grade_map,grade_white");
+			m_s.hotSpot, m_s.hotBelow, m_s.fixShape, m_s.gradedSpot, m_s.spotMask, m_s.dimFire ? 1 : 0, m_s.grid, m_s.lookAhead, m_s.view, m_s.upscaler, m_s.plus ? 1 : 0, m_s.kscape ? 1 : 0, m_s.dither, m_s.projector, m_s.lut);
+		{
+			// 2.48.3: the calibration LUT as the renderer has it.
+			const int ls = LutState();
+			const char* st = ls == 1 ? "on" : (ls == 2 ? "failed" : (ls == 3 ? "off (F5)" : "none"));
+			char desc[256] = {};
+			WideCharToMultiByte(CP_UTF8, 0, m_lutDesc.c_str(), -1, desc, (int)sizeof(desc), nullptr, nullptr);
+			fprintf(f, "# lut: %s%s%s\n", st, desc[0] && ls != 0 ? " - " : "", ls != 0 ? desc : "");
+		}
+		fprintf(f, "# limits: ring %.2f-%.2f flat %.2f-%.2f (or peak %.2f-%.2f) hot spot full up to %.2f x Hot spot below, release after %d frames\n", kHotRingFull, kHotLitRing, kHotFlatMin, kHotFlatFull, kBrightStart, kBrightFull, kHotBelowFull, kReleaseFrames);
+		fprintf(f, "t_s,picture,peak,fix,white,text,hot_pct,spots,lights,lamps,gate,graded,spread,dimmed,flat,ring,near,largest,skipped,grade_map,grade_white,strips,marker");
 		for (int i = 0; i < kLogSpots; i++) fprintf(f, ",s%d_x,s%d_y,s%d_size,s%d_peak,s%d_flat,s%d_ring,s%d_near,s%d_ease", i, i, i, i, i, i, i, i);
+		// Every tracked light: position (0-1 of the frame), dimming strength w
+		// (0-1) = fade x size weight x peak weight x flat weight x ring (lamp)
+		// weight, frames its light was missed and frames it is held.
+		fprintf(f, ",tracks");
+		for (int i = 0; i < kMaxTracks; i++) fprintf(f, ",t%d_x,t%d_y,t%d_w,t%d_fade,t%d_sizew,t%d_peakw,t%d_flatw,t%d_ringw,t%d_miss,t%d_hold", i, i, i, i, i, i, i, i, i, i);
+		// Shown: what was on screen with this row (the frame Look-ahead - 2 rows
+		// up): Guard amount, graded map peak and every patch drawn.
+		fprintf(f, ",shown_fix,shown_grade,shown");
+		for (int i = 0; i < kMaxTracks; i++) fprintf(f, ",u%d_x,u%d_y,u%d_w", i, i, i);
+		// fires: lights left alone as fire (Dim fire off); warm: the warmest
+		// glow of the lights checked, (red - blue) / red (-1 = none had a glow);
+		// warm_core: that light's core; warm_low: the palest glow among the
+		// lights reading 0.20 or warmer (-1 = none).
+		fprintf(f, ",fires,warm,warm_core,warm_low,fire_size");
+		fprintf(f, ",laser,ramp_ceil,dble_p");   // 2.46.0: Projector Titan Noir Max: modelled laser (0-1) and the squeeze's signal ceiling (1 = none)
 		fprintf(f, "\n");
 		const double now = NowMs();
 		for (int k = m_logCount; k >= 1; k--) {
 			const LogRec& r = m_log[(m_logHead - k + kLogRecs) % kLogRecs];
 			const double age = (now - r.t) / 1000.0;
 			if (age > 30.0) continue;
-			fprintf(f, "%.3f,%.2f,%.3f,%.3f,%.3f,%.1f,%.2f,%d,%d,%d,%.3f,%d,%d,%d,%.3f,%.3f,%.3f,%.4f,%d,%.3f,%.3f",
+			fprintf(f, "%.3f,%.2f,%.3f,%.3f,%.3f,%.1f,%.2f,%d,%d,%d,%.3f,%d,%d,%d,%.3f,%.3f,%.3f,%.4f,%d,%.3f,%.3f,%d,%d",
 				-age, r.picture, r.peak, r.fix, r.white, r.text, r.hotFrac * 100.0f, r.spots, r.lights, r.lamps, r.gate,
-				r.graded, r.spread, r.hotActive, r.flat, r.ring, r.nearSh, r.largest, r.skipped, r.gradeMax, r.gradeCeil);
+				r.graded, r.spread, r.hotActive, r.flat, r.ring, r.nearSh, r.largest, r.skipped, r.gradeMax, r.gradeCeil, r.strips, r.marker);
 			for (int i = 0; i < kLogSpots; i++) {
 				if (i < r.nSpot) {
 					const LogSpot& sp = r.spot[i];
@@ -1346,12 +2106,30 @@ private:
 					fprintf(f, ",,,,,,,,");
 				}
 			}
+			fprintf(f, ",%d", r.nTrk);
+			for (int i = 0; i < kMaxTracks; i++) {
+				if (i < r.nTrk) {
+					const LogTrack& lt = r.trk[i];
+					fprintf(f, ",%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d",
+						(lt.cx + 0.5f) / (float)std::max(m_cx, 1u), (lt.cy + 0.5f) / (float)std::max(m_cy, 1u),
+						lt.w, lt.fade, lt.ease, lt.pkw, lt.flw, lt.rgw, (int)lt.miss, (int)lt.hold);
+				} else {
+					fprintf(f, ",,,,,,,,,,");
+				}
+			}
+			fprintf(f, ",%.3f,%.3f,%d", r.shFix, r.shGrade, r.nSh);
+			for (int i = 0; i < kMaxTracks; i++) {
+				if (i < r.nSh) fprintf(f, ",%.3f,%.3f,%.3f", (r.sh[i][0] + 0.5f) / (float)std::max(m_cx, 1u), (r.sh[i][1] + 0.5f) / (float)std::max(m_cy, 1u), r.sh[i][2]);
+				else fprintf(f, ",,,");
+			}
+			fprintf(f, ",%d,%.2f,%.2f,%.2f,%.4f", r.fires, r.warm, r.warmCore, r.warmLow, r.fireSize);
+			fprintf(f, ",%.3f,%.3f,%.3f", r.laser, r.rampCeil, r.dbleP);
 			fprintf(f, "\n");
 		}
 		fclose(f);
 	}
 
-	// The window as shown, 24-bit BMP, halved while wider than 1920.
+	// The window as shown, 24-bit BMP, full resolution.
 	void WriteScreenshot(ID3D11Texture2D* pSrc, const std::wstring& path)
 	{
 		D3D11_TEXTURE2D_DESC d = {};
@@ -1417,7 +2195,8 @@ private:
 		if (v <= 0) return 0;
 		if (v <= 2) return 2;   // 1 = "on" from 2.12.0
 		if (v <= 4) return 4;
-		return 6;
+		if (v <= 6) return 6;
+		return 12;              // High Performance
 	}
 
 	static double NowMs()
@@ -1506,9 +2285,20 @@ private:
 		// Channel 3 holds the highlight samples plus 100 x the flat-core samples.
 		auto cell = [&](UINT x, UINT y, int ch) {
 			const float v = cellRaw(x, y, ch);
-			return (ch == 3) ? std::fmod(v, 100.0f) : v;
+			return (ch == 3 || ch == 2) ? std::fmod(v, 100.0f) : v;
 		};
+		auto warmN = [&](UINT x, UINT y) { return std::floor(cellRaw(x, y, 2) / 100.0f + 0.001f) / 99.0f; };   // 0..1, see kWarmStart
 		auto flatN = [&](UINT x, UINT y) { return std::floor(cellRaw(x, y, 3) / 100.0f + 0.001f); };
+		if (m_s.testBuild) {
+			DetectTestMarker([&](float fx, float fy) {
+				const UINT x = (UINT)std::clamp((int)(fx * (float)m_cx), 0, (int)m_cx - 1);
+				const UINT y = (UINT)std::clamp((int)(fy * (float)m_cy), 0, (int)m_cy - 1);
+				return cell(x, y, 1);
+			});
+		} else {
+			m_markPart = 0;   // the test video's code is only looked for by ClipGuard Test
+			m_markRun = 0;
+		}
 		for (UINT y = 0; y < m_cy; y++) {
 			for (UINT x = 0; x < m_cx; x++) {
 				if (cell(x, y, 1) > kContent) { rowHas[y] = true; colHas[x] = true; }
@@ -1524,12 +2314,22 @@ private:
 		double textSamples = 0.0, brightSamples = 0.0;
 		int n = 0, clipped = 0, hotCells = 0;
 		float framePeak = 0.0f;
-		struct Spot { int x0, y0, x1, y1; float lv; int core; float pk; float ease; float fl; float rg; float nr; };  // lv, core, pk: a hot spot's core level, cells and peak; ease: 1 = full dimming; fl: how flat its core is; rg, nr: lit and near share of its ring
+		float nearPeak[256] = {};   // 2.47.0: near-peak area by level, in cells (what DBLE counts)
+		float whiteArea = 0.0f;     // 2.49.0: near-white (not warm) area at kDbleWhiteMin or more, in cells
+		struct Spot { int x0, y0, x1, y1; float lv; int core; float pk; float ease; float fl; float rg; float nr; float wm; };  // wm: Dim fire weight; lv, core, pk: a hot spot's core level, cells and peak; ease: 1 = full dimming; fl: how flat its core is; rg, nr: lit and near share of its ring
 		Spot spots[kMaxSpots];
 		static Spot cands[kMaxCands];
 		int nCands = 0;
 		int nSpots = 0;
 		int litSpots = 0;
+		int fireSpots = 0;       // lights left alone as fire (Dim fire off)
+		float warmMax = -1.0f;   // warmest glow of the lights checked (readout; -1 = none had a glow)
+		float warmCore = 0.0f;   // that light's core, for comparison (readout)
+		float fireSize = 0.0f;   // 2.42.5: core size (share of the picture) of the largest warm light
+		float warmLow = -1.0f;   // the palest glow among the warm lights (kWarmLog or more; -1 = none)
+		int stripPieces = 0;
+		Spot stripList[kMaxSpots];   // strip pieces: they can only hold a hot spot already there
+		int nStrip = 0;
 		int gradedSpots = 0;
 		float bestFlat = -1.0f;
 		Spot gradedList[kMaxSpots];  // graded candidates: they can only drain a hot spot already there
@@ -1545,6 +2345,37 @@ private:
 		int largeSpots = 0;
 		float ringMax = -1.0f;  // lit share of the ring around the lights that passed (readout)
 		float nearMax = -1.0f;  // near share of the lit ring around the lights that passed (readout)
+		// One group of touching cells at lv or more, starting from (sx, sy):
+		// its cells go to gMembers (the count is returned, the start cell first)
+		// and its peak to gp. Reach: touching cells on Normal (diagonals
+		// included); up to 2 cells on Fine (the same distance), so a light with
+		// a darker gap inside stays one light. gSeen is cleared by the caller
+		// before each pass over the picture.
+		static uint8_t gSeen[kMaxCellsY][kMaxCellsX];
+		static int gStack[kMaxCellsX * kMaxCellsY];
+		static int gMembers[kMaxCellsX * kMaxCellsY];
+		auto flood = [&](int sx, int sy, float lv, float& gp) -> int {
+			int top = 0, nm = 0;
+			gp = 0.0f;
+			gStack[top++] = sy * cxN + sx;
+			gSeen[sy][sx] = 1;
+			while (top > 0) {
+				const int i = gStack[--top];
+				const int cx = i % cxN, cy = i / cxN;
+				gMembers[nm++] = i;
+				gp = std::max(gp, cell(cx, cy, 1));
+				for (int dy = -gs; dy <= gs; dy++) {
+					for (int dx = -gs; dx <= gs; dx++) {
+						const int nx = cx + dx, ny = cy + dy;
+						if (nx < x0 || nx > x1 || ny < y0 || ny > y1 || gSeen[ny][nx]) continue;
+						if (cell(nx, ny, 1) < lv) continue;
+						gSeen[ny][nx] = 1;
+						gStack[top++] = ny * cxN + nx;
+					}
+				}
+			}
+			return nm;
+		};
 		if (y0 <= y1 && x0 <= x1) {
 			for (int y = y0; y <= y1; y++) {
 				for (int x = x0; x <= x1; x++) {
@@ -1554,6 +2385,8 @@ private:
 					const float peak = cell(x, y, 1);
 					if (peak >= 0.995f) clipped++;
 					framePeak = std::max(framePeak, peak);
+					nearPeak[std::clamp((int)(peak * 255.0f + 0.5f), 0, 255)] += flatN(x, y) / 64.0f;
+					if (peak >= kDbleWhiteMin && warmN(x, y) <= kDbleWhiteWarm) whiteArea += flatN(x, y) / 64.0f;
 					n++;
 				}
 			}
@@ -1568,39 +2401,54 @@ private:
 				const float grp = kHotMinPeak - kHotMargin;
 				const float maxW = std::max(1.0f, kHotBoxW * (float)(x1 - x0 + 1));
 				const float maxH = std::max(1.0f, kHotBoxH * (float)(y1 - y0 + 1));
-				static uint8_t seen[kMaxCellsY][kMaxCellsX];
-				static int stack[kMaxCellsX * kMaxCellsY];
-				static int members[kMaxCellsX * kMaxCellsY];
-				memset(seen, 0, sizeof(seen));
-				for (int y = y0; y <= y1; y++) {
-					for (int x = x0; x <= x1; x++) {
-						if (seen[y][x] || cell(x, y, 1) < grp) continue;
-						int top = 0, nm = 0;
-						float gp = 0.0f;
-						stack[top++] = y * cxN + x;
-						seen[y][x] = 1;
-						while (top > 0) {
-							const int i = stack[--top];
-							const int cx = i % cxN, cy = i / cxN;
-							members[nm++] = i;
-							gp = std::max(gp, cell(cx, cy, 1));
-							// Reach: touching cells on Normal; up to 2 cells on Fine (the same
-							// distance), so a light with a darker gap inside stays one light.
-							for (int dy = -gs; dy <= gs; dy++) {
-								for (int dx = -gs; dx <= gs; dx++) {
-									const int nx = cx + dx, ny = cy + dy;
-									if (nx < x0 || nx > x1 || ny < y0 || ny > y1 || seen[ny][nx]) continue;
-									if (cell(nx, ny, 1) < grp) continue;
-									seen[ny][nx] = 1;
-									stack[top++] = ny * cxN + nx;
-								}
+				int* const members = gMembers;
+				memset(gSeen, 0, sizeof(gSeen));
+				// Lights grouped down to kStripLevel: each cell's group id, and whether
+				// that group is larger than the compact limits (worked out once per group).
+				static uint16_t wideId[kMaxCellsY][kMaxCellsX];
+				static int wideStack[kMaxCellsX * kMaxCellsY];
+				static bool wideBig[kMaxCellsX * kMaxCellsY / 2 + 2];
+				memset(wideId, 0, sizeof(wideId));
+				int wideN = 0;
+				auto wideTooBig = [&](int sx, int sy) -> bool {
+					if (wideId[sy][sx]) return wideBig[wideId[sy][sx]];
+					if (wideN + 1 >= (int)(sizeof(wideBig) / sizeof(wideBig[0]))) return false;
+					const uint16_t id = (uint16_t)(++wideN);
+					int top = 0, bx0 = sx, bx1 = sx, by0 = sy, by1 = sy;
+					wideStack[top++] = sy * cxN + sx;
+					wideId[sy][sx] = id;
+					while (top > 0) {
+						const int i = wideStack[--top];
+						const int cx = i % cxN, cy = i / cxN;
+						bx0 = std::min(bx0, cx); bx1 = std::max(bx1, cx);
+						by0 = std::min(by0, cy); by1 = std::max(by1, cy);
+						for (int dy = -gs; dy <= gs; dy++) {
+							for (int dx = -gs; dx <= gs; dx++) {
+								const int nx = cx + dx, ny = cy + dy;
+								if (nx < x0 || nx > x1 || ny < y0 || ny > y1 || wideId[ny][nx]) continue;
+								if (cell(nx, ny, 1) < kStripLevel) continue;
+								wideId[ny][nx] = id;
+								wideStack[top++] = ny * cxN + nx;
 							}
 						}
+					}
+					wideBig[id] = (bx1 - bx0 + 1) > maxW || (by1 - by0 + 1) > maxH;
+					return wideBig[id];
+				};
+				const float cellScale = m_grid == 0 ? 2.0f : 1.0f;  // Fine cells per cell
+				for (int y = y0; y <= y1; y++) {
+					for (int x = x0; x <= x1; x++) {
+						if (gSeen[y][x] || cell(x, y, 1) < grp) continue;
+						float gp = 0.0f;
+						const int nm = flood(x, y, grp, gp);
 						if (gp < kHotMinPeak) continue;
 						Spot sp = { cxN, cyN, -1, -1, gp - kHotMargin };
 						int core = 0;
+						int gx0 = cxN, gy0 = cyN, gx1 = -1, gy1 = -1;
 						for (int k = 0; k < nm; k++) {
 							const int cx = members[k] % cxN, cy = members[k] / cxN;
+							gx0 = std::min(gx0, cx); gx1 = std::max(gx1, cx);
+							gy0 = std::min(gy0, cy); gy1 = std::max(gy1, cy);
 							if (cell(cx, cy, 1) < sp.lv) continue;
 							core++;
 							sp.x0 = std::min(sp.x0, cx); sp.x1 = std::max(sp.x1, cx);
@@ -1611,6 +2459,19 @@ private:
 						if (!compact) continue;
 						sp.core = core;
 						sp.pk = gp;
+						// Strip pieces (a mirror's light frame, a neon tube) never start a
+						// hot spot; one already there is held (hysteresis), not dropped.
+						{
+							const int cw = sp.x1 - sp.x0 + 1, ch = sp.y1 - sp.y0 + 1;
+							const int cs = std::min(cw, ch), cl = std::max(cw, ch);
+							const bool thin = (float)cs * cellScale <= kStripThin && (float)cl >= kStripLong * (float)cs;
+							const int s0 = members[0] % cxN, s1 = members[0] / cxN;
+							if (thin || (gx1 - gx0 + 1) > maxW || (gy1 - gy0 + 1) > maxH || wideTooBig(s0, s1)) {
+								stripPieces++;
+								if (nStrip < kMaxSpots) stripList[nStrip++] = sp;
+								continue;
+							}
+						}
 						if (nCands < kMaxCands) cands[nCands++] = sp;
 					}
 				}
@@ -1643,6 +2504,7 @@ private:
 						}
 						fl = fc > 0 ? (float)(fs / (64.0 * fc)) : 0.0f;
 						bestFlat = std::max(bestFlat, fl);
+						fl = std::max(fl, kHotFlatFull * Smooth01(sp.pk, kBrightStart, kBrightFull));
 						if (fl < kHotFlatMin) {
 							gradedSpots++;
 							if (nGraded < kMaxSpots) {
@@ -1651,6 +2513,38 @@ private:
 								nGraded++;
 							}
 							continue;
+						}
+					}
+					// Dim fire off: a clearly orange or red light is not a hot spot; a
+					// slightly warm one is eased.
+					// Judged by the glow: the cells around the core (out to half the
+					// light's size, at least 2 cells) that are below the core level but
+					// bright enough to have a colour measured. No glow: not fire.
+					float warmW = 1.0f;
+					{
+						const float glowMin = std::min(lit, 0.75f);   // the measuring pass reads colour above this
+						const int pad = std::max(2, std::max(sp.x1 - sp.x0 + 1, sp.y1 - sp.y0 + 1) / 2);
+						double ws = 0.0, cs = 0.0;
+						int wc = 0, cc = 0;
+						for (int y = std::max(y0, sp.y0 - pad); y <= std::min(y1, sp.y1 + pad); y++) {
+							for (int x = std::max(x0, sp.x0 - pad); x <= std::min(x1, sp.x1 + pad); x++) {
+								const float c = cell(x, y, 1);
+								if (c >= sp.lv) { cs += warmN(x, y); cc++; continue; }
+								if (c <= glowMin) continue;
+								ws += warmN(x, y);
+								wc++;
+							}
+						}
+						if (wc >= kGlowMinCells) {
+							const float warm = (float)(ws / wc);
+							if (warm > warmMax) { warmMax = warm; warmCore = cc > 0 ? (float)(cs / cc) : 0.0f; }
+							if (warm >= kWarmLog && (warmLow < 0.0f || warm < warmLow)) warmLow = warm;
+							const float ffrac = n > 0 ? (float)sp.core / (float)n : 0.0f;
+							if (warm >= kWarmStart) fireSize = std::max(fireSize, ffrac);
+							if (!m_s.dimFire) {
+								warmW = std::max(1.0f - Smooth01(warm, kWarmStart, kWarmFull), 1.0f - Smooth01(ffrac, kFireSmallStart, kFireSmallFull));
+								if (warmW <= 0.0f) { fireSpots++; continue; }
+							}
 						}
 					}
 					const float scx = 0.5f * (float)(sp.x0 + sp.x1);
@@ -1691,6 +2585,7 @@ private:
 					if (kept < kMaxSpots) {
 						spots[kept] = sp;
 						spots[kept].fl = fl;
+						spots[kept].wm = warmW;
 						spots[kept].rg = ringLit;
 						spots[kept].nr = nearSh;
 						kept++;
@@ -1716,7 +2611,7 @@ private:
 					const float frac = n > 0 ? (float)spots[i].core / (float)n : 0.0f;
 					const float bySize = 1.0f - ramp(frac, kLargeStart, kLargeFull);
 					const float byClip = 1.0f - ramp(spots[i].fl, kClipFlatStart, kClipFlatFull) * ramp(frac, kClipSizeStart, kClipSizeFull);
-					spots[i].ease = std::min(bySize, byClip);
+					spots[i].ease = std::min(bySize, byClip) * spots[i].wm;
 					largest = std::max(largest, frac);
 					if (i < nSpots && spots[i].ease < 0.99f) largeSpots++;
 				}
@@ -1730,32 +2625,13 @@ private:
 					const float grp = gMin - kHotMargin;
 					const float maxW = std::max(1.0f, kHotBoxW * (float)(x1 - x0 + 1));
 					const float maxH = std::max(1.0f, kHotBoxH * (float)(y1 - y0 + 1));
-					static uint8_t seenG[kMaxCellsY][kMaxCellsX];
-					static int stackG[kMaxCellsX * kMaxCellsY];
-					static int membersG[kMaxCellsX * kMaxCellsY];
-					memset(seenG, 0, sizeof(seenG));
+					int* const membersG = gMembers;
+					memset(gSeen, 0, sizeof(gSeen));
 					for (int y = y0; y <= y1 && nGradeLow < kMaxSpots; y++) {
 						for (int x = x0; x <= x1 && nGradeLow < kMaxSpots; x++) {
-							if (seenG[y][x] || cell(x, y, 1) < grp) continue;
-							int top = 0, nm = 0;
+							if (gSeen[y][x] || cell(x, y, 1) < grp) continue;
 							float gp = 0.0f;
-							stackG[top++] = y * cxN + x;
-							seenG[y][x] = 1;
-							while (top > 0) {
-								const int i = stackG[--top];
-								const int cx = i % cxN, cy = i / cxN;
-								membersG[nm++] = i;
-								gp = std::max(gp, cell(cx, cy, 1));
-								for (int dy = -gs; dy <= gs; dy++) {
-									for (int dx = -gs; dx <= gs; dx++) {
-										const int nx = cx + dx, ny = cy + dy;
-										if (nx < x0 || nx > x1 || ny < y0 || ny > y1 || seenG[ny][nx]) continue;
-										if (cell(nx, ny, 1) < grp) continue;
-										seenG[ny][nx] = 1;
-										stackG[top++] = ny * cxN + nx;
-									}
-								}
-							}
+							const int nm = flood(x, y, grp, gp);
 							if (gp < gMin || gp >= kHotMinPeak) continue;
 							Spot sp = { cxN, cyN, -1, -1, gp - kHotMargin };
 							int core = 0;
@@ -1785,33 +2661,16 @@ private:
 				const float lv = pks[kth];
 				m_anchorLv = m_cut ? lv : m_anchorLv + 0.3f * (lv - m_anchorLv);
 				static float target[kMaxCellsX * kMaxCellsY];
-				static uint8_t seenA[kMaxCellsY][kMaxCellsX];
-				static int stackA[kMaxCellsX * kMaxCellsY];
-				static int membersA[kMaxCellsX * kMaxCellsY];
+				int* const membersA = gMembers;
 				std::fill(target, target + (size_t)cxN * cyN, 0.0f);
-				memset(seenA, 0, sizeof(seenA));
+				memset(gSeen, 0, sizeof(gSeen));
 				const float grp = std::max(m_anchorLv - kAnchorGroup, std::clamp(m_s.knee, 0.20f, 0.95f));
 				const int minCells = std::max(1, (int)(kAnchorMinFrac * (float)n));
 				for (int y = y0; y <= y1; y++) {
 					for (int x = x0; x <= x1; x++) {
-						if (seenA[y][x] || cell(x, y, 1) < grp) continue;
-						int top = 0, nm = 0;
-						stackA[top++] = y * cxN + x;
-						seenA[y][x] = 1;
-						while (top > 0) {
-							const int i = stackA[--top];
-							const int cx = i % cxN, cy = i / cxN;
-							membersA[nm++] = i;
-							for (int dy = -gs; dy <= gs; dy++) {
-								for (int dx = -gs; dx <= gs; dx++) {
-									const int nx = cx + dx, ny = cy + dy;
-									if (nx < x0 || nx > x1 || ny < y0 || ny > y1 || seenA[ny][nx]) continue;
-									if (cell(nx, ny, 1) < grp) continue;
-									seenA[ny][nx] = 1;
-									stackA[top++] = ny * cxN + nx;
-								}
-							}
-						}
+						if (gSeen[y][x] || cell(x, y, 1) < grp) continue;
+						float gpA = 0.0f;
+						const int nm = flood(x, y, grp, gpA);
 						if (nm < minCells) continue;
 						// Mark the area and one ring of cells around it (soft edge).
 						for (int k = 0; k < nm; k++) {
@@ -1885,6 +2744,7 @@ private:
 		}
 		m_picture = pic;
 		m_bx0 = x0; m_bx1 = x1; m_by0 = y0; m_by1 = y1;
+		AreaPush(x0, x1, y0, y1);
 		m_histHead = (m_histHead + 1) % kHist;
 		m_histPic[m_histHead] = pic;
 		m_histPeak[m_histHead] = framePeak;
@@ -1894,6 +2754,12 @@ private:
 		m_hotCells = hotCells;
 		m_spots = nSpots;
 		m_litSpots = litSpots;
+		m_fireSpots = fireSpots;
+		m_warmMax = warmMax;
+		m_warmCore = warmCore;
+		m_warmLow = warmLow;
+		m_fireSize = fireSize;
+		m_stripPieces = stripPieces;
 		m_gradedSpots = gradedSpots;
 		m_spread = spread;
 		m_spreadArea = spreadArea;
@@ -1904,6 +2770,16 @@ private:
 		m_hotRing = ringMax;
 		m_hotNear = nearMax;
 		m_framePeak = framePeak;
+		{
+			// The level of the brightest kDbleArea of the picture: walk down from the
+			// top until the cells' near-peak area adds up to it.
+			const float want = kDbleArea * (float)std::max(n, 1);
+			float acc = 0.0f;
+			int b = 255;
+			for (; b > 0; b--) { acc += nearPeak[b]; if (acc >= want) break; }
+			m_dbleP = (float)b / 255.0f;
+			if (whiteArea >= kDbleWhiteArea * (float)std::max(n, 1)) m_dbleP = std::max(m_dbleP, DbleWhiteP());
+		}
 		// The lights kept, for the log (F11).
 		m_logSpotN = 0;
 		for (int i = 0; i < nSpots && m_logSpotN < kLogSpots; i++) {
@@ -1913,7 +2789,7 @@ private:
 			ls.size = n > 0 ? (float)spots[i].core / (float)n : 0.0f;
 			ls.pk = spots[i].pk; ls.fl = spots[i].fl; ls.rg = spots[i].rg; ls.nr = spots[i].nr; ls.ease = spots[i].ease;
 		}
-		UpdateTracks(spots, nSpots, gradedList, spread ? 0 : nGraded, lampList, spread ? 0 : nLamp);
+		UpdateTracks(spots, nSpots, gradedList, spread ? 0 : nGraded, lampList, spread ? 0 : nLamp, stripList, spread ? 0 : nStrip);
 		{
 			Spot gradeAll[2 * kMaxSpots];
 			int nAll = 0;
@@ -1986,26 +2862,107 @@ private:
 		return Smooth01(fl, kHotFlatMin, kHotFlatFull);
 	}
 
+	// How far from its predicted place a patch looks for its light: its own size
+	// plus a margin, plus its speed (a fast light can land off the prediction).
+	float Reach(const Track& t) const
+	{
+		return 2.0f * t.r + 4.0f * gsF() + 1.5f * std::hypot(t.vx, t.vy);
+	}
+	// Move a patch to its light: halfway from where it should be now to where
+	// the light was found, and update its speed from the step it took.
+	void Follow(Track& t, float cx, float cy)
+	{
+		const float px = t.cx + t.vx, py = t.cy + t.vy;
+		const float nx = px + 0.5f * (cx - px), ny = py + 0.5f * (cy - py);
+		t.vx += kSpeedRate * ((nx - t.cx) - t.vx);
+		t.vy += kSpeedRate * ((ny - t.cy) - t.vy);
+		const float sp = std::hypot(t.vx, t.vy), cap = kMaxSpeed * gsF();
+		if (sp > cap) { t.vx *= cap / sp; t.vy *= cap / sp; }
+		t.cx = nx; t.cy = ny;
+	}
+
 	// A spot found inside an existing patch moves that patch; otherwise it
-	// starts a new one.
+	// starts a new one. When several lights sit within one patch's reach (a
+	// tight group of small lights), the patch follows the one nearest to it and
+	// grows to cover the others (cov), and once it is such a group it stays
+	// where it is instead of jumping to a neighbour on a frame its own light
+	// is not found: the patch used to hop between the lights, which then
+	// flickered.
 	template <class SpotT>
 	void MatchSpots(const SpotT* spots, int nSpots, int maxCount)
 	{
-		for (int i = 0; i < nSpots; i++) {
-			const float cx = 0.5f * (float)(spots[i].x0 + spots[i].x1);
-			const float cy = 0.5f * (float)(spots[i].y0 + spots[i].y1);
-			const float rr = 0.5f * (float)std::max(spots[i].x1 - spots[i].x0 + 1, spots[i].y1 - spots[i].y0 + 1) + gsF();
+		auto centre = [&](int i, float& cx, float& cy, float& rr) {
+			cx = 0.5f * (float)(spots[i].x0 + spots[i].x1);
+			cy = 0.5f * (float)(spots[i].y0 + spots[i].y1);
+			rr = 0.5f * (float)std::max(spots[i].x1 - spots[i].x0 + 1, spots[i].y1 - spots[i].y0 + 1) + gsF();
+		};
+		auto nearestTrack = [&](float cx, float cy, float rr, float pk, float& dOut) {
 			int best = -1;
 			float bestD = 1e9f;
 			for (int k = 0; k < kMaxTracks; k++) {
 				const Track& t = m_tracks[k];
 				if (t.alpha <= 0.0f) continue;
-				const float d = std::hypot(t.cx - cx, t.cy - cy);
-				if (d <= 2.0f * t.r + 4.0f * gsF() && d < bestD) { bestD = d; best = k; }
+				const float d = std::hypot(t.cx + t.vx - cx, t.cy + t.vy - cy);
+				// 2.42.3: a patch that lost its light while moving is only picked
+				// up by a light like the one it lost: close to where it was
+				// heading, as bright and about the same size. After a cut the
+				// brightness test missed, the old shot's patch was picked up by
+				// small dimmer lamps of the new shot and slid across it.
+				if (t.lm && (d > t.r + gsF() + 0.5f * std::hypot(t.vx, t.vy)
+					|| pk < t.lpk - kRefindPeak || rr < 0.5f * t.r || rr > 2.0f * t.r)) continue;
+				if (d <= Reach(t) && d < bestD) { bestD = d; best = k; }
+			}
+			dOut = bestD;
+			return best;
+		};
+		// Which patch each spot belongs to, and each patch's nearest spot.
+		static int spotTrack[kMaxSpots * 4];
+		int primary[kMaxTracks], cnt[kMaxTracks];
+		float primD[kMaxTracks], needMax[kMaxTracks];
+		for (int k = 0; k < kMaxTracks; k++) { primary[k] = -1; cnt[k] = 0; primD[k] = 1e9f; needMax[k] = 0.0f; }
+		const int nS = std::min(nSpots, (int)std::size(spotTrack));
+		for (int i = 0; i < nS; i++) {
+			float cx, cy, rr, d;
+			centre(i, cx, cy, rr);
+			const int k = nearestTrack(cx, cy, rr, spots[i].pk, d);
+			spotTrack[i] = k;
+			if (k >= 0) {
+				cnt[k]++;
+				if (d < primD[k]) { primD[k] = d; primary[k] = i; }
+			}
+		}
+		// Another light under the same patch: the patch reaches out to it.
+		auto cover = [&](int k, float cx, float cy, float rr) {
+			Track& t = m_tracks[k];
+			needMax[k] = std::max(needMax[k], std::hypot(t.cx - cx, t.cy - cy) + rr);
+			t.miss = 0;
+			t.fail = 0;
+			t.lamp = 0; t.lm = 0;
+			t.alpha = 1.0f;
+		};
+		for (int i = 0; i < nS; i++) {
+			float cx, cy, rr;
+			centre(i, cx, cy, rr);
+			int best = spotTrack[i];
+			if (best < 0) {
+				// Not near any patch of the last frame; one started by an earlier
+				// spot of this frame may be next to it.
+				float d;
+				best = nearestTrack(cx, cy, rr, spots[i].pk, d);
+				if (best >= 0) {
+					cover(best, cx, cy, rr);
+					cnt[best]++;
+					m_used[best] = true;
+					continue;
+				}
 			}
 			if (best >= 0) {
-				if (m_used[best]) continue; // another part of the same light
 				Track& t = m_tracks[best];
+				if (primary[best] != i) {
+					cover(best, cx, cy, rr);
+					m_used[best] = true;
+					continue;
+				}
 				const bool piece = rr < kHotPiece * t.r;
 				if (!piece) {
 					// Easing only ever increases while the light is tracked, so a large
@@ -2013,18 +2970,31 @@ private:
 					// peak drops); a new light starts afresh.
 					t.ease += kEaseRate * (std::min(spots[i].ease, t.ease) - t.ease);
 					const float pw = PeakWeight(spots[i].pk, spots[i].fl);
-					t.pkw += ((pw > t.pkw) ? kPeakRateUp : kEaseRate) * (pw - t.pkw);
+					// 2.41.1: the peak weight only rises while the light is tracked. A
+					// light on the borderline (a moon peaking at 80-82% with a 13-22%
+					// flat core) had its patch swing between 10% and 100% as the
+					// reading wobbled; now it comes up once and stays.
+					if (pw > t.pkw) t.pkw += kPeakRateUp * (pw - t.pkw);
 					t.flw += kEaseRate * (FlatWeight(spots[i].fl) - t.flw);
 					// Ring weight follows slowly both ways, so a flickering flame
 					// lighting more or less of its surroundings can't pulse the patch.
 					t.rgw += kEaseRate * (RingWeight(spots[i].rg) - t.rgw);
+					t.lpk = spots[i].pk; t.rE = spots[i].ease; t.rP = pw; t.rF = FlatWeight(spots[i].fl); t.rR = RingWeight(spots[i].rg);
 				}
 				if (!piece) {
-					t.cx += 0.5f * (cx - t.cx);   // position follows quickly (moving lights)
-					t.cy += 0.5f * (cy - t.cy);
-					t.r += ((rr > t.r) ? 0.30f : 0.05f) * (rr - t.r); // grows fast, shrinks slowly
+					// A group's patch that is not moving stays put when its nearest
+					// light is a neighbour (its own was not found this frame).
+					const bool still = std::hypot(t.vx, t.vy) < kMovingSpeed * gsF();
+					if (t.grp > 0 && still && primD[best] > std::max(1.5f * gsF(), 0.5f * t.r)) {
+						cover(best, cx, cy, rr);
+					} else {
+						Follow(t, cx, cy);            // position and speed follow the light
+						t.r += ((rr > t.r) ? 0.30f : 0.05f) * (rr - t.r); // grows fast, shrinks slowly
+					}
 				}
 				t.miss = 0;
+				t.fail = 0;
+				t.lamp = 0; t.lm = 0;
 				t.alpha = 1.0f;
 				m_used[best] = true;
 				continue;
@@ -2035,33 +3005,49 @@ private:
 				else if (slot < 0) slot = k;
 			}
 			if (count >= maxCount || slot < 0) continue;
+			if (!m_cut && StripRecent(cx, cy)) continue;   // a strip was here a moment ago
 			Track& t = m_tracks[slot];
-			t.cx = cx; t.cy = cy; t.r = rr; t.miss = 0; t.alpha = 1.0f;
+			t.cx = cx; t.cy = cy; t.r = rr; t.miss = 0; t.fail = 0; t.alpha = 1.0f; t.vx = 0.0f; t.vy = 0.0f; t.cov = 0.0f; t.grp = 0; t.seen = 1; t.pend = 0; t.age = 0; t.lamp = 0; t.lm = 0; t.lpk = spots[i].pk; t.id = ++m_nextId;
 			t.ease = spots[i].ease;
 			t.pkw = PeakWeight(spots[i].pk, spots[i].fl);
 			t.flw = FlatWeight(spots[i].fl);
 			t.rgw = RingWeight(spots[i].rg);
+			t.rE = t.ease; t.rP = t.pkw; t.rF = t.flw; t.rR = t.rgw;
+			// Touching the edge of the picture: the light is entering the frame.
+			const bool atEdge = cx - rr <= (float)m_bx0 + 0.5f || cx + rr >= (float)m_bx1 - 0.5f
+				|| cy - rr <= (float)m_by0 + 0.5f || cy + rr >= (float)m_by1 - 0.5f;
 			if (m_cut) {
 				t.fade = 1.0f;                     // scene cut: the change is hidden
-			} else if (Lead() > 0) {
-				t.fade = 1.0f;                     // faded in early on the frames before
-				if (m_nNew < kMaxTracks) m_newSlots[m_nNew++] = slot;
+			} else if (Confirm() > 0) {
+				t.fade = atEdge ? kFadeEdge : 1.0f;   // shown only once confirmed (see kConfirm)
+				t.pend = 1;
 			} else {
-				t.fade = kFadeStart;               // mid-scene: start strong, finish in a few frames
+				t.fade = atEdge ? kFadeEdge : kFadeStart;   // mid-scene: start strong, finish in a few frames
 			}
 			m_used[slot] = true;
 		}
+		// A patch with two or more lights under it is a group for the next two
+		// seconds; the reach to lights no longer there shrinks back slowly.
+		for (int k = 0; k < kMaxTracks; k++) {
+			Track& t = m_tracks[k];
+			if (t.alpha <= 0.0f) continue;
+			const bool settled = t.seen >= kGroupSeen && std::hypot(t.vx, t.vy) < kMovingSpeed * gsF();
+			if (cnt[k] >= 2 && (settled || t.grp > 0)) t.grp = kGroupFrames;
+			else if (t.grp > 0) t.grp--;
+			if (cnt[k] >= 1 && t.seen < 100000) t.seen++;   // frames its light was found
+			// The reach grows fast to the farthest light under the patch and
+			// shrinks back slowly once that light is gone.
+			t.cov += ((needMax[k] > t.cov) ? 0.30f : 0.03f) * (needMax[k] - t.cov);
+			if (t.cov < 0.05f) t.cov = 0.0f;
+		}
 	}
 
-	// A hot spot whose light now reads graded (its flat core cut off by the
-	// frame edge, or out of focus) or as a lamp (its surroundings lit past
-	// kHotLitRing) is not dropped: its patch stays where it is and its dimming
-	// drains (flatness or ring weight, about a second), instead of being held
-	// and then faded out in a few frames. Only a patch that is already there;
-	// a graded light or a lamp never starts one. Once drained, the patch is let
-	// go as usual.
+	// Hysteresis: a hot spot whose light now narrowly fails a check (reads
+	// graded, or as a lamp) keeps its patch at full strength while that light is
+	// still there, for up to kReleaseFrames frames in a row; after that it is
+	// let go and fades out as usual. A graded light or a lamp never starts one.
 	template <class SpotT>
-	void DrainLost(const SpotT* g, int n, bool lamp)
+	void HoldLost(const SpotT* g, int n, bool lamp = false, bool strip = false)
 	{
 		for (int i = 0; i < n; i++) {
 			const float cx = 0.5f * (float)(g[i].x0 + g[i].x1);
@@ -2071,14 +3057,48 @@ private:
 			for (int k = 0; k < kMaxTracks; k++) {
 				const Track& t = m_tracks[k];
 				if (t.alpha <= 0.0f || m_used[k]) continue;
-				const float d = std::hypot(t.cx - cx, t.cy - cy);
-				if (d <= 2.0f * t.r + 4.0f * gsF() && d < bestD) { bestD = d; best = k; }
+				// 2.42.2: a patch that is moving, or lost its light while moving,
+				// is not held by a dimmer reading it drifts over. After a cut the
+				// brightness test missed, a moving patch from the old shot coasted
+				// onto a glow in the new one and sat there at 80% (a dark blotch
+				// beside the new shot's headlight). Only a real light picks it up.
+				if (t.lm || std::hypot(t.vx, t.vy) >= kMovingSpeed * gsF()) continue;
+				const float d = std::hypot(t.cx + t.vx - cx, t.cy + t.vy - cy);
+				if (d <= Reach(t) && d < bestD) { bestD = d; best = k; }
 			}
 			if (best < 0) continue;
 			Track& t = m_tracks[best];
-			float& w = lamp ? t.rgw : t.flw;
-			if (w < kDrainDone) continue;
-			w += kEaseRate * ((lamp ? RingWeight(g[i].rg) : FlatWeight(g[i].fl)) - w);
+			if (lamp && HP()) {
+				// High Performance: a lamp reading eases the patch out, and a light
+				// reading eases it back in, so a flame whose glow comes and goes
+				// keeps one steady patch instead of full / let go / found again.
+				if (t.pend || t.seen < kProbation) continue;
+				// A lamp for Lead() frames in a row: it has become one, and the
+				// patch ends where that began, on the frames not yet shown.
+				if (++t.lamp >= kLampRun) { EndTrack(best, t.lamp, true); continue; }
+				t.rgw += kEaseRate * (0.0f - t.rgw);
+				if (t.rgw < kLampGone) { t = Track(); continue; }
+				if (std::hypot(t.vx, t.vy) >= kMovingSpeed * gsF()) Follow(t, cx, cy);
+				t.miss = 0;
+				t.alpha = 1.0f;
+				m_used[best] = true;
+				continue;
+			}
+			if (strip && HP() && !t.pend && t.seen >= kProbation) {
+				// High Performance: part of a strip for Lead() frames in a row
+				// (counted together with lamp readings) ends the patch the same way.
+				if (++t.lamp >= kLampRun) { EndTrack(best, t.lamp, true); continue; }
+			}
+			if (t.fail >= kReleaseFrames) continue;
+			// Only a patch whose light was really found for kProbation frames is
+			// held; one not yet confirmed must be found as a light itself. A tiny
+			// glint reading light on one frame and graded on the next was
+			// confirmed, and later revived, by its graded readings.
+			if (t.pend || t.seen < kProbation) continue;
+			if (std::hypot(t.vx, t.vy) >= kMovingSpeed * gsF()) {
+				Follow(t, cx, cy);   // a moving hot spot's held patch moves with its light
+			}
+			t.fail++;
 			t.miss = 0;
 			t.alpha = 1.0f;
 			m_used[best] = true;
@@ -2091,7 +3111,7 @@ private:
 	void UpdateGrade(const SpotT* g, int ng, int nCells)
 	{
 		const int cx = (int)m_cx, cy = (int)m_cy;
-		static float target[kMaxCellsX * kMaxCellsY];
+		float* target = m_gradeTarget;
 		std::fill(target, target + (size_t)cx * cy, 0.0f);
 		m_gradeLive = 0;
 		for (int i = 0; i < ng; i++) {
@@ -2113,7 +3133,7 @@ private:
 				}
 			}
 		}
-		const float rate = m_cut ? 1.0f : kGradeRate;
+		const float rate = m_cut ? 1.0f : (HPFull() ? kGradeRateHP : kGradeRate);
 		m_gradeMax = 0.0f;
 		for (size_t i = 0; i < (size_t)cx * cy; i++) {
 			m_grade[i] += rate * (target[i] - m_grade[i]);
@@ -2124,26 +3144,104 @@ private:
 
 	template <class SpotT>
 	void UpdateTracks(const SpotT* hot, int nHot, const SpotT* graded, int nGraded,
-		const SpotT* lamps, int nLamps)
+		const SpotT* lamps, int nLamps, const SpotT* strips, int nStrips)
 	{
 		std::fill(std::begin(m_used), std::end(m_used), false);
 		m_nNew = 0;
 		// Patches still fading in take their next step.
 		for (Track& t : m_tracks) {
 			if (t.alpha > 0.0f && t.fade < 1.0f) t.fade = std::min(1.0f, t.fade + kFadeStepHot);
+			if (t.alpha > 0.0f && t.pend) t.age++;
+		}
+		if (m_cut || m_stripMemCx != (int)m_cx || m_stripMemCy != (int)m_cy) {
+			for (StripMem& s : m_stripMem) s.ttl = 0;
+			m_stripMemCx = (int)m_cx; m_stripMemCy = (int)m_cy;
 		}
 		MatchSpots(hot, nHot, kMaxSpots);
-		DrainLost(graded, nGraded, false);
-		DrainLost(lamps, nLamps, true);
+		// Remember where strips are (after matching: this frame's strips and
+		// lights are different areas anyway).
+		for (StripMem& s : m_stripMem) if (s.ttl > 0) s.ttl--;
+		for (int i = 0; i < nStrips; i++) {
+			const float cx = 0.5f * (float)(strips[i].x0 + strips[i].x1);
+			const float cy = 0.5f * (float)(strips[i].y0 + strips[i].y1);
+			StripMem* slot = nullptr;
+			for (StripMem& s : m_stripMem) {
+				if (s.ttl > 0 && cx >= s.x0 && cx <= s.x1 && cy >= s.y0 && cy <= s.y1) { slot = &s; break; }
+				if (s.ttl <= 0 && !slot) slot = &s;
+			}
+			if (!slot) continue;
+			const float pad = gsF();
+			const float x0 = (float)strips[i].x0 - pad, x1 = (float)strips[i].x1 + pad;
+			const float y0 = (float)strips[i].y0 - pad, y1 = (float)strips[i].y1 + pad;
+			if (slot->ttl > 0) {
+				slot->x0 = std::min(slot->x0, x0); slot->x1 = std::max(slot->x1, x1);
+				slot->y0 = std::min(slot->y0, y0); slot->y1 = std::max(slot->y1, y1);
+			} else {
+				slot->x0 = x0; slot->x1 = x1; slot->y0 = y0; slot->y1 = y1;
+			}
+			slot->ttl = kStripMemFrames;
+		}
+		HoldLost(graded, nGraded);
+		HoldLost(lamps, nLamps, true);
+		HoldLost(strips, nStrips, false, true);
 		// Patches not found this frame are held, then fade out (at once after a cut).
 		for (int k = 0; k < kMaxTracks; k++) {
 			Track& t = m_tracks[k];
 			if (t.alpha <= 0.0f || m_used[k]) continue;
+			if (t.pend) {
+				// High Performance: judged over kConfirmHP frames, so it may be
+				// missed on a few of them.
+				if (HP() && !m_cut && t.age + 1 - t.seen <= (HPFull() ? kPendMissHP : kPendMissLite)) { t.miss++; continue; }
+				// Gone before it was confirmed: never shown.
+				ErasePending(k, t.age);
+				t = Track();
+				continue;
+			}
+			// Not found: carry on in its direction while held, slowing down.
+			if (std::hypot(t.vx, t.vy) >= kMovingSpeed * gsF()) {
+				t.lm = 1;   // lost while moving: from here only a real light picks it up
+				t.cx = std::clamp(t.cx + t.vx, 0.0f, (float)m_cx - 1.0f);
+				t.cy = std::clamp(t.cy + t.vy, 0.0f, (float)m_cy - 1.0f);
+			}
+			t.vx *= 0.8f; t.vy *= 0.8f;
+			if (HP()) {
+				// High Performance: held over a gap of up to Lead() frames; a
+				// light gone for longer (or lost at a cut) has its patch ended
+				// where the light ended, on the frames not yet shown.
+				t.miss++;
+				// 2.41.2: at a cut the patch runs up to the cut. It was only lost
+				// for a moment (under Lead() frames), and taking it back to the
+				// last frame it was found on made the light step brighter for
+				// the last frames of the shot.
+				if (m_cut) { t = Track(); continue; }
+				if (t.miss >= Lead()) EndTrack(k, t.miss, false);
+				continue;
+			}
 			t.miss = m_cut ? std::max(t.miss + 1, kHoldFrames + 1) : t.miss + 1;
 			if (t.miss > kHoldFrames) {
 				t.alpha *= kTrackFadeOut;
 				if (t.alpha < 0.02f) t.alpha = 0.0f;
+			} else if (t.seen < kProbation && t.miss > 1) {
+				t.alpha *= kYoungFadeOut;         // on probation: not held
+				if (t.alpha < 0.02f) t.alpha = 0.0f;
 			}
+		}
+		// A new light found on its confirmation frames too: its patch stays, and
+		// PushSnap fades it in early where the look-ahead leaves room.
+		for (int k = 0; k < kMaxTracks; k++) {
+			Track& t = m_tracks[k];
+			if (t.alpha <= 0.0f || !t.pend || t.age < Confirm()) continue;
+			if (HP()) {
+				// Judged: it starts with the weights the light has now.
+				t.ease = std::min(t.ease, t.rE); t.pkw = std::max(t.pkw, t.rP); t.flw = t.rF; t.rgw = t.rR;
+				for (int j = 0; j < t.age && j < m_snapCount; j++) {
+					Track& e = m_snap[(m_snapHead + kMaxLead + 1 - j) % (kMaxLead + 1)].tracks[k];
+					if (e.alpha <= 0.0f || !e.pend) continue;
+					e.ease = t.ease; e.pkw = t.pkw; e.flw = t.flw; e.rgw = t.rgw;
+				}
+			}
+			t.pend = 0;
+			if (m_nNew < kMaxTracks) m_newSlots[m_nNew++] = k;
 		}
 		// Overlapping patches merge into the larger one.
 		for (int a = 0; a < kMaxTracks; a++) {
@@ -2156,7 +3254,10 @@ private:
 				Track& drop = (ta.r >= tb.r) ? tb : ta;
 				keep.alpha = std::max(keep.alpha, drop.alpha);
 				keep.miss = std::min(keep.miss, drop.miss);
+				if (drop.pend) ErasePending((int)(&drop - m_tracks), drop.age);
+				else keep.pend = 0;
 				drop.alpha = 0.0f;
+				drop.pend = 0;
 			}
 		}
 		m_tracksLive = 0;
@@ -2173,6 +3274,52 @@ private:
 		}
 	}
 
+	// ---- native Unplugged settings (Unplugged 2.3.0) -----------------------------
+	// Unplugged pushes its own ClipGuard block through Settings_t. ClipGuard.exe owns
+	// the settings whenever it is running (shared memory, as before); the native block
+	// is used only when it is not, in place of clipguard.ini.
+public:
+	void SetNativeSettings(const ClipGuardSettings& s)
+	{
+		m_native = true;
+		m_nat = s;
+	}
+	void RequestLog(unsigned id) { if (id) m_logWant = id; }
+	float FixAmount() const { return std::max(m_smooth, 0.0f); }
+	float WhiteCeil() const { return m_ceil; }
+	bool  HotActive() const { return m_hotActive; }
+private:
+	bool m_native = false;          // Unplugged sent a native settings block
+	ClipGuardSettings m_nat;        // the latest native block
+	bool m_usingNative = false;     // the settings in use now came from the native block
+	void ApplyNative()
+	{
+		const ClipGuardSettings& n = m_nat;
+		m_s.enabled      = n.enabled;
+		m_s.strength     = std::clamp(n.strength, 0.0f, 1.0f);
+		m_s.fixShape     = std::clamp(n.fixShape, 0, 1);
+		m_s.triggerPct   = std::clamp(n.fixStartPct, 1.0f, 50.0f);
+		m_s.fullPct      = std::clamp(n.fullPct, 0.5f, 49.5f);
+		if (m_s.fullPct > m_s.triggerPct - 0.5f) m_s.fullPct = m_s.triggerPct - 0.5f;
+		m_s.knee         = std::clamp(n.knee, 0.20f, 0.95f);
+		m_s.colorProtect = std::clamp(n.colorProtect, 0.0f, 1.0f);
+		m_s.textSkipPct  = std::clamp(n.textSkipPct, 0.0f, 100.0f);
+		m_s.hotSpot      = std::clamp(n.hotSpot, 0.0f, 1.0f);
+		m_s.hotBelow     = std::clamp(n.hotBelowPct, 0.0f, 20.0f);
+		m_s.gradedSpot   = std::clamp(n.gradedSpot, 0.0f, 1.0f);
+		m_s.grid         = std::clamp(n.grid, 0, 1);
+		m_s.lookAhead    = (n.lookAhead == 2 || n.lookAhead == 4 || n.lookAhead == 6) ? n.lookAhead : 0;
+		m_s.view         = std::clamp(n.view, 0, 3);
+		m_s.overlayOn    = n.osd;
+		m_s.pinned       = n.osdPinned;
+		m_s.selected     = std::clamp(n.osdSelected, 0, kRows - 3);   // no ClipGuard+ or Test rows
+		// Not in the native block: ClipGuard.exe-only features stay at their defaults.
+		m_s.upscaler = 0; m_s.plus = false; m_s.kscape = false;
+		m_s.projector = 0; m_s.lut = 0; m_s.lutOff = false; m_s.source = 0;
+		m_s.infoOn = false; m_s.testBuild = false;
+	}
+public:
+
 	// ---- settings ------------------------------------------------------------------
 
 	void CloseShared()
@@ -2183,7 +3330,7 @@ private:
 
 	bool ExeAlive() const
 	{
-		return m_pShared && m_pShared->magic == kDbleMagic
+		return m_pShared && m_pShared->magic == kClipGuardMagic
 			&& (DWORD)(GetTickCount() - m_pShared->exeTick) < 5000;
 	}
 
@@ -2192,12 +3339,12 @@ private:
 		const ULONGLONG now = GetTickCount64();
 		if (!m_pShared && (m_openTick == 0 || now - m_openTick >= 2000)) {
 			m_openTick = now;
-			HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kDbleMapName);
+			HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kClipGuardMapName);
 			if (h) {
-				void* p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DbleShared));
+				void* p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ClipGuardShared));
 				if (p) {
 					m_hMap = h;
-					m_pShared = (volatile DbleShared*)p;
+					m_pShared = (volatile ClipGuardShared*)p;
 				} else {
 					CloseHandle(h);
 				}
@@ -2205,7 +3352,8 @@ private:
 		}
 
 		if (ExeAlive()) {
-			volatile DbleShared* s = m_pShared;
+			m_usingNative = false;
+			volatile ClipGuardShared* s = m_pShared;
 			m_s.enabled     = s->enabled != 0;
 			m_s.strength    = std::clamp((float)s->strength, 0.0f, 1.0f);
 			m_s.triggerPct  = std::clamp((float)s->triggerPct, 0.2f, 100.0f);
@@ -2218,13 +3366,26 @@ private:
 			m_s.hotBelow    = std::clamp((float)s->hotBelowPct, 0.0f, 100.0f);
 			m_s.fixShape    = std::clamp((int)s->fixShape, 0, 1);
 			m_s.gradedSpot  = std::clamp((float)s->gradedSpot, 0.0f, 1.0f);
+			m_s.spotMask    = std::clamp((int)s->spotMask, 0, 1);
+			m_s.dimFire     = s->dimFire != 0;
+			m_s.upscaler    = std::clamp((int)s->upscaler, 0, 1);
+			m_s.dither      = std::clamp((int)s->dither, 0, 1);
+			m_s.projector   = (s->projector == 1 || s->projector == 3) ? (int)s->projector : 0;   // 2.60.0: 3 = Titan DBLE Low
+			m_s.lut         = std::clamp((int)s->lut, 0, 2);
+			m_s.lutOff      = s->lutOff != 0;
+			if (s->edition != 1) m_s.upscaler = 0;   // Upscaler is ClipGuard+ only
 			m_s.grid        = std::clamp((int)s->grid, 0, 1);
+			m_s.plus        = s->edition == 1;
+			m_s.kscape      = m_s.plus && s->kscape != 0;
 			m_s.lookAhead   = NormLookAhead((int)s->lookAhead);
+			if (!m_s.plus) m_s.lookAhead = std::min(m_s.lookAhead, 6);   // High Performance is ClipGuard+ only
 			m_s.overlayOn   = s->overlayOn != 0;
+			m_s.infoOn      = s->infoOn != 0;
 			m_s.pinned      = s->overlayPinned != 0;
-			m_s.selected    = std::clamp((int)s->selected, 0, kRows - 1);
 			m_s.lastKeyTick = s->lastKeyTick;
 			m_s.testBuild   = s->buildKind == 1;
+			m_s.source      = m_s.testBuild && s->source == 1 ? 1 : 0;
+			m_s.selected    = std::clamp((int)s->selected, 0, kRows - (s->edition == 1 ? 0 : 1) - (m_s.testBuild ? 0 : 1) - 1);
 			const uint32_t req = s->logRequest;
 			if (req != 0 && req != m_logSeen) {
 				m_logSeen = req;
@@ -2233,6 +3394,13 @@ private:
 			return;
 		}
 
+		// No ClipGuard.exe: Unplugged's native settings when it sent them (2.3.0),
+		// otherwise clipguard.ini next to the filter, re-read every two seconds.
+		if (m_native) {
+			m_usingNative = true;
+			ApplyNative();
+			return;
+		}
 		// No ClipGuard.exe: clipguard.ini next to the filter, re-read every two seconds.
 		if (m_iniTick != 0 && now - m_iniTick < 2000) {
 			return;
@@ -2255,17 +3423,72 @@ private:
 		m_s.hotBelow   = std::clamp(readf(L"HotSpotBelowPct", 3.0f), 0.0f, 100.0f);
 		m_s.fixShape   = std::clamp((int)readf(L"FixShape", 1.0f), 0, 1);
 		m_s.gradedSpot = std::clamp(readf(L"GradedSpot", 0.5f), 0.0f, 1.0f);
+		m_s.spotMask   = std::clamp((int)readf(L"HotSpotMask", 1.0f), 0, 1);
+		m_s.dimFire    = readf(L"DimFire", 0.0f) > 0.5f;
+		m_s.upscaler   = std::clamp((int)readf(L"Upscaler", 0.0f), 0, 1);
+		m_s.dither     = std::clamp((int)readf(L"Dither", 0.0f), 0, 1);
+		{
+			// 2.50.0: Projector 2 (Valerion, 2.48-2.49) became Universal with the Valerion LUT.
+			const int pj = std::clamp((int)readf(L"Projector", 0.0f), 0, 3);
+			m_s.projector = (pj == 1 || pj == 3) ? pj : 0;   // 2.51.2: Valerion (2) becomes Universal (Reactive) with the Valerion LUT; 2.60.0: 3 = Titan DBLE Low
+			m_s.lut = std::clamp((int)readf(L"Lut", (float)(pj == 3 ? 1 : pj)), 0, 2);
+		}
 		m_s.grid       = std::clamp((int)readf(L"Grid", 1.0f), 0, 1);
 		m_s.lookAhead  = NormLookAhead((int)readf(L"LookAhead", 4.0f));
+		m_s.plus       = false;   // without ClipGuard.exe: ClipGuard (High Performance and Upscaler need ClipGuard+)
+		m_s.kscape     = false;
+		m_s.lookAhead  = std::min(m_s.lookAhead, 6);
+		m_s.upscaler   = 0;
 		m_s.overlayOn  = readf(L"Overlay", 0.0f) > 0.5f;
+		m_s.infoOn     = readf(L"Info", 0.0f) > 0.5f;
 		m_s.pinned     = m_s.overlayOn;
 		m_s.selected   = 0;
 	}
 
+	// Hot spot test video: the end of each 30 s part shows a row of ten 40 x 40
+	// grey (bit 1, signal 0.30) or black (bit 0) blocks along the bottom right of
+	// the 1920 x 1080 frame: the code 10110010 and then the part number in two
+	// bits. Seen on kMarkFrames frames in a row, it counts once; ClipGuard Test
+	// then saves and sends the log (the last 30 s: that part).
+	static constexpr int kMarkFrames = 4;
+	template <class F>
+	void DetectTestMarker(F sample)
+	{
+		static const int code[8] = { 1, 0, 1, 1, 0, 0, 1, 0 };
+		int part = 0;
+		bool ok = true;
+		int bits[10];
+		for (int i = 0; i < 10 && ok; i++) {
+			const float fx = (1920.0f - 440.0f + 40.0f * (float)i + 20.0f) / 1920.0f;
+			const float fy = (1080.0f - 60.0f) / 1080.0f;
+			const float v = sample(fx, fy);
+			if (v >= 0.18f && v <= 0.50f) bits[i] = 1;
+			else if (v < 0.08f) bits[i] = 0;
+			else ok = false;
+		}
+		if (ok) {
+			for (int i = 0; i < 8; i++) if (bits[i] != code[i]) { ok = false; break; }
+		}
+		if (ok) part = bits[8] * 2 + bits[9];
+		if (!ok || part == 0) {
+			m_markRun = 0;
+			m_markPart = 0;
+			return;
+		}
+		if (part != m_markPart) { m_markPart = part; m_markRun = 0; }
+		if (++m_markRun == kMarkFrames) {
+			m_markSeq++;
+			if (m_pShared) m_pShared->testMarker = (m_markSeq << 8) | (uint32_t)part;
+		}
+	}
+	int      m_markPart = 0;   // test code part on screen now (0 = none)
+	int      m_markRun = 0;    // frames in a row it has been seen
+	uint32_t m_markSeq = 0;
+
 	void WriteStatus()
 	{
 		if (!m_pShared) return;
-		volatile DbleShared* s = m_pShared;
+		volatile ClipGuardShared* s = m_pShared;
 		s->rendTick = GetTickCount();
 		s->pictureBrightness = m_haveMeasure ? m_picture : -1.0f;
 		s->sceneNits = m_sceneNits;
@@ -2297,26 +3520,126 @@ private:
 	float m_picAfter = 0.0f;
 	float m_peakAfter = 0.0f;
 	int   m_bx0 = 0, m_bx1 = -1, m_by0 = 0, m_by1 = -1;  // picture area of the last measurement
-	static constexpr int kHist = 8;                      // incoming ADL and peak of the last frames
+	int   m_stickY0 = (int)kMaxCellsY, m_stickY1 = -1;   // top and bottom rows of the stable picture area
+	int   m_stickX0 = (int)kMaxCellsX, m_stickX1 = -1;   // and its left and right columns
+	// The stable picture area (where the menu and the info banner go): the
+	// largest area measured on at least kAreaMin of the last kAreaFrames frames.
+	// It used to be the largest area ever seen, so one stray frame with
+	// something in the black bars (a 16:9 logo before a scope film, a full
+	// frame flash) put the banner in the bars for the rest of the session. Now a
+	// stray frame doesn't count, and an old shape is forgotten after two
+	// minutes; a dark shot whose edges read as bars still can't shrink it while
+	// the full picture was seen in that time, so it doesn't hop about.
+	// 2.56.0: 30 seconds, not two minutes. A studio logo in 16:9 before a scope
+	// film kept the banner in the bars for two minutes after a new film; a dark
+	// shot can now pull it in a little, which keeps it on the picture anyway.
+	static constexpr int kAreaFrames = 720;    // 30 seconds at 24 fps
+	static constexpr int kAreaMin = 24;
+	int16_t  m_areaRing[kAreaFrames][4] = {};   // x0, x1, y0, y1 of each frame (x0 < 0: black frame)
+	uint16_t m_areaHist[4][kMaxCellsX + 1] = {};
+	int   m_areaHead = 0, m_areaCount = 0, m_areaValid = 0;
+	int   m_areaCx = 0, m_areaCy = 0;
+	void AreaClear()
+	{
+		memset(m_areaHist, 0, sizeof(m_areaHist));
+		m_areaHead = m_areaCount = m_areaValid = 0;
+		m_stickY0 = (int)kMaxCellsY; m_stickY1 = -1;
+		m_stickX0 = (int)kMaxCellsX; m_stickX1 = -1;
+	}
+	void AreaPush(int x0, int x1, int y0, int y1)
+	{
+		if (m_areaCx != (int)m_cx || m_areaCy != (int)m_cy) {
+			AreaClear();
+			m_areaCx = (int)m_cx; m_areaCy = (int)m_cy;
+		}
+		const bool ok = x0 <= x1 && y0 <= y1 && x0 >= 0 && y0 >= 0 && x1 < (int)kMaxCellsX && y1 < (int)kMaxCellsY;
+		if (m_areaCount == kAreaFrames) {
+			const int16_t* o = m_areaRing[m_areaHead];
+			if (o[0] >= 0) {
+				for (int k = 0; k < 4; k++) m_areaHist[k][o[k]]--;
+				m_areaValid--;
+			}
+		} else {
+			m_areaCount++;
+		}
+		int16_t* e = m_areaRing[m_areaHead];
+		if (ok) {
+			e[0] = (int16_t)x0; e[1] = (int16_t)x1; e[2] = (int16_t)y0; e[3] = (int16_t)y1;
+			for (int k = 0; k < 4; k++) m_areaHist[k][e[k]]++;
+			m_areaValid++;
+		} else {
+			e[0] = -1;
+		}
+		m_areaHead = (m_areaHead + 1) % kAreaFrames;
+		if (m_areaValid <= 0) return;   // nothing but black so far: keep what there is
+		const int need = std::min(kAreaMin, m_areaValid);
+		// The outermost edge reached on at least `need` frames.
+		auto low = [&](int k, int n) { int c = 0; for (int v = 0; v < n; v++) { c += m_areaHist[k][v]; if (c >= need) return v; } return n - 1; };
+		auto high = [&](int k, int n) { int c = 0; for (int v = n - 1; v >= 0; v--) { c += m_areaHist[k][v]; if (c >= need) return v; } return 0; };
+		m_stickX0 = low(0, (int)kMaxCellsX);
+		m_stickX1 = high(1, (int)kMaxCellsX);
+		m_stickY0 = low(2, (int)kMaxCellsY);
+		m_stickY1 = high(3, (int)kMaxCellsY);
+	}
+	static constexpr int kHist = 16;                     // incoming ADL and peak of the last frames (look-ahead up to 12)
 	float m_histPic[kHist] = {};
 	float m_histPeak[kHist] = {};
 	int   m_histHead = 0;
 	CD3D11Font m_Font;    // overlay: main text
 	CD3D11Font m_FontS;   // small: headings, hints, cost
 	CD3D11Font m_FontT;   // bold title
+	CD3D11Font m_FontB;   // large bold: info banner badges
+	CD3D11Font m_FontH;   // small bold: headings
+	CD3D11Font m_FontL;   // info banner values
+	CD3D11Font m_FontG;   // info banner group headings (bold)
 	UINT m_fontH = 0;
 
 	std::wstring m_iniPath;
 	HANDLE m_hMap = nullptr;
-	volatile DbleShared* m_pShared = nullptr;
-	bool m_native = false;   // Unplugged owns the settings; no shared memory/INI
+	volatile ClipGuardShared* m_pShared = nullptr;
 	ULONGLONG m_openTick = 0;
 	ULONGLONG m_iniTick = 0;
-	DbleSettings m_s;
+	CgRunSettings m_s;
 
 	UINT64 m_frame = 0;
 	bool  m_haveMeasure = false;
 	bool  m_cut = false;
+	struct StripMem { float x0 = 0, y0 = 0, x1 = 0, y1 = 0; int ttl = 0; };
+	StripMem m_stripMem[kMaxStripMem];   // where strips were seen in the last kStripMemFrames frames
+	int   m_stripMemCx = 0, m_stripMemCy = 0;
+	// Takes an unconfirmed patch out of the queued frames it was put in (its
+	// last `age` frames; none of them has been shown yet).
+	void ErasePending(int slot, int age)
+	{
+		for (int j = 0; j < age && j < m_snapCount; j++) {
+			Track& e = m_snap[(m_snapHead + kMaxLead + 1 - j) % (kMaxLead + 1)].tracks[slot];
+			if (e.pend) e = Track();
+		}
+	}
+	// High Performance: ends a patch whose light was last found `miss` frames
+	// ago, on the queued frames after that one (none shown yet). fade: a
+	// short fade-out first (a light that turned into a lamp); otherwise the
+	// patch is gone with its light.
+	void EndTrack(int slot, int miss, bool fade)
+	{
+		// The first of those frames that has not been shown yet (with a short
+		// lead the earlier ones already have): the fade starts there.
+		const int i0 = std::max(1, miss - Lead());
+		for (int i = i0; i < miss; i++) {
+			const int j = miss - 1 - i;
+			if (j >= m_snapCount) continue;
+			Track& e = m_snap[(m_snapHead + kMaxLead + 1 - j) % (kMaxLead + 1)].tracks[slot];
+			if (fade && i - i0 < kEndSteps) e.alpha *= EndFade(i - i0 + 1);
+			else e = Track();
+		}
+		m_tracks[slot] = Track();
+	}
+	bool StripRecent(float cx, float cy) const {
+		for (const StripMem& s : m_stripMem) {
+			if (s.ttl > 0 && cx >= s.x0 && cx <= s.x1 && cy >= s.y0 && cy <= s.y1) return true;
+		}
+		return false;
+	}
 	int   m_grid = 0;
 	UINT  m_cx = 128;
 	UINT  m_cy = 72;
@@ -2324,7 +3647,6 @@ private:
 	float m_lastHotSet = -1.0f;
 	bool  m_outputPQ = false;
 	float m_picture = 0.0f;
-	float m_srcMax = 0.0f;     // unused since 2.1
 	float m_textPct = 0.0f;       // bright-on-black share of highlights (text, stars)
 	bool  m_textSkipped = false;
 	float m_brightSamples = 0.0f;
@@ -2334,12 +3656,19 @@ private:
 	float m_hotSmooth = 0.0f;
 	bool  m_hotActive = false;
 	int   m_spots = 0;
+	int   m_stripPieces = 0;  // bright pieces of long lights (strips), not hot spots
+	int   m_fireSpots = 0;  // lights left alone as fire (Dim fire off)
+	float m_warmMax = -1.0f; // warmest glow of the lights checked this frame (-1 = none had a glow)
+	float m_warmCore = 0.0f; // that light's core
+	float m_fireSize = 0.0f; // 2.42.5: core size of the largest warm light
+	float m_warmLow = -1.0f; // palest glow among the warm lights
 	int   m_litSpots = 0;   // bright cores turned down as hot spots (lit surroundings)
 	int   m_gradedSpots = 0; // bright cores turned down as hot spots (graded, not flat: skin)
 	bool  m_spread = false;  // more lights than kSpreadLights, or over kHotMaxFrac
 	bool  m_spreadArea = false; // spread because the lights' cores were over kHotMaxFrac
 	int   m_spreadLights = 0;   // lights that passed the checks (readout)
 	float m_hotFlat = -1.0f; // flat share of the flattest candidate core (readout)
+	bool m_gateShut = false; // 2.42.4: picture above Hot spot below, patches go fast
 	float m_hotGate = 1.0f;  // Hot spot below: 1 = full, 0 = picture too bright for hot spots
 	float m_hotNear = -1.0f; // highest near share of the lit ring around a light that passed (readout)
 	float m_hotRing = -1.0f; // highest lit share of the ring around a light that passed (readout)
@@ -2358,10 +3687,17 @@ private:
 	float m_anchorGain[kMaxCellsX * kMaxCellsY];        // anchor gain per cell (1 = untouched)
 	float m_anchorLv = 1.0f;                           // anchor level: top kAnchorPct of picture cells
 	float m_grade[kMaxCellsX * kMaxCellsY] = {};   // graded spot map (follows slowly)
+	float m_gradeTarget[kMaxCellsX * kMaxCellsY] = {};   // this frame's target for it
+	float m_shownGradeMax = 0.0f;
+	float m_targetRaw = 0.0f;
+	bool  m_cutFrame = false;
+	float m_tgVal[kTgHist] = {};   // each frame's own Guard amount and scene start,
+	bool  m_tgCut[kTgHist] = {};   // newest at m_tgHead (same order as the queue)
+	int   m_tgHead = 0, m_tgCount = 0;
+	int   m_nextId = 0;
 	float m_gradeCeil = 1.0f;
 	float m_gradeMax = 0.0f;
 	int   m_gradeLive = 0;
-	bool  m_maskDirty = true;
 	int   m_newSlots[kMaxTracks] = {};
 	int   m_nNew = 0;
 	Snap  m_snap[kMaxLead + 1];

@@ -211,7 +211,7 @@ HRESULT CD3D11Font::CreateFontBitmap(const WCHAR* strFontName, const UINT fontHe
 
 	CFontBitmap fontBitmap;
 
-	HRESULT hr = fontBitmap.Initialize(m_strFontName.c_str(), m_fontHeight, 0, m_Characters, std::size(m_Characters));
+	HRESULT hr = fontBitmap.Initialize(m_strFontName.c_str(), m_fontHeight, m_fontFlags, m_Characters, std::size(m_Characters));
 	if (FAILED(hr)) {
 		return hr;
 	}

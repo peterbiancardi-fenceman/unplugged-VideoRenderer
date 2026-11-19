@@ -32,7 +32,7 @@ cbuffer PS_CONSTANTS : register(b0)
     float  gamutConvert;
     float  gamutSrc;
     float  gamutDst;
-    float2 _pad;
+    float2 ditherOffset;     // ClipGuard 2.45.0: temporal dither, a new whole-texel offset each frame (0 = static)
 };
 
 #include "../convert/colorspace_gamut_conversion.hlsl"
@@ -142,7 +142,7 @@ float4 main(PS_INPUT input) : SV_Target
     }
 
     if (ditherEnabled > 0.5) {
-        float4 ditherValue = texDither.Sample(sampDither, input.Tex * ditherCoordScale);
+        float4 ditherValue = texDither.Sample(sampDither, input.Tex * ditherCoordScale + ditherOffset);
         pixel = floor(pixel * QUANTIZATION + ditherValue) / QUANTIZATION;
     }
 

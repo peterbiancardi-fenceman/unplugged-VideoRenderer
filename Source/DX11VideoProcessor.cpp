@@ -415,7 +415,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iSDRDisplayNits      = config.iSDRDisplayNits;
 	m_iDisplayTransfer    = config.iDisplayTransfer;
 	m_clipGuard           = config.clipGuard;
-	m_Dble.SetNativeSettings(m_clipGuard);
+	m_ClipGuard.SetNativeSettings(m_clipGuard);
 	m_fHdrDisplayMinNits   = config.fHdrDisplayMinNits;
 	m_fHdrTitlePeakNits    = config.fHdrTitlePeakNits;
 	m_fHdrHableKnee        = config.fHdrHableKnee;
@@ -808,6 +808,10 @@ void CDX11VideoProcessor::ReleaseVP()
 
 	m_pFilter->ResetStreamingTimes2();
 	m_RenderStats.Reset();
+	m_SkipBase = 0;
+	m_SkipGraceT = 0;
+	m_LastFrames = 0;
+	m_ClipGuard.AreaReset();   // a new file or format: forget the last picture shape
 
 	if (m_pDeviceContext) {
 		m_pDeviceContext->ClearState();
@@ -838,15 +842,15 @@ void CDX11VideoProcessor::ReleaseDevice()
 	ReleaseVP();
 	m_D3D11VP.ReleaseVideoDevice();
 
-	m_Dble.ReleaseDevice();
-	for (auto& t : m_DbleDelay) t.Release();
-	m_DbleDelayN = 0;
-	m_DbleDelayRing = 0;
-	m_DbleOut.Release();
+	m_ClipGuard.ReleaseDevice();
+	for (auto& t : m_ClipGuardDelay) t.Release();
+	m_ClipGuardDelayN = 0;
+	m_ClipGuardDelayRing = 0;
+	m_ClipGuardOut.Release();
 	m_StatsBackground.InvalidateDeviceObjects();
 	m_Font3D.InvalidateDeviceObjects();
-	m_DbleRect.InvalidateDeviceObjects();
-	m_DbleQuad.InvalidateDeviceObjects();
+	m_ClipGuardRect.InvalidateDeviceObjects();
+	m_ClipGuardQuad.InvalidateDeviceObjects();
 	m_Rect3D.InvalidateDeviceObjects();
 
 	m_Underlay.InvalidateDeviceObjects();
@@ -1021,7 +1025,7 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	}
 	// ClipGuard pass: counted whenever it is ready, so the ring is sized for it.
 	// When the fix is off it draws an exact copy.
-	if (m_Dble.Ready()) {
+	if (m_ClipGuard.Ready()) {
 		nSteps++;
 	}
 	if (m_pPSHalfOUtoInterlace) {
@@ -5371,8 +5375,8 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	DLogIf(FAILED(hr3), L"m_Font3D.InitDeviceObjects() failed with error {}", HR2Str(hr3));
 	if (SUCCEEDED(hr3)) {
 		hr3 = m_StatsBackground.InitDeviceObjects(m_pDevice, m_pDeviceContext);
-		hr3 = m_DbleRect.InitDeviceObjects(m_pDevice, m_pDeviceContext);
-		hr3 = m_DbleQuad.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+		hr3 = m_ClipGuardRect.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+		hr3 = m_ClipGuardQuad.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Rect3D.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Underlay.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Lines.InitDeviceObjects(m_pDevice, m_pDeviceContext);
@@ -5384,7 +5388,7 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	// ClipGuard: shaders compiled here, before any ring sizing, so the extra
 	// post-scale step is counted from the first frame.
 	{
-		const HRESULT hrClipGuard = m_Dble.InitDevice(m_pDevice, m_pDeviceContext, GetMLModuleDir());
+		const HRESULT hrClipGuard = m_ClipGuard.InitDevice(m_pDevice, m_pDeviceContext, GetMLModuleDir());
 		DLogIf(FAILED(hrClipGuard), L"ClipGuard: InitDevice failed with error {}", HR2Str(hrClipGuard));
 	}
 
@@ -6816,6 +6820,27 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 	}
 	m_nSkyFrame++;   // render-frame counter for the seg cadence (always)
 
+	// ClipGuard 2.48.0: the calibration LUT for the selected projector (titan.cube /
+	// valerion.cube from ClipGuard Meter's auto-cal). Done here, before the frame
+	// is drawn, because loading switches the final pass on or off.
+	if (m_ClipGuard.Ready()) {
+		if (m_ClipGuard.LutState() == 1 && !m_bCubeLutEnabled) m_ClipGuard.LutForget();   // lost with a device reset
+		std::wstring lutPath;
+		if (m_ClipGuard.LutWanted(lutPath)) {
+			if (lutPath.empty()) {
+				LoadCubeLut("");
+				m_ClipGuard.LutLoaded(true, true);
+			} else {
+				char u8[1024] = {};
+				WideCharToMultiByte(CP_UTF8, 0, lutPath.c_str(), -1, u8, (int)sizeof(u8), nullptr, nullptr);
+				const HRESULT hrLut = LoadCubeLut(u8);
+				if (SUCCEEDED(hrLut)) m_iCubeLutMode = 3;   // full 3D
+				m_ClipGuard.LutLoaded(SUCCEEDED(hrLut), false);
+			}
+			UpdatePostScaleTexures();
+		}
+	}
+
 	// ML params must be refreshed before this frame is processed; keep this
 	// unconditional (only gated by active state) so a stale or zero-filled
 	// constant buffer can never reach the grade shaders.
@@ -7701,11 +7726,12 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 	// DBLE overlay, after the picture and the stats so it is never measured by
 	// the fix; toggled by the app's OSD row and Ctrl+Alt shortcuts.
-	if (m_Dble.Ready() && (m_Dble.OverlayVisible() || m_Dble.ShowViewNote() || m_Dble.HasLogNote())) {
-		DrawDbleOverlay(pBackBuffer);
+	if (m_ClipGuard.Ready() && (m_ClipGuard.OverlayVisible() || m_ClipGuard.InfoVisible() || m_ClipGuard.ShowViewNote() || m_ClipGuard.HasLogNote())) {
+		DrawClipGuardOverlay(pBackBuffer);
 	}
-	if (m_Dble.Ready() && m_Dble.LogPending()) {
-		m_Dble.SaveLog(pBackBuffer);
+	// F11: save the log and a screenshot of this frame.
+	if (m_ClipGuard.Ready() && m_ClipGuard.LogPending()) {
+		m_ClipGuard.SaveLog(pBackBuffer);
 	}
 
 	if (m_bAlphaBitmapEnable) {
@@ -8255,6 +8281,15 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 	const float gamutSrc = (float)SourceGamutId();
 	const float gamutDst = (m_iOutputGamut == 2) ? 2.0f : (m_iOutputGamut == 1 ? 1.0f : 0.0f);
 
+	// ClipGuard 2.45.0: Dither Temporal moves the dither pattern to a new random
+	// whole-texel position every frame, so it averages out instead of sitting
+	// still. Static (0, 0) is the original behaviour.
+	FLOAT ditherOff[2] = { 0.0f, 0.0f };
+	if (m_ClipGuard.TemporalDither()) {
+		m_DitherSeed = m_DitherSeed * 1664525u + 1013904223u;
+		ditherOff[0] = (float)((m_DitherSeed >> 8) % dither_size) / dither_size;
+		ditherOff[1] = (float)((m_DitherSeed >> 20) % dither_size) / dither_size;
+	}
 	// ClipGuard runs in the post-scale chain; this pass only encodes the target.
 	const FLOAT constants[16] = {
 		(float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size,
@@ -8269,7 +8304,7 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		gamutConvert ? 1.0f : 0.0f,
 		gamutSrc,
 		gamutDst,
-		0.0f, 0.0f
+		ditherOff[0], ditherOff[1]   // ClipGuard 2.45.0: temporal dither offset
 	};
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFinalPassConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
@@ -8947,14 +8982,29 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		}
 
 		// ClipGuard: measure the finished SDR picture, then apply the highlight
-		// compensation (and the test views) with look-ahead. After every Unplugged
-		// stage and the custom shaders; before interlaced output and the final
-		// display encode / calibration LUT / dither.
-		if (m_Dble.Ready()) {
+		// roll-off (and the test views). After every Unplugged stage and the custom
+		// shaders; before interlaced output and the final calibration LUT / dither.
+		if (m_ClipGuard.Ready()) {
 			StepSetting();
 			const bool bPqOut = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
 			const bool bBypass = bPqOut || m_bHDRPassthroughRaw;
-			m_Dble.BeginFrame(bBypass, (m_bMLFeaturesReady && m_MLMeanNitsRaw > 0.0f) ? m_MLMeanNitsRaw : -1.0f);
+			m_ClipGuard.BeginFrame(bBypass, (m_bMLFeaturesReady && m_MLMeanNitsRaw > 0.0f) ? m_MLMeanNitsRaw : -1.0f);
+			{
+				// Banner "Skipped": nothing counts until 10 s have been played
+				// since the start or the last seek.
+				const unsigned raw = m_pFilter->m_DrawStats.m_dropped + m_RenderStats.dropped2;
+				if (raw < m_SkipBase) { m_SkipBase = raw; m_SkipGraceT = 0; }   // counters were reset: a new start
+				// The frame count started again: a new file. Its picture may have
+				// another shape, so the remembered one is dropped.
+				const unsigned frames = (unsigned)m_pFilter->m_FrameStats.GetFrames();
+				if (frames < m_LastFrames) m_ClipGuard.AreaReset();
+				m_LastFrames = frames;
+				if (m_SkipGraceT < 100000000) {
+					m_SkipGraceT += (m_rtAvgTimePerFrame > 0) ? m_rtAvgTimePerFrame : 416667;
+					m_SkipBase = raw;
+				}
+			}
+
 			{
 				static ULONGLONG s_cgTrace = 0;
 				const ULONGLONG cgNow = GetTickCount64();
@@ -8962,11 +9012,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 					s_cgTrace = cgNow;
 					char line[192];
 					snprintf(line, sizeof(line),
-						"[CG] en=%d pic=%.2f%% fix=%.3f white=%.3f hot=%d view=%d la=%d grid=%d",
-						m_clipGuard.enabled ? 1 : 0, (double)m_Dble.PicturePct(),
-						(double)m_Dble.FixAmount(), (double)m_Dble.WhiteCeil(),
-						m_Dble.HotActive() ? 1 : 0, m_clipGuard.view,
-						m_clipGuard.lookAhead, m_clipGuard.grid);
+						"[CG] pic=%.2f%% fix=%.3f white=%.3f hot=%d la=%d",
+						(double)m_ClipGuard.PicturePct(), (double)m_ClipGuard.FixAmount(),
+						(double)m_ClipGuard.WhiteCeil(), m_ClipGuard.HotActive() ? 1 : 0,
+						m_ClipGuard.LookAheadFrames());
 					mpcvr::TraceLog(line);
 				}
 			}
@@ -8977,28 +9026,14 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			const float offY = (float)rect.top / inH;
 			const float scX = (float)rect.Width() / inW;
 			const float scY = (float)rect.Height() / inH;
-			const bool bSrc = m_TexConvertOutput.pShaderResource && (m_D3D11VP.IsReady() || m_PSConvColorData.bEnable);
-			const bool bSrcPQ = MLFeatureDomainIsPq();
-			auto bindSource = [&]() {
-				if (bSrc) {
-					m_pDeviceContext->PSSetShaderResources(1, 1, &m_TexConvertOutput.pShaderResource.p);
-					m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerLinear.p);
-				}
-			};
-			auto unbindSource = [&]() {
-				ID3D11ShaderResourceView* nul = nullptr;
-				m_pDeviceContext->PSSetShaderResources(1, 1, &nul);
-			};
 
-			m_Dble.GpuBegin();
+			m_ClipGuard.GpuBegin();
 			if (!bBypass && rect.Width() > 0 && rect.Height() > 0) {
-				m_Dble.FillMeasureCB(scX / m_Dble.CellsX(), scY / m_Dble.CellsY(), offX, offY, scX, scY, bSrc, bSrcPQ);
-				bindSource();
-				const HRESULT hrM = TextureCopyRect(*pInputTexture, m_Dble.MeasureTex(), rect,
-					CRect(0, 0, m_Dble.CellsX(), m_Dble.CellsY()), m_Dble.PSMeasure(), m_Dble.CBMeasure(), 0, false);
-				unbindSource();
+				m_ClipGuard.FillMeasureCB(scX / m_ClipGuard.CellsX(), scY / m_ClipGuard.CellsY(), offX, offY, scX, scY);
+				const HRESULT hrM = TextureCopyRect(*pInputTexture, m_ClipGuard.MeasureTex(), rect,
+					CRect(0, 0, m_ClipGuard.CellsX(), m_ClipGuard.CellsY()), m_ClipGuard.PSMeasure(), m_ClipGuard.CBMeasure(), 0, false);
 				if (SUCCEEDED(hrM)) {
-					m_Dble.EndMeasure();
+					m_ClipGuard.EndMeasure();
 				}
 			}
 
@@ -9007,60 +9042,58 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// lands on the frame it was measured on; beyond 2 it can also start
 			// fading a new spot in before the light appears.
 			const Tex2D_t* pShow = pInputTexture;
-			const UINT la = (UINT)m_Dble.LookAheadFrames();
+			const UINT la = (UINT)m_ClipGuard.LookAheadFrames();
 			if (!bBypass && la > 0) {
 				const UINT ring = la + 1;
-				if (ring != m_DbleDelayRing) {
-					for (auto& t : m_DbleDelay) t.Release();
-					m_DbleDelayRing = ring;
-					m_DbleDelayN = 0;
-					m_DbleDelayPos = 0;
+				if (ring != m_ClipGuardDelayRing) {
+					for (auto& t : m_ClipGuardDelay) t.Release();
+					m_ClipGuardDelayRing = ring;
+					m_ClipGuardDelayN = 0;
+					m_ClipGuardDelayPos = 0;
 				}
 				const D3D11_TEXTURE2D_DESC& d = pInputTexture->desc;
 				bool ok = true;
 				for (UINT i = 0; i < ring; i++) {
-					Tex2D_t& t = m_DbleDelay[i];
+					Tex2D_t& t = m_ClipGuardDelay[i];
 					if (t.desc.Width != d.Width || t.desc.Height != d.Height || t.desc.Format != d.Format) {
-						m_DbleDelayN = 0;
+						m_ClipGuardDelayN = 0;
 						if (FAILED(t.Create(m_pDevice, d.Format, d.Width, d.Height, Tex2D_DefaultShader))) ok = false;
 					}
 				}
 				if (ok && pInputTexture->pTexture) {
-					m_pDeviceContext->CopyResource(m_DbleDelay[m_DbleDelayPos].pTexture, pInputTexture->pTexture);
-					if (m_DbleDelayN >= la) {
-						pShow = &m_DbleDelay[(m_DbleDelayPos + 1) % ring];
+					m_pDeviceContext->CopyResource(m_ClipGuardDelay[m_ClipGuardDelayPos].pTexture, pInputTexture->pTexture);
+					if (m_ClipGuardDelayN >= la) {
+						pShow = &m_ClipGuardDelay[(m_ClipGuardDelayPos + 1) % ring];
 					}
-					m_DbleDelayPos = (m_DbleDelayPos + 1) % ring;
-					m_DbleDelayN = std::min(m_DbleDelayN + 1, ring);
+					m_ClipGuardDelayPos = (m_ClipGuardDelayPos + 1) % ring;
+					m_ClipGuardDelayN = std::min(m_ClipGuardDelayN + 1, ring);
 				}
-			} else if (m_DbleDelayRing) {
-				for (auto& t : m_DbleDelay) t.Release();
-				m_DbleDelayN = 0;
-				m_DbleDelayRing = 0;
+			} else if (m_ClipGuardDelayRing) {
+				for (auto& t : m_ClipGuardDelay) t.Release();
+				m_ClipGuardDelayN = 0;
+				m_ClipGuardDelayRing = 0;
 			}
 
-			m_Dble.FillMainCB(bBypass, offX, offY, scX, scY, bSrc, bSrcPQ, inW);
-			bindSource();
-			hr = TextureCopyRect(*pShow, pRT, rect, rect, m_Dble.PSMain(), m_Dble.CBMain(), 0, false);
-			unbindSource();
-			m_Dble.UnbindMask();
+			m_ClipGuard.FillMainCB(bBypass, offX, offY, scX, scY, inW);
+			hr = TextureCopyRect(*pShow, pRT, rect, rect, m_ClipGuard.PSMain(), m_ClipGuard.CBMain(), 0, false);
+			m_ClipGuard.UnbindMask();
 
 			// While the overlay shows: measure the picture as sent (after the fix),
 			// for the before/after ADL and peak readout.
-			if (!bBypass && SUCCEEDED(hr) && m_Dble.OverlayVisible() && rect.Width() > 0 && rect.Height() > 0) {
+			if (!bBypass && SUCCEEDED(hr) && m_ClipGuard.OverlayVisible() && rect.Width() > 0 && rect.Height() > 0) {
 				D3D11_TEXTURE2D_DESC od = {};
 				pRT->GetDesc(&od);
-				if (SUCCEEDED(m_DbleOut.CheckCreate(m_pDevice, od.Format, od.Width, od.Height, Tex2D_DefaultShader))) {
+				if (SUCCEEDED(m_ClipGuardOut.CheckCreate(m_pDevice, od.Format, od.Width, od.Height, Tex2D_DefaultShader))) {
 					const D3D11_BOX box = { (UINT)rect.left, (UINT)rect.top, 0, (UINT)rect.right, (UINT)rect.bottom, 1 };
-					m_pDeviceContext->CopySubresourceRegion(m_DbleOut.pTexture, 0, (UINT)rect.left, (UINT)rect.top, 0, pRT, 0, &box);
-					const HRESULT hrO = TextureCopyRect(m_DbleOut, m_Dble.MeasureOutTex(), rect,
-						CRect(0, 0, m_Dble.CellsX(), m_Dble.CellsY()), m_Dble.PSMeasure(), m_Dble.CBMeasure(), 0, false);
+					m_pDeviceContext->CopySubresourceRegion(m_ClipGuardOut.pTexture, 0, (UINT)rect.left, (UINT)rect.top, 0, pRT, 0, &box);
+					const HRESULT hrO = TextureCopyRect(m_ClipGuardOut, m_ClipGuard.MeasureOutTex(), rect,
+						CRect(0, 0, m_ClipGuard.CellsX(), m_ClipGuard.CellsY()), m_ClipGuard.PSMeasure(), m_ClipGuard.CBMeasure(), 0, false);
 					if (SUCCEEDED(hrO)) {
-						m_Dble.EndMeasureOut();
+						m_ClipGuard.EndMeasureOut();
 					}
 				}
 			}
-			m_Dble.GpuEnd();
+			m_ClipGuard.GpuEnd();
 		}
 
 		if (m_pPSHalfOUtoInterlace) {
@@ -9685,9 +9718,9 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.clipGuard.logRequest != m_clipGuard.logRequest)
-		m_Dble.RequestLog(config.clipGuard.logRequest);
+		m_ClipGuard.RequestLog(config.clipGuard.logRequest);
 	m_clipGuard = config.clipGuard;
-	m_Dble.SetNativeSettings(m_clipGuard);
+	m_ClipGuard.SetNativeSettings(m_clipGuard);   // used only while ClipGuard.exe is not running
 	{
 		static bool s_cgTrace = false;
 		if (!s_cgTrace) {
@@ -10205,6 +10238,7 @@ void CDX11VideoProcessor::Flush()
 	}
 
 	m_rtStart = 0;
+	m_SkipGraceT = 0;   // banner "Skipped": the 10 s start again after a seek
 
 	m_DoviExtensionMetadata = {};
 #ifndef NDEBUG
@@ -10495,49 +10529,47 @@ void CDX11VideoProcessor::UpdateStatsPostProc()
 }
 */
 
-// DBLEFix measurement shader. Ported from the contributed DbleFix.h: each
-// output cell is the mean of 64 samples (8x8) of the finished SDR picture,
-// with the linear-light weight; the second channel is the cell's brightest
-// sample, which is what finds the picture inside letterbox bars and detects
-// clipping. It writes to a 128x72 R16G16B16A16_FLOAT target.
-void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
+// ClipGuard overlay: a dark, slightly see-through panel with rounded corners
+// at the bottom left of the active picture (inside the black bars): title, the settings in three sections (the
+// selected one on a blue bar), the keys, and the readout. Kept dim so it does
+// not set off the projector's laser dimming. In Split screen and Side by side
+// a note sits above the picture. Drawn on the back buffer after the video, so
+// it is never measured by the fix.
+
+void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 {
 	if (m_windowRect.IsRectEmpty()) {
 		return;
 	}
-	{
-		static bool s_cgDraw = false;
-		if (!s_cgDraw) {
-			s_cgDraw = true;
-			mpcvr::TraceLog("[CG] overlay draw entered");
-		}
-	}
 	const SIZE rtSize = m_windowRect.Size();
-	m_Dble.EnsureFont(rtSize.cy);
-	const int u = (int)m_Dble.FontH();
+	m_ClipGuard.EnsureFont(rtSize.cy);
+	const int u = (int)m_ClipGuard.FontH();
 	if (u <= 0) {
 		return;
 	}
-	CD3D11Font& fM = m_Dble.Font();
-	CD3D11Font& fS = m_Dble.FontS();
-	CD3D11Font& fT = m_Dble.FontT();
+	CD3D11Font& fM = m_ClipGuard.Font();
+	CD3D11Font& fS = m_ClipGuard.FontS();
+	CD3D11Font& fT = m_ClipGuard.FontT();
+	CD3D11Font& fB = m_ClipGuard.FontB();
+	CD3D11Font& fH = m_ClipGuard.FontHd();
 
-	CRect video;
-	if (m_clipGuard.osdW > 0 && m_clipGuard.osdH > 0) {
-		video.SetRect(m_clipGuard.osdX, m_clipGuard.osdY,
-		              m_clipGuard.osdX + m_clipGuard.osdW, m_clipGuard.osdY + m_clipGuard.osdH);
-	} else {
-		video = m_videoRect;
-	}
+	CRect video = m_videoRect;
 	video.IntersectRect(video, CRect(0, 0, rtSize.cx, rtSize.cy));
 	if (video.IsRectEmpty()) {
 		video.SetRect(0, 0, rtSize.cx, rtSize.cy);
 	}
 
-	// The overlay is LOCKED to the bottom-left of the app's safe area. The
-	// contribution positioned itself from the measured bars, which moves frame
-	// to frame; the app's rect is the only stable anchor.
+	// The active picture: the video without its black bars (as measured).
 	int actTop = (int)video.top, actBot = (int)video.bottom;
+	{
+		const float vh = (float)video.Height();
+		actTop += (int)(m_ClipGuard.StableTopBarFrac() * vh);
+		actBot -= (int)(m_ClipGuard.StableBottomBarFrac() * vh);
+		if (actBot - actTop < u * 6) {
+			actTop = (int)video.top;
+			actBot = (int)video.bottom;
+		}
+	}
 
 	CComPtr<ID3D11RenderTargetView> pRTV;
 	if (FAILED(m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRTV))) {
@@ -10546,17 +10578,19 @@ void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
 
 	// Colours (premultiplied for the see-through ones).
 	auto pm = [](int a, int r, int g, int b) { return D3DCOLOR_ARGB(a, r * a / 255, g * a / 255, b * a / 255); };
-	const D3DCOLOR cPanel = pm(205, 10, 12, 18), cEdge = D3DCOLOR_XRGB(70, 74, 84), cRule = D3DCOLOR_XRGB(55, 58, 66);
-	const D3DCOLOR cSelBar = pm(230, 232, 85, 31), cSelEdge = D3DCOLOR_XRGB(255, 138, 76);
-	const D3DCOLOR cText = D3DCOLOR_XRGB(150, 150, 150), cTextSel = D3DCOLOR_XRGB(195, 200, 210);
-	const D3DCOLOR cDim = D3DCOLOR_XRGB(95, 95, 100), cHead = D3DCOLOR_XRGB(232, 85, 31), cTitle = D3DCOLOR_XRGB(175, 175, 180);
-	const D3DCOLOR cBlue = D3DCOLOR_XRGB(232, 85, 31), cBlueSel = D3DCOLOR_XRGB(255, 138, 76), cYellow = D3DCOLOR_XRGB(200, 175, 70);
-	const D3DCOLOR cKeyCap = D3DCOLOR_XRGB(35, 40, 52), cKeyEdge = D3DCOLOR_XRGB(80, 86, 98), cKeyText = D3DCOLOR_XRGB(170, 175, 185);
+	// The Unplugged menu's palette: near-black panel, orange accent, off-white text.
+	const D3DCOLOR cPanel = pm(240, 12, 14, 14), cEdge = D3DCOLOR_XRGB(150, 150, 150), cRule = D3DCOLOR_XRGB(48, 50, 52);
+	const D3DCOLOR cSelBar = D3DCOLOR_XRGB(33, 35, 37);
+	const D3DCOLOR cText = D3DCOLOR_XRGB(226, 226, 226), cTextSel = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cDim = D3DCOLOR_XRGB(128, 128, 128), cSub = D3DCOLOR_XRGB(176, 176, 176), cTitle = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cOrange = D3DCOLOR_XRGB(245, 97, 26), cKnob = D3DCOLOR_XRGB(255, 147, 71), cInk = D3DCOLOR_XRGB(10, 10, 10);
+	const D3DCOLOR cKeyCap = D3DCOLOR_XRGB(33, 35, 37), cKeyEdge = D3DCOLOR_XRGB(96, 98, 100), cKeyText = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cWhite = D3DCOLOR_XRGB(255, 255, 255);
 
 	auto fill = [&](int x0, int y0, int x1, int y1, D3DCOLOR c) {
 		if (x1 <= x0 || y1 <= y0) return;
-		m_DbleRect.Set({ x0, y0, x1, y1 }, rtSize, c);
-		m_DbleRect.Draw(pRTV, rtSize);
+		m_ClipGuardRect.Set({ x0, y0, x1, y1 }, rtSize, c);
+		m_ClipGuardRect.Draw(pRTV, rtSize);
 	};
 	// Inset of a rounded rectangle's edge on scanline j (0 = top) of r rows.
 	auto inset = [](int j, int r) {
@@ -10598,25 +10632,498 @@ void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
 	auto text = [&](CD3D11Font& f, int x, int y, D3DCOLOR c, const std::wstring& s) {
 		f.Draw2DText(pRTV, rtSize, (float)x, (float)y, c, s.c_str());
 	};
-	auto styleColor = [&](int st, bool sel) {
-		if (st == 3) return cYellow;
-		if (st == 2) return cDim;
-		if (st == 1) return sel ? cBlueSel : cBlue;
+	// Settings rows: values off-white, Off and hints grey. Readout lines: what
+	// is active in the lighter orange, notes in orange, the cost line grey.
+	auto rowColor = [&](int st, bool sel) {
+		if (st == 3 || st == 2) return cDim;
 		return sel ? cTextSel : cText;
 	};
+	auto lineColor = [&](int st) {
+		if (st == 3) return cOrange;
+		if (st == 2) return cDim;
+		if (st == 1) return cKnob;
+		return cText;
+	};
+	auto ndcX = [&](float x) { return x * 2.0f / rtSize.cx - 1.0f; };
+	auto ndcY = [&](float y) { return 1.0f - y * 2.0f / rtSize.cy; };
+	// A right-pointing triangle sz pixels high (the menu's section arrow).
+	auto tri = [&](int x, int y, int sz, D3DCOLOR c) {
+		const float l = (float)x, t = (float)y, b = (float)(y + sz), rr = (float)x + 0.7f * (float)sz, m = (float)y + 0.5f * (float)sz;
+		m_ClipGuardQuad.Set(ndcX(l), ndcY(t), ndcX(rr), ndcY(m), ndcX(rr), ndcY(m), ndcX(l), ndcY(b), c);
+		m_ClipGuardQuad.Draw(pRTV, rtSize);
+	};
+	// A section heading: arrow and bold capitals in orange. Returns its right edge.
+	auto heading = [&](int x, int y, const std::wstring& s) {
+		const int sz = u * 3 / 5;
+		tri(x, y + u / 8, sz, cOrange);
+		text(fH, x + sz, y, cOrange, s);
+		return x + sz + width(fH, s);
+	};
+
+	// ---- info banner (F6) ---------------------------------------------------------
+	// Along the top of the picture: large badges for the essentials on the left,
+	// live status badges on the right, and below them one column per group
+	// with every detail, in the Unplugged menu's look. kind: 0 = normal, 1 = active, 2 = worth a look.
+	if (m_ClipGuard.InfoVisible()) {
+		struct InfoItem { std::wstring t; int k; };
+		struct InfoGroup { std::wstring name; std::vector<InfoItem> items; std::vector<std::wstring> wide; };   // wide: the widest lines it can show, so the column keeps one width
+		struct InfoBadge { std::wstring t; bool hot; std::wstring wide; };   // wide: widest text it can show, so it keeps one width
+		std::vector<InfoGroup> groups;
+		std::vector<InfoBadge> left, right;
+
+		const bool bHDRsrc = SourceIsHDR();
+		const bool bPQsrc = m_decExFmt.VideoTransferFunction == MFVideoTransFunc_2084;
+		const bool bHLGsrc = m_decExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
+		const double fpsIn = m_pFilter->m_FrameStats.GetAverageFps();
+		const double fpsOut = m_pFilter->m_DrawStats.GetAverageFps();
+		const wchar_t scan = (m_SampleFormat != D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE) ? L'i' : L'p';
+		LPCSTR fx[6] = {};
+		const bool bYUV = m_srcParams.CSType == CS_YUV;
+		if (bYUV) {
+			GetExtendedFormatString(fx, m_srcExFmt, m_srcParams.CSType);
+		}
+		auto fxStr = [&](int i) { return (bYUV && fx[i]) ? A2WStr(fx[i]) : std::wstring(); };
+		// Bit depth: P010, P210, Y210 and Y410 hold 10 bits in a 16-bit container.
+		int srcBits = m_srcParams.CDepth;
+		if (m_srcParams.str) {
+			const std::wstring_view fn(m_srcParams.str);
+			if (fn == L"P010" || fn == L"P210" || fn == L"Y210" || fn == L"Y410") srcBits = 10;
+		}
+
+		// Badges on the left: size class, HDR type, frame rate, primaries, bit depth.
+		{
+			const UINT w = m_srcRectWidth, h = m_srcRectHeight;
+			left.push_back({ (w >= 3800 || h >= 2100) ? L"4K" : (w >= 2500 || h >= 1400) ? L"1440p" : (w >= 1900 || h >= 1000) ? L"1080p"
+				: (w >= 1200 || h >= 700) ? L"720p" : L"SD", false });
+			left.push_back({ m_Dovi.bValid ? L"DOLBY VISION" : bPQsrc ? L"HDR10" : bHLGsrc ? L"HLG" : L"SDR", bHDRsrc });
+			if (fpsIn > 1.0) left.push_back({ std::format(L"{:.3f}{}", fpsIn, scan), false });
+			if (!fxStr(4).empty()) left.push_back({ fxStr(4), false });
+			if (srcBits > 0) left.push_back({ std::format(L"{}-bit", srcBits), false });
+		}
+
+		// SOURCE
+		{
+			InfoGroup g{ L"SOURCE", {} };
+			g.items.push_back({ fpsIn > 1.0 ? std::format(L"{} x {}, {:.3f} fps in", m_srcRectWidth, m_srcRectHeight, fpsIn)
+				: std::format(L"{} x {}", m_srcRectWidth, m_srcRectHeight), 0 });
+			if (m_srcParams.str) {
+				std::wstring f = m_srcParams.str;
+				if (srcBits > 0 && bYUV) {
+					f += std::format(L" {}-bit {}", srcBits,
+						m_srcParams.Subsampling == 420 ? L"4:2:0" : m_srcParams.Subsampling == 422 ? L"4:2:2" : L"4:4:4");
+				}
+				g.items.push_back({ f, 0 });
+			}
+			if (m_Dovi.bValid) {
+				g.items.push_back({ L"Dolby Vision", 1 });
+			} else if (bYUV) {
+				std::wstring mx = fxStr(2).empty() ? std::wstring() : L"Matrix " + fxStr(2);
+				if (!fxStr(1).empty()) mx += (mx.empty() ? L"Range " : L", range ") + fxStr(1);
+				if (!mx.empty()) g.items.push_back({ mx, 0 });
+				if (!fxStr(5).empty()) g.items.push_back({ L"Transfer " + fxStr(5), 0 });
+			}
+			// The picture inside the black bars, as its aspect ratio (measured on
+			// the grid, so snapped to the usual ratios when within 1.5%).
+			{
+				float wf = 1.0f, hf = 1.0f;
+				if (m_ClipGuard.PictureArea(wf, hf) && hf > 0.01f && m_srcRectHeight) {
+					double ar = ((double)m_srcRectWidth * wf) / ((double)m_srcRectHeight * hf);
+					static const double usual[] = { 1.33, 1.37, 1.66, 1.78, 1.85, 1.90, 2.00, 2.20, 2.35, 2.39, 2.76 };
+					double best = ar;
+					double bestD = 0.015;
+					for (const double v : usual) {
+						const double dd = fabs(ar / v - 1.0);
+						if (dd < bestD) { bestD = dd; best = v; }
+					}
+					g.items.push_back({ std::format(L"Picture area {:.2f}:1", best), 0 });
+				}
+			}
+			groups.push_back(g);
+		}
+		// HDR metadata (ST 2086 as the renderer read it from the file)
+		if (bHDRsrc) {
+			InfoGroup g{ L"HDR", {} };
+			UINT cll = m_hdr10Cll, fall = m_hdr10Fall, mmax = m_hdr10Mmax, mmin = m_hdr10Mmin;
+			if (m_Dovi.bValid) {
+				if (m_DoviMaxContentLightLevel) cll = m_DoviMaxContentLightLevel;
+				if (m_DoviMaxFrameAverageLightLevel) fall = m_DoviMaxFrameAverageLightLevel;
+				if (m_DoviMaxMasteringLuminance) { mmax = m_DoviMaxMasteringLuminance; mmin = m_DoviMinMasteringLuminance; }
+			}
+			if (cll) g.items.push_back({ std::format(L"MaxCLL {}", cll), 0 });
+			if (fall) g.items.push_back({ std::format(L"MaxFALL {}", fall), 0 });
+			if (mmax) g.items.push_back({ std::format(L"Master {:.4f} - {} nits", (double)mmin / 10000.0, mmax), 0 });
+			if (m_Dovi.bValid && m_DoviExtensionMetadata.L1.present)
+				g.items.push_back({ std::format(L"Scene max {} nits (Dolby Vision)", (UINT)m_DoviExtensionMetadata.L1.max_pq), 0 });
+			if (g.items.empty()) g.items.push_back({ L"None received", 2 });
+			groups.push_back(g);
+		}
+		// PROCESS
+		const UINT dstW = m_videoRect.Width(), dstH = m_videoRect.Height();
+		{
+			InfoGroup g{ L"PROCESS", {} };
+			g.items.push_back({ m_D3D11VP.IsReady() ? L"D3D11 VP" : L"Shaders", 0 });
+			if (m_srcRectWidth != dstW || m_srcRectHeight != dstH) {
+				// A scale within 2% of 1:1 is a near miss (a window just short of
+				// the screen): the picture is resampled for no gain.
+				const double sx = m_srcRectWidth ? (double)dstW / (double)m_srcRectWidth : 1.0;
+				const bool nearMiss = sx > 0.98 && sx < 1.02;
+				if (m_strShaderX) g.items.push_back({ m_strShaderX, 0 });
+				else if (m_strShaderY) g.items.push_back({ m_strShaderY, 0 });
+				g.items.push_back({ std::format(L"Scaled to {} x {}", dstW, dstH), nearMiss ? 2 : 0 });
+			} else {
+				g.items.push_back({ L"1:1, no scaling", 0 });
+			}
+			// 2.43.2: how colour (chroma) is upscaled
+			{
+				static const wchar_t* kChroma[CHROMA_COUNT] = { L"Nearest", L"Bilinear", L"Catmull-Rom", L"KrigBilateral" };
+				const int sub = m_srcParams.Subsampling;
+				std::wstring c;
+				if (m_D3D11VP.IsReady()) c = L"Chroma by D3D11 VP";
+				else if (sub == 444 || sub == 0) c = L"Chroma 4:4:4, none needed";
+				else c = std::format(L"Chroma {} {}", kChroma[std::clamp(m_iChromaScaling, 0, CHROMA_COUNT - 1)], sub == 420 ? L"4:2:0" : L"4:2:2");
+				g.items.push_back({ c, 0 });
+			}
+			if (m_strCorrection) g.items.push_back({ m_strCorrection, 0 });
+			g.items.push_back({ m_bDitherUsed ? L"Dither On" : L"Dither Off", 0 });
+			groups.push_back(g);
+		}
+		// UNPLUGGED
+		{
+			InfoGroup g{ L"UNPLUGGED", {} };
+			if (m_bMLFeaturesReady) {
+				// Always shown (0 on a black frame), so the lines below don't move.
+				g.items.push_back({ std::format(L"Scene {:.0f} nits", std::max(0.0f, m_MLMeanNitsRaw)), 0 });
+				g.wide = { L"Scene 0000 nits" };
+			}
+			g.items.push_back({ m_bMLActive ? L"ML Grade On" : L"ML Grade Off", m_bMLActive ? 1 : 0 });
+			if (m_bMLActive) {
+				const bool mc = m_lastMLParams.MCStrength > 0.0f;
+				g.items.push_back({ mc ? L"Micro contrast On" : L"Micro contrast Off", mc ? 1 : 0 });
+			}
+			groups.push_back(g);
+		}
+		// OUTPUT: the display line of the statistics, the adapter, the drawn rate.
+		{
+			InfoGroup g{ L"OUTPUT", {} };
+			std::wstring d = m_strStatsDispInfo;
+			auto cut = [&](const wchar_t* what) {
+				const size_t i = d.find(what);
+				if (i != std::wstring::npos) d.erase(i, wcslen(what));
+				return i != std::wstring::npos;
+			};
+			cut(L"\nDisplay: ");
+			std::wstring color;
+			{
+				const size_t i = d.find(L"\n  Color: ");
+				if (i != std::wstring::npos) { color = d.substr(i + 10); d.erase(i); }
+			}
+			cut(L" Primary");
+			const bool exclusive = cut(L" exclusive");
+			cut(L" windowed");
+			if (!d.empty()) g.items.push_back({ d, 0 });
+			if (!color.empty()) g.items.push_back({ color, 0 });
+			// 2.43.2: the colour space the picture is sent in
+			{
+				const bool pq = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+				const bool src2020 = (m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) || m_Dovi.bValid;   // Dolby Vision is rebuilt in BT.2020
+				const wchar_t* gm = (pq || src2020 || m_iOutputGamut == 1) ? L"Gamut BT.2020"
+					: L"Gamut BT.709";
+				g.items.push_back({ gm, 0 });
+			}
+			if (fpsOut > 1.0) g.items.push_back({ std::format(L"{:.3f} fps drawn", fpsOut), 0 });
+			g.items.push_back({ std::format(L"{} {} x {}", exclusive ? L"Exclusive" : L"Window", (int)rtSize.cx, (int)rtSize.cy), 0 });
+			{
+				std::wstring a = m_strAdapterDescription;
+				const size_t i = a.find(L" (");
+				if (i != std::wstring::npos) a.erase(i);
+				if (!a.empty()) g.items.push_back({ a, 0 });
+			}
+			groups.push_back(g);
+		}
+		// SYNC
+		{
+			InfoGroup g{ L"SYNC", {} };
+			g.wide = { L"Frames 00000000", L"Skipped 00000", L"Offset +0000 ms", L"ClipGuard GPU 00.00 ms", L"ClipGuard CPU 00.00 ms", L"GPU load 100%", L"GPU memory 00.0 of 00.0 GB" };
+			const unsigned skippedAll = m_pFilter->m_DrawStats.m_dropped + m_RenderStats.dropped2;
+			const unsigned skipped = skippedAll > m_SkipBase ? skippedAll - m_SkipBase : 0;   // not those of the first 10 s
+			g.items.push_back({ std::format(L"Frames {}", m_pFilter->m_FrameStats.GetFrames()), 0 });
+			g.items.push_back({ std::format(L"Skipped {}", skipped), skipped ? 2 : 0 });
+			g.items.push_back({ std::format(L"Offset {:+} ms", (m_RenderStats.syncoffset + 5000) / 10000), 0 });
+			if (m_ClipGuard.GpuMs() >= 0.0) g.items.push_back({ std::format(L"ClipGuard GPU {:.2f} ms", m_ClipGuard.GpuMs()), 0 });
+			g.items.push_back({ std::format(L"ClipGuard CPU {:.2f} ms", m_ClipGuard.CpuMs()), 0 });
+			// The card's load as Windows reports it (Task Manager's 3D figure).
+			if (m_ClipGuard.GpuLoad() >= 0.0f) {
+				const float load = m_ClipGuard.GpuLoad();
+				g.items.push_back({ std::format(L"GPU load {:.0f}%", load), load >= 85.0f ? 2 : 0 });
+			}
+			// Video memory this player uses, and what Windows allows it (read twice a second).
+			{
+				static ULONGLONG sMemTick = 0;
+				static double sMemUsed = -1.0, sMemBudget = 0.0;
+				const ULONGLONG nowTick = GetTickCount64();
+				if (nowTick - sMemTick >= 500 && m_pDevice) {
+					sMemTick = nowTick;
+					CComQIPtr<IDXGIDevice> pDxgiDev(m_pDevice.p);
+					CComPtr<IDXGIAdapter> pAd;
+					if (pDxgiDev && SUCCEEDED(pDxgiDev->GetAdapter(&pAd)) && pAd) {
+						CComQIPtr<IDXGIAdapter3> pAd3(pAd);
+						DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+						if (pAd3 && SUCCEEDED(pAd3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) {
+							sMemUsed = (double)mi.CurrentUsage / 1073741824.0;
+							sMemBudget = (double)mi.Budget / 1073741824.0;
+						}
+					}
+				}
+				if (sMemUsed >= 0.0) g.items.push_back({ std::format(L"GPU memory {:.1f} of {:.1f} GB", sMemUsed, sMemBudget), 0 });
+			}
+			groups.push_back(g);
+		}
+		// CLIPGUARD: the fix and its settings. HOT SPOTS: the lights.
+		{
+			const auto ci = m_ClipGuard.GetInfo();
+			InfoGroup g{ std::wstring(L"CLIPGUARD ") + m_ClipGuard.VersionText(), {} };
+			InfoGroup h{ L"HOT SPOTS", {} };
+			g.wide = { L"Picture 100.0%, peak 100%", L"Guard 100%, white 100%", L"Strength 0.00, Normal", L"Strength 0.00, Anchor", L"Look-ahead 6 frames", L"Look-ahead 6 frames (Kaleidescape)", L"High Performance", L"Look-ahead Off", L"Normal grid", L"Titan Noir Max DBLE High (Predictive)", L"Titan Noir Max DBLE Low (Predictive)", L"Projector Universal (Reactive)", L"Laser 100%, clips above 255", L"DBLE level 255", L"Firmware V1.3.38", L"LUT: Valerion, BT.2020 BT.1886, dE 0.8, 17 Nov" };
+			h.wide = { L"16 lights, 16 dimmed", L"Hot spot 0.00, Patch", L"Hot spot 0.00, Pixel", L"Below 10.0%: holding off", L"Below 10.0%: at 100%", L"16 lamps, 16 strips", L"16 fires left alone", L"16 graded to 100%", L"No graded spots" };
+			// 2.46.0: the projector mode is always shown.
+			if (m_ClipGuard.MeasuredMode()) {
+				// 2.47.0: the measured model replaces the Guard and Hot spot rules; show what it predicts.
+				g.items.push_back({ m_ClipGuard.ProjectorName(), 0 });   // 2.60.0: DBLE High or DBLE Low
+				g.items.push_back({ L"Firmware V1.3.38", 0 });
+				if (!m_ClipGuard.FixOn()) {
+					g.items.push_back({ L"Guard Off", 2 });
+				} else if (m_ClipGuard.RampStale()) {
+					g.items.push_back({ L"No video: prediction paused", 0 });
+				} else if (m_ClipGuard.Measured()) {
+					const float rp = m_ClipGuard.RampPct();
+					g.items.push_back({ rp < 99.5f ? std::format(L"Laser {:.0f}%, clips above {:.0f}", rp, m_ClipGuard.ClipLevel()) : std::wstring(L"Laser 100%, no clipping"), rp < 99.5f ? 1 : 0 });
+					g.items.push_back({ std::format(L"DBLE level {:.0f}", m_ClipGuard.DbleLevel()), 0 });
+					g.items.push_back({ ci.kscape ? std::format(L"Look-ahead {} frames (Kaleidescape)", ci.lookAhead) : ci.lookAhead >= 12 ? std::wstring(L"High Performance") : (ci.lookAhead > 0 ? std::format(L"Look-ahead {} frames", ci.lookAhead) : std::wstring(L"Look-ahead Off")), 0 });
+				} else {
+					g.items.push_back({ L"Measuring", 0 });
+				}
+				h.items.push_back({ L"Predictive model", 0 });
+			} else {
+				g.items.push_back({ L"Projector Universal (Reactive)", 0 });
+			}
+			// 2.48.0: the calibration LUT, as the renderer has it.
+			if (m_ClipGuard.Lut() != 0) {   // 2.50.0: the LUT row, not the projector
+				const int ls = m_ClipGuard.LutState();
+				if (ls == 1 && m_bCubeLutEnabled)
+					g.items.push_back({ L"LUT: " + m_ClipGuard.LutDesc() + L" (on)", 0 });
+				else if (ls == 2)
+					g.items.push_back({ L"LUT: failed to load", 2 });
+				else if (ls == 3)
+					g.items.push_back({ L"LUT: off (F5)", 1 });
+				else
+					g.items.push_back({ L"LUT: none", 0 });
+			}
+			if (m_ClipGuard.MeasuredMode()) {
+				// shown above
+			} else if (!m_ClipGuard.FixOn()) {
+				g.items.push_back({ L"Guard Off", 2 });
+			} else if (m_ClipGuard.Measured()) {
+				g.items.push_back({ std::format(L"Picture {:.1f}%, peak {:.0f}%", ci.picture, ci.peak), 0 });
+				g.items.push_back({ std::format(L"Guard {:.0f}%, white {:.0f}%", ci.fix, ci.white), ci.fix >= 0.5f ? 1 : 0 });
+				g.items.push_back({ std::format(L"Strength {:.2f}, {}", ci.strength, ci.fixShape == 1 ? L"Anchor" : L"Normal"), 0 });
+				g.items.push_back({ ci.kscape ? std::format(L"Look-ahead {} frames (Kaleidescape)", ci.lookAhead) : ci.lookAhead >= 12 ? std::wstring(L"High Performance") : (ci.lookAhead > 0 ? std::format(L"Look-ahead {} frames", ci.lookAhead) : std::wstring(L"Look-ahead Off")), 0 });
+				g.items.push_back({ ci.grid ? L"Fine grid" : L"Normal grid", 0 });
+
+				const int spots = m_ClipGuard.SpotsDimmed();
+				if (ci.hotSpot <= 0.0f) {
+					h.items.push_back({ L"Hot spot Off", 2 });
+				} else {
+					h.items.push_back({ ci.lights ? std::format(L"{} light{}, {} dimmed", ci.lights, ci.lights == 1 ? L"" : L"s", spots) : std::wstring(L"No lights"), spots ? 1 : 0 });
+					h.items.push_back({ std::format(L"Hot spot {:.2f}, {}", ci.hotSpot, m_ClipGuard.PixelMask() ? L"Pixel" : L"Patch"), 0 });
+					h.items.push_back({ ci.gate >= 0.999f ? std::format(L"Below {:.1f}%: on", ci.hotBelow)
+						: ci.gate <= 0.001f ? std::format(L"Below {:.1f}%: holding off", ci.hotBelow)
+						: std::format(L"Below {:.1f}%: at {:.0f}%", ci.hotBelow, ci.gate * 100.0f), 0 });
+					h.items.push_back({ std::format(L"{} lamp{}, {} strip{}", ci.lamps, ci.lamps == 1 ? L"" : L"s", ci.strips, ci.strips == 1 ? L"" : L"s"), 0 });
+					if (ci.fires > 0) h.items.push_back({ std::format(L"{} fire{} left alone", ci.fires, ci.fires == 1 ? L"" : L"s"), 0 });
+					h.items.push_back({ ci.graded ? std::format(L"{} graded to {:.0f}%", ci.graded, ci.gradeCeil) : std::wstring(L"No graded spots"), ci.graded ? 1 : 0 });
+				}
+			} else {
+				g.items.push_back({ L"Measuring", 0 });
+			}
+			groups.push_back(g);
+			// Always there, so the columns keep their places.
+			if (h.items.empty()) h.items.push_back({ m_ClipGuard.FixOn() ? L"Measuring" : L"Guard Off", 0 });
+			groups.push_back(h);
+		}
+		// Status badges on the right.
+		if (m_ClipGuard.MeasuredMode() && m_ClipGuard.FixOn() && m_ClipGuard.RampStale()) {
+			right.push_back({ std::wstring(L"NO VIDEO"), false, L"CLIPS ABOVE 000" });
+		} else if (m_ClipGuard.MeasuredMode() && m_ClipGuard.FixOn() && m_ClipGuard.Measured()) {
+			// 2.47.0: Titan Noir Max: what the model predicts instead of the Guard amount.
+			const float cl = m_ClipGuard.ClipLevel();
+			right.push_back({ cl < 254.5f ? std::format(L"CLIPS ABOVE {:.0f}", cl) : std::wstring(L"NO CLIPPING"), cl < 254.5f, L"CLIPS ABOVE 000" });
+		} else if (m_ClipGuard.FixOn() && m_ClipGuard.Measured()) {
+			const int spots = m_ClipGuard.SpotsDimmed();
+			right.push_back({ std::format(L"GUARD {:.0f}%", m_ClipGuard.FixPct()), m_ClipGuard.FixPct() >= 0.5f, L"GUARD 100%" });
+			// Always shown while Hot spot is on (unlit at 0), so the row doesn't shift.
+			if (m_ClipGuard.GetInfo().hotSpot > 0.0f) right.push_back({ std::format(L"{} HOT SPOT{}", spots, spots == 1 ? L"" : L"S"), spots > 0, L"00 HOT SPOTS" });
+		} else {
+			right.push_back({ L"GUARD OFF", false, L"GUARD 100%" });
+			if (m_ClipGuard.GetInfo().hotSpot > 0.0f) right.push_back({ L"0 HOT SPOTS", false, L"00 HOT SPOTS" });
+		}
+		if (m_bMLFeaturesReady) right.push_back({ std::format(L"SCENE {:.0f} NITS", std::max(0.0f, m_MLMeanNitsRaw)), false, L"SCENE 0000 NITS" });
+		if (bHDRsrc && m_hdr10Cll) right.push_back({ std::format(L"MAXCLL {}", m_hdr10Cll), false });
+
+		// Layout: a row of large badges, then one column per group (its heading,
+		// then its values one under another), sized to be read from a seat.
+		const int bx0 = video.left, bx1 = video.right, by0 = actTop;
+		const int padX = u * 3 / 2, padY = u * 4 / 5;
+		const int hB = u * 3, bhB = hB * 4 / 3, hT = u * 3 / 2, bhT = hT * 3 / 2;
+		const int avail = (bx1 - bx0) - padX * 2;
+		// The columns in the large text when they all fit in one row, else in
+		// the menu's text size.
+		int hL = u * 31 / 20, hG = u * 13 / 10, minGap = u * 3 / 2;
+		CD3D11Font* pL = &m_ClipGuard.FontL();
+		CD3D11Font* pG = &m_ClipGuard.FontG();
+		// The layout is kept from frame to frame: a column never gets narrower,
+		// the banner never shorter and the text never switches size back while
+		// the window and the set of columns stay the same, so only the numbers
+		// change and nothing moves.
+		static int sAvail = 0, sU = 0, sPass = 0, sBh = 0;
+		static size_t sN = 0;
+		static bool sBadgeSmall = false;
+		static std::vector<int> sColW;
+		if (sAvail != avail || sU != u || sN != groups.size()) {
+			sAvail = avail; sU = u; sN = groups.size();
+			sPass = 0; sBh = 0; sBadgeSmall = false;
+			sColW.assign(groups.size(), 0);
+		}
+		std::vector<int> colW(groups.size());
+		int sumW = 0;
+		for (int pass = sPass; pass < 2; pass++) {
+			if (pass == 1) {
+				hL = u; hG = std::max(9, u * 4 / 5); minGap = u;
+				pL = &fM; pG = &fH;
+			}
+			sumW = 0;
+			for (size_t i = 0; i < groups.size(); i++) {
+				int w = hG * 3 / 5 + hG / 3 + width(*pG, groups[i].name);
+				for (const auto& it : groups[i].items) w = std::max(w, width(*pL, it.t) + (it.k == 2 ? hL + hL / 3 : 0));
+				for (const auto& t : groups[i].wide) w = std::max(w, width(*pL, t));
+				if (pass == sPass) w = std::max(w, sColW[i]);
+				colW[i] = w;
+				sumW += w;
+			}
+			if (pass == 1 || groups.empty() || sumW + (int)(groups.size() - 1) * minGap <= avail) {
+				if (sPass != pass) sBh = 0;   // smaller text: the height is worked out afresh
+				sPass = pass;
+				break;
+			}
+		}
+		sColW = colW;
+		CD3D11Font& fL = *pL;
+		CD3D11Font& fG = *pG;
+		const int rowH = hL * 27 / 20, headH = hL * 13 / 10;
+		const int warnW = hL;
+		// Columns side by side, spread over the width; when they don't fit
+		// (a small window) they wrap into a second band, and a third.
+		std::vector<std::vector<size_t>> bands(1);
+		{
+			int x = 0;
+			for (size_t i = 0; i < groups.size(); i++) {
+				if (!bands.back().empty() && x + colW[i] > avail && bands.size() < 3) {
+					bands.emplace_back();
+					x = 0;
+				}
+				bands.back().push_back(i);
+				x += colW[i] + minGap;
+			}
+		}
+		int gap = minGap;
+		if (bands.size() == 1 && groups.size() > 1) {
+			gap = std::clamp((avail - sumW) / (int)(groups.size() - 1), minGap, u * 8);
+		}
+		std::vector<int> bandRows(bands.size(), 0);
+		int colsH = 0;
+		for (size_t b = 0; b < bands.size(); b++) {
+			for (const size_t gi : bands[b]) bandRows[b] = std::max(bandRows[b], (int)groups[gi].items.size());
+			colsH += headH + bandRows[b] * rowH + (b ? u / 2 : 0);
+		}
+		const int colsY = by0 + padY + bhB + u * 9 / 10;
+		const int bh = std::max((colsY - by0) + colsH + u / 2, sBh);
+		sBh = bh;
+		fill(bx0, by0, bx1, by0 + bh, cPanel);
+		fill(bx0, by0 + bh - std::max(2, u / 8), bx1, by0 + bh, cOrange);
+
+		auto badgeW = [&](CD3D11Font& f, int fh, const InfoBadge& b) { return std::max(width(f, b.t), b.wide.empty() ? 0 : width(f, b.wide)) + fh * 4 / 5; };
+		auto badge = [&](CD3D11Font& f, int fh, int x, int y, int h, const InfoBadge& b) {
+			const int w = badgeW(f, fh, b);
+			fillRound(x, y, x + w, y + h, u / 2, b.hot ? cOrange : cSelBar);
+			edgeRound(x, y, x + w, y + h, u / 2, std::max(2, u / 9), cWhite);
+			text(f, x + (w - width(f, b.t)) / 2, y + (h - fh * 5 / 4) / 2, b.hot ? cInk : cTextSel, b.t);
+			return x + w;
+		};
+		{
+			const int bgap = u * 3 / 5;
+			int x = bx0 + padX;
+			for (const auto& b : left) x = badge(fB, hB, x, by0 + padY, bhB, b) + bgap;
+			// The status badges at the same size when they fit, else smaller.
+			int wBig = 0;
+			for (const auto& b : right) wBig += badgeW(fB, hB, b) + bgap;
+			if (x + u * 2 + wBig > bx1 - padX) sBadgeSmall = true;
+			const bool big = !sBadgeSmall;
+			CD3D11Font& fR = big ? fB : fT;
+			const int hR = big ? hB : hT, bhR = big ? bhB : bhT;
+			int xr = bx1 - padX;
+			const int ry = by0 + padY + (bhB - bhR) / 2;
+			for (const auto& b : right) {
+				const int w = badgeW(fR, hR, b);
+				if (xr - w < x + u) break;   // no room left beside the left badges
+				badge(fR, hR, xr - w, ry, bhR, b);
+				xr -= w + bgap;
+			}
+		}
+		{
+			int y = colsY;
+			for (size_t b = 0; b < bands.size(); b++) {
+				int x = bx0 + padX;
+				const int yBot = y + headH + bandRows[b] * rowH;
+				for (size_t ci = 0; ci < bands[b].size(); ci++) {
+					const InfoGroup& g = groups[bands[b][ci]];
+					if (ci) fill(x - gap / 2, y + u / 4, x - gap / 2 + std::max(1, u / 12), yBot - u / 4, cRule);
+					const int tsz = hG * 3 / 5;
+					tri(x, y + (hG * 5 / 4 - tsz) / 2, tsz, cOrange);
+					text(fG, x + tsz + hG / 3, y, cOrange, g.name);
+					int iy = y + headH;
+					for (const auto& it : g.items) {
+						int ix = x;
+						if (it.k == 2) {
+							// Worth a look: an orange box with "!", so it doesn't rest on colour alone.
+							const int by = iy + (hL * 5 / 4 - warnW) / 2;
+							fillRound(ix, by, ix + warnW, by + warnW, u / 5, cOrange);
+							edgeRound(ix, by, ix + warnW, by + warnW, u / 5, 1, cWhite);
+							text(fG, ix + (warnW - width(fG, L"!")) / 2, by + (warnW - hG * 5 / 4) / 2, cInk, L"!");
+							ix += warnW + hL / 3;
+						}
+						text(fL, ix, iy, it.k == 1 ? cKnob : cTextSel, it.t);
+						iy += rowH;
+					}
+					x += colW[bands[b][ci]] + gap;
+				}
+				y = yBot + u / 2;
+			}
+		}
+	}
 
 	const int x0 = video.left + u * 2;
-	if (m_Dble.OverlayVisible()) {
-		const CDbleFix::OvModel m = m_Dble.Overlay();
+	if (m_ClipGuard.OverlayVisible()) {
+		const CClipGuard::OvModel m = m_ClipGuard.Overlay();
 		const int pad = u, rowH = u * 3 / 2, headH = u * 7 / 4, titleH = u * 5 / 2, keyH = u * 4 / 3, lineH = u * 5 / 4;
 		const int nameX = pad + u * 3 / 2;
-		// Width: the widest of the settings, the keys and the readout.
-		int wNames = 0, wVals = 0;
+		// Fixed width: set by the setting names, the widest value any setting can
+		// show, the keys and the title, never by the changing readout, so the panel
+		// doesn't jump. Readout lines that don't fit wrap onto more lines.
+		int wNames = 0;
 		for (const auto& r : m.rows) {
 			if (r.heading) continue;
 			wNames = std::max(wNames, width(fM, r.name));
-			wVals = std::max(wVals, width(fM, r.value));
 		}
+		const int wVals = std::max(std::max(std::max(width(fM, L"Side by side"), width(fM, L"Restart & update")), width(fM, L"High Performance")), width(fM, L"6 frames (Kaleidescape)")) + u * 2;   // and the < > arrows
 		int wKey = 0, wWhat = 0;
 		for (const auto& k : m.keys) {
 			wKey = std::max(wKey, width(fS, k.key));
@@ -10624,27 +11131,69 @@ void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
 		}
 		const int keyCol = wKey + u + u / 2 + wWhat + u;
 		int pw = std::max(nameX + wNames + u * 2 + wVals + pad + u / 2, pad * 2 + keyCol * 2);
-		pw = std::max(pw, pad * 2 + width(fT, L"ClipGuard") + u + width(fS, m.version));
-		for (const auto& l : m.lines) pw = std::max(pw, pad * 2 + width(l.style == 2 ? fS : fM, l.text));
-		// Reserve a fixed readout column and a fixed number of readout lines.
-		// Without this the panel resized every time a spot count or a cost value
-		// changed width, which read as the OSD jumping around frame to frame.
-		pw = std::max(pw, pad * 2 + u * 70);
-		pw = std::max(pw, u * 20);
-		const int kReadoutLines = 6;
-		int ph = titleH + headH + (int)((m.keys.size() + 1) / 2) * keyH + u / 2
-		       + std::max((int)m.lines.size(), kReadoutLines) * lineH + pad;
-		for (const auto& r : m.rows) ph += r.heading ? headH : rowH;
-		if (rtSize.cx != m_dblePanelWinW || rtSize.cy != m_dblePanelWinH) {
-			m_dblePanelWinW = rtSize.cx;
-			m_dblePanelWinH = rtSize.cy;
-			m_dblePanelW = 0;
-			m_dblePanelH = 0;
+		pw = std::max(pw, pad * 2 + width(fT, L"ClipGuard+") + u + width(fS, m.version));
+		pw = std::max(pw, u * 22);
+		// Readout lines wrapped to the panel at spaces.
+		struct WLine { std::wstring text; int style; };
+		std::vector<WLine> wl;
+		for (const auto& l : m.lines) {
+			CD3D11Font& f = l.style == 2 ? fS : fM;
+			const int avail = pw - pad * 2;
+			std::wstring cur, word;
+			const std::wstring src = l.text + L" ";
+			for (wchar_t ch : src) {
+				if (ch != L' ') { word += ch; continue; }
+				if (word.empty()) continue;
+				const std::wstring tryLine = cur.empty() ? word : cur + L" " + word;
+				if (!cur.empty() && width(f, tryLine) > avail) {
+					wl.push_back({ cur, l.style });
+					cur = L"  " + word;
+				} else {
+					cur = tryLine;
+				}
+				word.clear();
+			}
+			if (!cur.empty() || l.text.empty()) wl.push_back({ cur, l.style });
 		}
-		pw = std::max(pw, m_dblePanelW);
-		ph = std::max(ph, m_dblePanelH);
-		m_dblePanelW = pw;
-		m_dblePanelH = ph;
+		// Fixed height too: the readout always takes kReadoutLines lines (blank
+		// below when there is less), and anything beyond is cut with "...", so
+		// the panel never grows or shrinks.
+		constexpr size_t kReadoutLines = 9;
+		if (wl.size() > kReadoutLines) {
+			wl.resize(kReadoutLines);
+			wl.back().text += L" ...";
+		}
+		// The selected setting's explanation: always kHelpLines small lines
+		// (blank below when it is shorter), so the panel keeps its size as the
+		// selection moves.
+		constexpr size_t kHelpLines = 4;
+		const int helpH = u * 11 / 10;
+		std::vector<std::wstring> hl;
+		{
+			const int avail = pw - pad * 2 - u;
+			std::wstring cur, word;
+			const std::wstring src = m.help + L" ";
+			for (wchar_t ch : src) {
+				if (ch != L' ') { word += ch; continue; }
+				if (word.empty()) continue;
+				const std::wstring tryLine = cur.empty() ? word : cur + L" " + word;
+				if (!cur.empty() && width(fS, tryLine) > avail) {
+					hl.push_back(cur);
+					cur = word;
+				} else {
+					cur = tryLine;
+				}
+				word.clear();
+			}
+			if (!cur.empty()) hl.push_back(cur);
+			if (hl.size() > kHelpLines) {
+				hl.resize(kHelpLines);
+				hl.back() += L" ...";
+			}
+		}
+		int ph = titleH + headH + (int)((m.keys.size() + 1) / 2) * keyH + u / 2 + (int)kReadoutLines * lineH + pad;
+		ph += u / 2 + (int)kHelpLines * helpH + u / 4;
+		for (const auto& r : m.rows) ph += r.heading ? headH : rowH;
 
 		// Bottom left of the active picture; pinned to its top if it doesn't fit.
 		int px = x0, py = actBot - u - ph;
@@ -10655,55 +11204,46 @@ void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
 		fillRound(px, py, px + pw, py + ph, rad, cPanel);
 		edgeRound(px, py, px + pw, py + ph, rad, edge, cEdge);
 
-		// Title: a small shield (white edge, blue, yellow light), name and version.
-		{
-			const float s = (float)u / 24.0f;
-			const float ix = (float)(px + pad), iy = (float)(py + u * 3 / 4);
-			auto ndcX = [&](float x) { return x * 2.0f / rtSize.cx - 1.0f; };
-			auto ndcY = [&](float y) { return 1.0f - y * 2.0f / rtSize.cy; };
-			auto shield = [&](float in, D3DCOLOR c) {
-				const float l = ix + in, r = ix + 24 * s - in, t = iy + in * 0.9f, mid = iy + 15 * s, b = iy + 30 * s - in * 1.4f;
-				m_DbleQuad.Set(ndcX(l), ndcY(t), ndcX(r), ndcY(t), ndcX(r), ndcY(mid), ndcX(l), ndcY(mid), c);
-				m_DbleQuad.Draw(pRTV, rtSize);
-				const float cx = ix + 12 * s;
-				m_DbleQuad.Set(ndcX(l), ndcY(mid), ndcX(r), ndcY(mid), ndcX(cx), ndcY(b), ndcX(cx), ndcY(b), c);
-				m_DbleQuad.Draw(pRTV, rtSize);
-			};
-			shield(0.0f, D3DCOLOR_XRGB(200, 200, 200));
-			shield(2.2f * s, D3DCOLOR_XRGB(232, 85, 31));
-			const float cx = ix + 12 * s, cy = iy + 13 * s, rr = 5.5f * s;
-			m_DbleQuad.Set(ndcX(cx - rr * 0.41f), ndcY(cy - rr), ndcX(cx + rr * 0.41f), ndcY(cy - rr), ndcX(cx + rr * 0.41f), ndcY(cy + rr), ndcX(cx - rr * 0.41f), ndcY(cy + rr), D3DCOLOR_XRGB(230, 185, 40));
-			m_DbleQuad.Draw(pRTV, rtSize);
-			m_DbleQuad.Set(ndcX(cx - rr), ndcY(cy - rr * 0.41f), ndcX(cx + rr), ndcY(cy - rr * 0.41f), ndcX(cx + rr), ndcY(cy + rr * 0.41f), ndcX(cx - rr), ndcY(cy + rr * 0.41f), D3DCOLOR_XRGB(230, 185, 40));
-			m_DbleQuad.Draw(pRTV, rtSize);
-			m_DbleQuad.Set(ndcX(cx - rr * 0.8f), ndcY(cy - rr * 0.8f), ndcX(cx + rr * 0.8f), ndcY(cy - rr * 0.8f), ndcX(cx + rr * 0.8f), ndcY(cy + rr * 0.8f), ndcX(cx - rr * 0.8f), ndcY(cy + rr * 0.8f), D3DCOLOR_XRGB(230, 185, 40));
-			m_DbleQuad.Draw(pRTV, rtSize);
-		}
-		const int tx = px + pad + u * 3 / 2;
-		text(fT, tx, py + u / 2, cTitle, L"ClipGuard");
-		text(fS, tx + width(fT, L"ClipGuard") + u / 2, py + u / 2 + (u * 3 / 2 - u * 4 / 5), cDim, m.version);
+		// Title: an orange bar, the name in bold and the version.
+		fill(px + pad / 2, py + u / 2, px + pad / 2 + std::max(3, u / 5), py + u * 2, cOrange);
+		const int tx = px + pad + u / 2;
+		text(fT, tx, py + u / 2, cTitle, m.title);
+		text(fS, tx + width(fT, m.title) + u / 2, py + u / 2 + (u * 3 / 2 - u * 4 / 5), cDim, m.version);
 		int y = py + titleH;
 		fill(px + pad, y - u / 3, px + pw - pad, y - u / 3 + 1, cRule);
 
 		for (const auto& r : m.rows) {
 			if (r.heading) {
-				text(fS, px + pad, y + u / 2, cHead, r.name);
+				heading(px + pad, y + u / 2, r.name);
 				y += headH;
 				continue;
 			}
+			const int vx1 = px + pw - pad - u / 2;
 			if (r.selected) {
+				// The selected row: a grey bar, and orange < > around the value.
 				const int bx0 = px + u / 2, bx1 = px + pw - u / 2, by0 = y - u / 8, by1 = y + rowH - u / 8;
 				fillRound(bx0, by0, bx1, by1, u / 4, cSelBar);
-				edgeRound(bx0, by0, bx1, by1, u / 4, 1, cSelEdge);
-				text(fM, px + pad - u / 4, y, cTextSel, L">");
+				const int wv = width(fM, r.value), wa = width(fM, L">");
+				text(fM, vx1 - wa, y, cOrange, L">");
+				text(fM, vx1 - wa - u / 2 - wv, y, rowColor(r.style, true), r.value);
+				text(fM, vx1 - wa - u / 2 - wv - u / 2 - width(fM, L"<"), y, cOrange, L"<");
+			} else {
+				text(fM, vx1 - width(fM, r.value), y, rowColor(r.style, false), r.value);
 			}
 			text(fM, px + nameX, y, r.selected ? cTextSel : cText, r.name);
-			text(fM, px + pw - pad - u / 2 - width(fM, r.value), y, styleColor(r.style, r.selected), r.value);
 			y += rowH;
 		}
 
+		// The selected setting's explanation, in a fixed box under the settings.
+		fill(px + pad, y + u / 4, px + pw - pad, y + u / 4 + 1, cRule);
+		y += u / 2;
+		for (size_t i = 0; i < hl.size(); i++) {
+			text(fS, px + pad + u / 2, y + (int)i * helpH, cSub, hl[i]);
+		}
+		y += (int)kHelpLines * helpH + u / 4;
+
 		// Keys, two columns of small key caps.
-		text(fS, px + pad, y + u / 2, cHead, L"KEYS");
+		heading(px + pad, y + u / 2, L"KEYS");
 		y += headH;
 		for (size_t i = 0; i < m.keys.size(); i++) {
 			const int kx = px + pad + (int)(i % 2) * keyCol, ky = y + (int)(i / 2) * keyH;
@@ -10712,32 +11252,32 @@ void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
 			fillRound(kx, ky, kx + kw + u / 2, ky + capH, u / 6, cKeyCap);
 			edgeRound(kx, ky, kx + kw + u / 2, ky + capH, u / 6, 1, cKeyEdge);
 			text(fS, kx + u / 4, ky + (capH - u * 4 / 5) / 2, cKeyText, m.keys[i].key);
-			text(fS, kx + kw + u, ky + (capH - u * 4 / 5) / 2, cText, m.keys[i].what);
+			text(fS, kx + kw + u, ky + (capH - u * 4 / 5) / 2, cSub, m.keys[i].what);
 		}
 		y += (int)((m.keys.size() + 1) / 2) * keyH;
 		fill(px + pad, y + u / 4, px + pw - pad, y + u / 4 + 1, cRule);
 		y += u / 2;
 
 		// Readout.
-		for (const auto& l : m.lines) {
-			text(l.style == 2 ? fS : fM, px + pad, y + u / 8, styleColor(l.style, false), l.text);
+		for (const auto& l : wl) {
+			text(l.style == 2 ? fS : fM, px + pad, y + u / 8, lineColor(l.style), l.text);
 			y += lineH;
 		}
 	} else {
 		// Overlay hidden: the log note (F11) alone, on a small dark backing.
-		const std::wstring note = m_Dble.LogNote();
+		const std::wstring note = m_ClipGuard.LogNote();
 		if (!note.empty()) {
 			const int ny = std::clamp(actBot - u * 2, 0, std::max(0, (int)rtSize.cy - u * 2));
 			fillRound(x0 - u / 2, ny - u / 3, x0 + width(fM, note) + u / 2, ny + u * 4 / 3, u / 3, cPanel);
 			text(fM, x0, ny, cText, note);
 		}
 	}
-	if (m_Dble.ShowViewNote()) {
+	if (m_ClipGuard.ShowViewNote()) {
 		// Above the picture: in the top letterbox bar (Side by side: the black above
 		// the half-size pictures), else above the video, else at the picture's top.
 		const int lineH = u * 5 / 4, margin = u / 2;
 		const float vh = (float)video.Height();
-		const int topPx = (m_Dble.View() == 3) ? (int)(0.25f * vh + 0.5f * m_Dble.TopBarFrac() * vh) : (int)(m_Dble.TopBarFrac() * vh);
+		const int topPx = (m_ClipGuard.View() == 3) ? (int)(0.25f * vh + 0.5f * m_ClipGuard.TopBarFrac() * vh) : (int)(m_ClipGuard.TopBarFrac() * vh);
 		int ny;
 		if (topPx >= lineH + margin) {
 			ny = video.top + (topPx - lineH) / 2;

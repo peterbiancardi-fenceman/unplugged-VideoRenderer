@@ -872,19 +872,21 @@ private:
 	// Statistics
 	CD3D11Rectangle m_StatsBackground;
 	CD3D11Font      m_Font3D;
-	// ClipGuard: projector highlight compensation, test views and overlay.
-	CDbleFix            m_Dble;
-	CD3D11Rectangle     m_DbleRect;   // overlay panel, bars and key caps
-	CD3D11Quadrilateral m_DbleQuad;   // overlay icon
-	Tex2D_t  m_DbleDelay[7];          // look-ahead: the last frames, shown 2-6 frames late
-	UINT     m_DbleDelayN = 0;
-	UINT     m_DbleDelayPos = 0;
-	UINT     m_DbleDelayRing = 0;     // slots in use (look-ahead + 1), 0 = off
-	Tex2D_t  m_DbleOut;               // picture as sent, measured for the readout
-	// ClipGuard panel size, held stable while the readout text changes. A spot
-	// count or cost value must not resize the panel frame to frame.
-	int m_dblePanelW = 0, m_dblePanelH = 0;
-	int m_dblePanelWinW = 0, m_dblePanelWinH = 0;
+	// ClipGuard: highlight compensation, test views and on-screen overlay (ClipGuard.h).
+	CClipGuard m_ClipGuard;
+	uint32_t m_DitherSeed = 12345u;      // ClipGuard 2.45.0: temporal dither offsets
+	CD3D11Rectangle     m_ClipGuardRect;   // ClipGuard overlay panel, bars and key caps
+	CD3D11Quadrilateral m_ClipGuardQuad;   // ClipGuard overlay icon
+	Tex2D_t  m_ClipGuardDelay[13];  // look-ahead: the last frames, shown 2-12 frames late
+	UINT     m_ClipGuardDelayN = 0;
+	// Banner "Skipped": frames skipped in the first 10 s of playback, and in
+	// the 10 s after a seek, don't count (the picture is still settling).
+	unsigned m_LastFrames = 0;           // frame count on the last frame (a drop means a new file)
+	unsigned m_SkipBase = 0;             // skipped frames not counted
+	REFERENCE_TIME m_SkipGraceT = 0;     // played time since the start or seek, up to 10 s
+	UINT     m_ClipGuardDelayPos = 0;
+	UINT     m_ClipGuardDelayRing = 0;  // slots in use (look-ahead + 1), 0 = off
+	Tex2D_t  m_ClipGuardOut;        // copy of the picture as sent, measured for the readout
 	CD3D11Rectangle m_Rect3D;
 	CD3D11Rectangle m_Underlay;
 	CD3D11Lines     m_Lines;
@@ -1238,7 +1240,7 @@ private:
 	void UpdateStatsStatic() override;
 	//void UpdateStatsPostProc();
 	HRESULT DrawStats(ID3D11Texture2D* pRenderTarget);
-	void DrawDbleOverlay(ID3D11Texture2D* pRenderTarget);
+	void DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget);
 
 public:
 	// IMFVideoProcessor
