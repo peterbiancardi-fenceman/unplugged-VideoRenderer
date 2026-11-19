@@ -219,6 +219,11 @@ struct Settings_t {
 	bool bVBlankBeforePresent;
 	bool bAdjustPresentTime;
 	bool bReinitByDisplay;
+	// TEST (2026-11-19): declare the SDR swap chain as BT.2020 SDR
+	// (DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020) so the GPU/driver carries a
+	// BT.2020 colourimetry flag to the display. The image must already be in
+	// BT.2020 (Output gamut = BT.2020); this only changes the declaration.
+	bool bSdrBt2020;
 	bool bHdrPreferDoVi;
 	bool bHdrPassthrough;
 	int  iHdrToggleDisplay;
@@ -645,6 +650,7 @@ struct Settings_t {
 		bVBlankBeforePresent            = false;
 		bAdjustPresentTime              = true;
 		bReinitByDisplay                = false;
+		bSdrBt2020                      = false;
 		bHdrPreferDoVi                  = false;
 		if (IsWindows10OrGreater()) {
 			bHdrPassthrough             = true;

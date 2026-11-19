@@ -526,6 +526,10 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrToggleDisplay, dw)) {
 			m_Sets.iHdrToggleDisplay = discard<int>(dw, HDRTD_On, HDRTD_Disabled, HDRTD_OnOff);
 		}
+		// SDR BT.2020 signal declaration (test, 2026-11-19).
+		if (ERROR_SUCCESS == key.QueryDWORDValue(L"SdrBt2020", dw)) {
+			m_Sets.bSdrBt2020 = !!dw;
+		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrOsdBrightness, dw)) {
 			m_Sets.iHdrOsdBrightness = discard<int>(dw, 0, 0, 2);
 		}
@@ -2364,6 +2368,7 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_ExperimentalToneMapper, m_Sets.iExperimentalToneMapper);
 		key.SetDWORDValue(OPT_ToneLutContrast,     (DWORD)(m_Sets.fToneLutContrast * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_HdrToggleDisplay,    m_Sets.iHdrToggleDisplay);
+		key.SetDWORDValue(L"SdrBt2020",            m_Sets.bSdrBt2020 ? 1 : 0);
 		key.SetDWORDValue(OPT_HdrOsdBrightness,    m_Sets.iHdrOsdBrightness);
 		key.SetDWORDValue(OPT_ConvertToSdr,        m_Sets.bConvertToSdr);
 		key.SetDWORDValue(OPT_DisplayNits,         m_Sets.iSDRDisplayNits);

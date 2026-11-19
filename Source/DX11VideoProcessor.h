@@ -904,6 +904,8 @@ private:
 	bool m_bHdrDisplayModeEnabled             = false;
 	bool m_bHdrAllowSwitchDisplay             = true;
 	bool m_bACMEnabled                        = false;
+	// SDR BT.2020 signal declaration (test): see IVideoRenderer.h Settings_t.
+	bool m_bSdrBt2020                         = false;
 
 	UINT m_srcVideoTransferFunction = 0; // need a description or rename
 

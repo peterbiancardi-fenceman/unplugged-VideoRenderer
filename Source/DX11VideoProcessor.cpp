@@ -398,6 +398,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iDownscaling         = config.iDownscaling;
 	m_bInterpolateAt50pct  = config.bInterpolateAt50pct;
 	m_bUseDither           = config.bUseDither;
+	m_bSdrBt2020           = config.bSdrBt2020;
 	m_bDeintBlend          = config.bDeintBlend;
 	m_iSwapEffect          = config.iSwapEffect;
 	m_bVBlankBeforePresent = config.bVBlankBeforePresent;
@@ -4873,6 +4874,7 @@ void CDX11VideoProcessor::LogMLFrame()
 	const wchar_t* pColor = L"?";
 	switch (m_currentSwapChainColorSpace) {
 	case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: pColor = L"G22P709"; break;
+	case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020: pColor = L"G22P2020"; break;
 	case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: pColor = L"G2084P2020"; break;
 	case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: pColor = L"G10P709"; break;
 	default: break;
@@ -5547,6 +5549,42 @@ HRESULT CDX11VideoProcessor::InitSwapChain(bool bWindowChanged)
 		HRESULT hr2 = m_pDXGISwapChain1->GetContainingOutput(&m_pDXGIOutput);
 
 		m_currentSwapChainColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+		// SDR BT.2020 SIGNAL (test, 2026-11-19). The GPU derives the AVI InfoFrame
+		// colourimetry from the swap chain colour space, so an SDR picture already
+		// converted to BT.2020 (Output gamut = BT.2020) can be DECLARED as BT.2020
+		// SDR — the only lever that may make a display switch to its wide-gamut
+		// mode. Driver support is not guaranteed: fall back to P709 and log.
+		if (!bHdrOutput && m_bSdrBt2020) {
+			CComPtr<IDXGISwapChain4> pSC4;
+			if (SUCCEEDED(m_pDXGISwapChain1->QueryInterface(IID_PPV_ARGS(&pSC4)))) {
+				const DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020;
+				UINT support = 0;
+				const HRESULT hrChk = pSC4->CheckColorSpaceSupport(cs, &support);
+				if (m_pMLDebugFile) {
+					fwprintf(m_pMLDebugFile, L"SDR_BT2020 check hr=0x%08X support=0x%X\n",
+						(unsigned)hrChk, support);
+					fflush(m_pMLDebugFile);
+				}
+				if (SUCCEEDED(hrChk) &&
+					(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+					const HRESULT hrSet = pSC4->SetColorSpace1(cs);
+					if (m_pMLDebugFile) {
+						fwprintf(m_pMLDebugFile, L"SDR_BT2020 set hr=0x%08X\n", (unsigned)hrSet);
+						fflush(m_pMLDebugFile);
+					}
+					if (SUCCEEDED(hrSet)) {
+						m_currentSwapChainColorSpace = cs;
+						DLog(L"SDR BT.2020: swap chain declared RGB_FULL_G22_NONE_P2020");
+					} else {
+						DLog(L"SDR BT.2020: SetColorSpace1 failed");
+					}
+				} else {
+					DLog(L"SDR BT.2020: not supported (support={})", support);
+				}
+			} else {
+				DLog(L"SDR BT.2020: no IDXGISwapChain4");
+			}
+		}
 		if (bHdrOutput) {
 			hr2 = m_pDXGISwapChain1->QueryInterface(IID_PPV_ARGS(&m_pDXGISwapChain4));
 
@@ -9554,6 +9592,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.bHdrPassthrough != m_bHdrPassthrough) {
 		m_bHdrPassthrough = config.bHdrPassthrough;
 		changeHDR = true;
+	}
+
+	// SDR BT.2020 signal declaration: the colour space is set when the swap chain
+	// is created, so a change has to recreate it.
+	if (config.bSdrBt2020 != m_bSdrBt2020) {
+		m_bSdrBt2020 = config.bSdrBt2020;
+		changeWindow = true;
 	}
 
 	if (config.bHdrLocalToneMapping != m_bHdrLocalToneMapping ||
