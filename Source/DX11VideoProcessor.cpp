@@ -804,6 +804,10 @@ void CDX11VideoProcessor::ReleaseVP()
 
 	m_pFilter->ResetStreamingTimes2();
 	m_RenderStats.Reset();
+	m_SkipBase = 0;
+	m_SkipGraceT = 0;
+	m_LastFrames = 0;
+	m_ClipGuard.AreaReset();   // a new file or format: forget the last picture shape
 
 	if (m_pDeviceContext) {
 		m_pDeviceContext->ClearState();
@@ -834,7 +838,16 @@ void CDX11VideoProcessor::ReleaseDevice()
 	ReleaseVP();
 	m_D3D11VP.ReleaseVideoDevice();
 
+	m_ClipGuard.ReleaseDevice();
+	m_NeuralUps.ReleaseDevice();
+	m_pPSGamut2020.Release();
+	for (auto& t : m_ClipGuardDelay) t.Release();
+	m_ClipGuardDelayN = 0;
+	m_ClipGuardDelayRing = 0;
+	m_ClipGuardOut.Release();
 	m_StatsBackground.InvalidateDeviceObjects();
+	m_ClipGuardRect.InvalidateDeviceObjects();
+	m_ClipGuardQuad.InvalidateDeviceObjects();
 	m_Font3D.InvalidateDeviceObjects();
 	m_Rect3D.InvalidateDeviceObjects();
 
@@ -1008,13 +1021,33 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
 		nSteps++; // P0 bar repaint
 	}
+	// ClipGuard pass: counted whenever it is ready, so the ring is sized for it.
+	// When the fix is off it draws an exact copy.
+	if (m_ClipGuard.Ready()) {
+		nSteps++;
+	}
 	if (m_pPSHalfOUtoInterlace) {
+		nSteps++;
+	}
+	if (Gamut2020Step()) {
 		nSteps++;
 	}
 	if (m_bFinalPass) {
 		nSteps++;
 	}
 	return nSteps;
+}
+
+// 2.43.2: the picture is still BT.709 at the end of the chain and Output gamut
+// is BT.2020 (SDR output; HDR sources are BT.2020 already and are never
+// converted, nor is anything when Output gamut is BT.709).
+bool CDX11VideoProcessor::Gamut2020Step()
+{
+	return m_pPSGamut2020 && m_iOutputGamut == 1
+		&& m_srcExFmt.VideoPrimaries != MFVideoPrimaries_BT2020
+		&& !SourceIsHDR()
+		&& m_currentSwapChainColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+		&& !m_bHDRPassthroughRaw;
 }
 
 HRESULT CDX11VideoProcessor::CreatePShaderFromResource(ID3D11PixelShader** ppPixelShader, UINT resid)
@@ -1337,9 +1370,18 @@ static void SplineLut(float* out, int n, Params p) {
 
 } // namespace exptm
 
+// 2.58.0: Dolby Vision counts as PQ: the converter rebuilds it to BT.2020 PQ and leaves
+// the tone mapping to the correction pass (Unplugged's curve and dials, Output Gamut),
+// exactly like HDR10. Profile 5 files say SDR / BT.709 in their media type, which kept
+// them on upstream's fixed Hable + BT.709 conversion.
+bool CDX11VideoProcessor::SrcIsPq() const
+{
+	return m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 || m_Dovi.bValid;
+}
+
 bool CDX11VideoProcessor::IsPqToSdrSelected() const
 {
-	return (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084)
+	return SrcIsPq()
 		&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping))
 		&& m_bConvertToSdr;
 }
@@ -1350,7 +1392,7 @@ bool CDX11VideoProcessor::MLFeatureDomainIsPq() const
 	// domain follows the SOURCE. m_bConvertToSdr has no business here, and having
 	// it here is what produced the double remap documented in the header.
 	return (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-		|| (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084);
+		|| SrcIsPq();
 }
 
 bool CDX11VideoProcessor::MLInputIsPq() const
@@ -1361,14 +1403,14 @@ bool CDX11VideoProcessor::MLInputIsPq() const
 	// through while the swap chain stays SDR â€” so the old swap-chain test said
 	// "gamma 2.2" and ps_ml_gamma decoded PQ with pow(x, 2.2).
 	return (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-		|| ((m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084) && !IsPqToSdrSelected());
+		|| (SrcIsPq() && !IsPqToSdrSelected());
 }
 
 void CDX11VideoProcessor::UpdateCorrectionShader()
 {
 	m_pCorrectionConstants.Release();
 	{
-		const bool bHdrSrc = m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084
+		const bool bHdrSrc = SrcIsPq()
 			|| m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
 		const bool bToSdrIntent = m_bConvertToSdr
 			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping));
@@ -1390,7 +1432,7 @@ void CDX11VideoProcessor::UpdateCorrectionShader()
 							|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_709
 							|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_240M;
 
-	if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) && m_bConvertToSdr) {
+	if (SrcIsPq() && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) && m_bConvertToSdr) {
 		// IsPqSupported() asks whether the HARDWARE VP can emit PQ â€” which decides
 		// the correction shader's INPUT on the VP path. On the TexVP path (no VP:
 		// P210 and friends) the converter override in UpdateConvertColorShader
@@ -2288,7 +2330,10 @@ void CDX11VideoProcessor::UpdateMLActive()
 	// select IsPQ=1/0 from the swapchain (never from SourceIsHDR), so native SDR
 	// (Blu-ray Rec.709/BT.1886) takes the gamma-2.2 SDR path identically to an
 	// HDR file after tone-mapping. Gate on enable + mode only.
-	const bool bActive = m_bML && (m_iMLMode == ML_Manual || bAutoReady);
+	// ClipGuard 2.44.3: SDR sources are already graded for SDR; the ML grade
+	// re-graded them (brighter, colour boosted, strong blues clipped flat), so it
+	// runs on HDR sources only. The ML setting is kept and applies to HDR.
+	const bool bActive = m_bML && (m_iMLMode == ML_Manual || bAutoReady) && SourceIsHDR();
 
 	// Only the ACTIVE flag toggles; the preloaded resources persist.
 	if (bActive == m_bMLActive) {
@@ -5289,6 +5334,8 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	DLogIf(FAILED(hr3), L"m_Font3D.InitDeviceObjects() failed with error {}", HR2Str(hr3));
 	if (SUCCEEDED(hr3)) {
 		hr3 = m_StatsBackground.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+		hr3 = m_ClipGuardRect.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+		hr3 = m_ClipGuardQuad.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Rect3D.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Underlay.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Lines.InitDeviceObjects(m_pDevice, m_pDeviceContext);
@@ -5296,6 +5343,37 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 		DLogIf(FAILED(hr3), L"Geometric primitives InitDeviceObjects() failed with error {}", HR2Str(hr3));
 	}
 	ASSERT(S_OK == hr3);
+
+	// ClipGuard: shaders compiled here, before any ring sizing, so the extra
+	// post-scale step is counted from the first frame.
+	{
+		const HRESULT hrClipGuard = m_ClipGuard.InitDevice(m_pDevice, m_pDeviceContext, GetMLModuleDir());
+		DLogIf(FAILED(hrClipGuard), L"ClipGuard: InitDevice failed with error {}", HR2Str(hrClipGuard));
+	}
+	// 2.43.2: BT.709 -> BT.2020 for a projector kept in BT.2020. In linear light
+	// (BT.1886, gamma 2.4 both ways, so greys are unchanged), BT.2087 matrix.
+	{
+		static const char kGamut2020[] =
+			"Texture2D tex : register(t0);\n"
+			"SamplerState samp : register(s0);\n"
+			"struct PS_INPUT { float4 Pos : SV_POSITION; float2 Tex : TEXCOORD; };\n"
+			"float4 main(PS_INPUT input) : SV_Target\n"
+			"{\n"
+			"	const float4 p = tex.Sample(samp, input.Tex);\n"
+			"	const float3 l = pow(max(p.rgb, 0.0), 2.4);\n"
+			"	const float3 o = float3(dot(l, float3(0.6274, 0.3293, 0.0433)),\n"
+			"	                        dot(l, float3(0.0691, 0.9195, 0.0114)),\n"
+			"	                        dot(l, float3(0.0164, 0.0880, 0.8956)));\n"
+			"	return float4(pow(max(o, 0.0), 1.0 / 2.4), p.a);\n"
+			"}\n";
+		m_pPSGamut2020.Release();
+		ID3DBlob* pBlob = nullptr;
+		if (SUCCEEDED(CompileShader(std::string(kGamut2020), nullptr, "ps_4_0", &pBlob)) && pBlob) {
+			m_pDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &m_pPSGamut2020);
+		}
+		if (pBlob) pBlob->Release();
+		DLogIf(!m_pPSGamut2020, L"Gamut BT.709 -> BT.2020 shader failed");
+	}
 
 	if (m_pFilter->m_inputMT.IsValid()) {
 		if (!InitMediaType(&m_pFilter->m_inputMT)) {
@@ -5823,6 +5901,17 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 
 	m_srcExFmt = SpecifyExtendedFormat(m_decExFmt, FmtParams, m_srcRectWidth, m_srcRectHeight);
 	ApplyInputColorSpaceOverride(); // forced ICS_* for live HDMI capture (no-op when Auto)
+	// 2.58.0: an HDR10 file (P010) labelled full range: checked against the picture
+	// (see RangeProbe); once found to be limited, it is converted as limited.
+	if (m_rangeCheck == 2) {
+		m_srcExFmt.NominalRange = DXVA2_NominalRange_16_235;
+	} else if (m_rangeCheck == 0 && m_srcExFmt.NominalRange == DXVA2_NominalRange_0_255
+			&& m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 && !m_Dovi.bValid
+			&& FmtParams.CSType == CS_YUV && (FmtParams.cformat == CF_P010 || FmtParams.cformat == CF_P016)) {
+		m_rangeCheck = 1;
+		m_rangeBright = m_rangeContent = 0;
+		m_rangePending = false;
+	}
 
 	bool disableD3D11VP = false;
 	switch (FmtParams.cformat) {
@@ -5856,6 +5945,17 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 		const auto ar_gcd = std::gcd(m_srcAspectRatioX, m_srcAspectRatioY);
 		m_srcAspectRatioX /= ar_gcd;
 		m_srcAspectRatioY /= ar_gcd;
+		// 2.59.0: a label within 1% of the frame's own shape is a rounded one (3840 x 2080
+		// labelled 1.85:1 drew it at 3840 x 2076, resampling every frame for 4 rows):
+		// the pixels are square, so the picture is shown 1:1. Real anamorphic is far off.
+		{
+			const double lab = (double)m_srcAspectRatioX / (double)m_srcAspectRatioY;
+			const double frm = (double)m_srcRectWidth / (double)m_srcRectHeight;
+			if (frm > 0.0 && fabs(lab / frm - 1.0) < 0.01) {
+				m_srcAspectRatioX = srcFrameARX;
+				m_srcAspectRatioY = srcFrameARY;
+			}
+		}
 		m_srcAnamorphic = (srcFrameARX != m_srcAspectRatioX || srcFrameARY != m_srcAspectRatioY);
 	}
 
@@ -6153,6 +6253,7 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	}
 
 	m_rtStart = rtStart;
+	m_rtClipGuardShownDelay = 0;   // set again by the look-ahead in Render when it holds a frame back
 	CRefTime rtClock(rtStart);
 
 	VLog(L"[RT] ProcessSample #{} CopySample ENTER (rtStart={})", seq, (long long)rtStart);
@@ -6244,9 +6345,109 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	return hr;
 }
 
+// 2.58.0: is an HDR10 file labelled full range really full range? Once a second (every
+// 5 s after deciding) a frame is copied to a small CPU-readable texture and read a second
+// later (so nothing waits on the GPU). Limited range keeps its codes in 64-940 (10-bit);
+// a real full-range picture has many below 40 (its black, and its bars, are 0) or above
+// 980. Small overshoots of a limited picture (grain, filtering) don't count: it takes
+// 0.2% of the pixels. "Limited" needs 10 checks with picture in them, 3 of them bright,
+// and nothing outside; it is undone (once) if a real full-range picture turns up later.
+void CDX11VideoProcessor::RangeProbe(ID3D11Texture2D* pTex, UINT sub)
+{
+	if (!pTex) return;
+	const DWORD now = GetTickCount();
+	const DWORD every = (m_rangeCheck == 2) ? 5000 : 1000;
+	if (m_rangePending) {
+		if (now - m_rangeTick < 1000 || !m_pRangeStaging) return;
+		D3D11_MAPPED_SUBRESOURCE mr = {};
+		const HRESULT hrMap = m_pDeviceContext->Map(m_pRangeStaging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mr);
+		if (hrMap == DXGI_ERROR_WAS_STILL_DRAWING) return;
+		m_rangePending = false;
+		if (FAILED(hrMap)) return;
+		D3D11_TEXTURE2D_DESC sd = {};
+		m_pRangeStaging->GetDesc(&sd);
+		UINT total = 0, out = 0, bright = 0, content = 0;
+		// The picture only: a decoder's texture can be taller than the picture (padding rows).
+		const UINT ph = std::min<UINT>(sd.Height, m_srcHeight), pw = std::min<UINT>(sd.Width, m_srcWidth);
+		// 2.59.0: and not its black bars. A limited-range encode can still have its bars at
+		// code 0, which alone looked like full range: rows and columns with nothing above
+		// a dark level in them are bars (or an all-black frame) and are left out.
+		const UINT nr = ph > 4 ? (ph - 4 + 7) / 8 : 0, nc = pw > 4 ? (pw - 4 + 7) / 8 : 0;
+		std::vector<uint16_t> grid((size_t)nr * nc);
+		for (UINT r = 0; r < nr; r++) {
+			const uint16_t* row = (const uint16_t*)((const BYTE*)mr.pData + (size_t)(4 + r * 8) * mr.RowPitch);
+			for (UINT c = 0; c < nc; c++) grid[(size_t)r * nc + c] = (uint16_t)(row[4 + c * 8] >> 6);
+		}
+		m_pDeviceContext->Unmap(m_pRangeStaging, 0);
+		std::vector<char> rowBar(nr, 1), colBar(nc, 1);
+		for (UINT r = 0; r < nr; r++)
+			for (UINT c = 0; c < nc; c++)
+				if (grid[(size_t)r * nc + c] > 120) { rowBar[r] = 0; break; }
+		for (UINT c = 0; c < nc; c++)
+			for (UINT r = 0; r < nr; r++)
+				if (!rowBar[r] && grid[(size_t)r * nc + c] > 120) { colBar[c] = 0; break; }
+		for (UINT r = 0; r < nr; r++) {
+			if (rowBar[r]) continue;
+			for (UINT c = 0; c < nc; c++) {
+				if (colBar[c]) continue;
+				const UINT v = grid[(size_t)r * nc + c];
+				total++;
+				if (v < 40 || v > 980) out++;
+				if (v > 600) bright++;
+				if (v > 150) content++;
+			}
+		}
+		if (!total) return;
+		const bool full = out * 500 > total;
+		if (m_rangeCheck == 1) {
+			if (full) {
+				m_rangeCheck = 3;   // the label is right: nothing changes
+				DLog(L"Range check: full range confirmed ({} of {} samples outside 64-940)", out, total);
+			} else if (content * 2 > total) {
+				m_rangeContent++;
+				if (bright * 100 > total) m_rangeBright++;
+				if (m_rangeContent >= 10 && m_rangeBright >= 3) {
+					m_rangeCheck = 2;   // limited: re-initialise with 16-235
+					m_rangeApply = true;
+					DLog(L"Range check: limited range (file said full)");
+				}
+			}
+		} else if (m_rangeCheck == 2 && out * 100 > total) {
+			m_rangeCheck = 3;   // a real full-range picture after all: back to the label
+			m_rangeApply = true;
+			DLog(L"Range check: full range after all, back to the file's label");
+		}
+		m_rangeTick = now;
+		return;
+	}
+	if (now - m_rangeTick < every) return;
+	D3D11_TEXTURE2D_DESC d = {};
+	pTex->GetDesc(&d);
+	if (d.Format != DXGI_FORMAT_P010 && d.Format != DXGI_FORMAT_P016) { m_rangeCheck = 0; return; }
+	D3D11_TEXTURE2D_DESC sd = {};
+	if (m_pRangeStaging) m_pRangeStaging->GetDesc(&sd);
+	if (!m_pRangeStaging || sd.Width != d.Width || sd.Height != d.Height || sd.Format != d.Format) {
+		m_pRangeStaging.Release();
+		D3D11_TEXTURE2D_DESC nd = {};
+		nd.Width = d.Width; nd.Height = d.Height; nd.MipLevels = 1; nd.ArraySize = 1;
+		nd.Format = d.Format; nd.SampleDesc.Count = 1;
+		nd.Usage = D3D11_USAGE_STAGING; nd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(m_pDevice->CreateTexture2D(&nd, nullptr, &m_pRangeStaging))) { m_rangeCheck = 0; return; }
+	}
+	m_pDeviceContext->CopySubresourceRegion(m_pRangeStaging, 0, 0, 0, 0, pTex, sub, nullptr);
+	m_rangePending = true;
+	m_rangeTick = now;
+}
+
 HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 {
 	CheckPointer(m_pDXGISwapChain1, E_FAIL);
+
+	// 2.58.0: the range check decided: convert with it from this frame on.
+	if (m_rangeApply) {
+		m_rangeApply = false;
+		InitMediaType(&m_pFilter->m_inputMT);
+	}
 
 	uint64_t tick = GetPreciseTick();
 
@@ -6286,6 +6487,35 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 				| (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataHDRContentLightLevel, &q, &z)) ? 2 : 0)
 				| (SUCCEEDED(pMediaSideData->GetSideData(kH10p, &q, &z)) ? 4 : 0)
 				| (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataDOVIMetadataV2, &q, &z)) ? 8 : 0);
+			// 2.58.0: the file's HDR10 information, for the banner only (the tone mapping
+			// reads it only for HDR output; read into m_hdr10 it would change the picture).
+			{
+				const MediaSideDataHDR* bh = nullptr; size_t bz = 0;
+				if (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataHDR, (const BYTE**)&bh, &bz)) && bh && bz == sizeof(MediaSideDataHDR)
+						&& bh->max_display_mastering_luminance > 0.) {
+					m_bnMmax = (UINT)std::lround(bh->max_display_mastering_luminance);
+					m_bnMmin = (UINT)std::lround(bh->min_display_mastering_luminance * 10000.0);
+				}
+				const MediaSideDataHDRContentLightLevel* bc = nullptr; bz = 0;
+				if (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataHDRContentLightLevel, (const BYTE**)&bc, &bz)) && bc && bz == sizeof(MediaSideDataHDRContentLightLevel)) {
+					if (bc->MaxCLL) m_bnCll = bc->MaxCLL;
+					if (bc->MaxFALL) m_bnFall = bc->MaxFALL;
+				}
+			}
+			// 2.57.0: which Dolby Vision this is, for the banner (whether used or not).
+			m_doviSeenProfile = 0;
+			m_doviSeenFel = false;
+			const MediaSideDataDOVIMetadata* dv = nullptr;
+			size_t dz = 0;
+			if (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataDOVIMetadataV2, (const BYTE**)&dv, &dz))
+					&& dv && dz == sizeof(MediaSideDataDOVIMetadata)) {
+				const auto& h = dv->Header;
+				if (h.vdr_rpu_profile == 0) m_doviSeenProfile = 5;
+				else if (h.el_spatial_resampling_filter_flag && !h.disable_residual_flag && h.vdr_bit_depth != 12) m_doviSeenProfile = 4;
+				else if (!h.disable_residual_flag) m_doviSeenProfile = 7;
+				else m_doviSeenProfile = 8;
+				m_doviSeenFel = SourceIsDoviFel(dv);
+			}
 		}
 		if (SourceIsHDR10orHLG() && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) {
 			MediaSideDataHDR* hdr = nullptr;
@@ -6650,6 +6880,7 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 			D3D11_BOX srcBox = { 0, 0, 0, m_srcWidth, m_srcHeight, 1 };
 			m_pDeviceContext->CopySubresourceRegion(m_TexSrcVideo.pTexture, 0, 0, 0, 0, pD3D11Texture2D, ArraySlice, &srcBox);
 		}
+		if (m_rangeCheck == 1 || m_rangeCheck == 2) RangeProbe(pD3D11Texture2D, D3D11CalcSubresource(0, ArraySlice, desc.MipLevels));
 	}
 	else {
 		if (m_iSrcFromGPU != 0) {
@@ -6663,6 +6894,7 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 			// do not use UpdateSubresource for D3D11 VP here
 			// because it can cause green screens and freezes on some configurations
 			hr = MemCopyToTexSrcVideo(data, m_srcPitch);
+			if (m_rangeCheck == 1 || m_rangeCheck == 2) RangeProbe(m_TexSrcVideo.pTexture, 0);
 			if (m_D3D11VP.IsReady()) {
 				// ID3D11VideoProcessor does not use textures with D3D11_CPU_ACCESS_WRITE flag
 				m_pDeviceContext->CopyResource(m_D3D11VP.GetNextInputTexture(m_SampleFormat), m_TexSrcVideo.pTexture);
@@ -6688,6 +6920,27 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 		LogMLFrame();
 	}
 	m_nSkyFrame++;   // render-frame counter for the seg cadence (always)
+
+	// ClipGuard 2.48.0: the calibration LUT for the selected projector (titan.cube /
+	// valerion.cube from ClipGuard Meter's auto-cal). Done here, before the frame
+	// is drawn, because loading switches the final pass on or off.
+	if (m_ClipGuard.Ready()) {
+		if (m_ClipGuard.LutState() == 1 && !m_bCubeLutEnabled) m_ClipGuard.LutForget();   // lost with a device reset
+		std::wstring lutPath;
+		if (m_ClipGuard.LutWanted(lutPath)) {
+			if (lutPath.empty()) {
+				LoadCubeLut("");
+				m_ClipGuard.LutLoaded(true, true);
+			} else {
+				char u8[1024] = {};
+				WideCharToMultiByte(CP_UTF8, 0, lutPath.c_str(), -1, u8, (int)sizeof(u8), nullptr, nullptr);
+				const HRESULT hrLut = LoadCubeLut(u8);
+				if (SUCCEEDED(hrLut)) m_iCubeLutMode = 3;   // full 3D
+				m_ClipGuard.LutLoaded(SUCCEEDED(hrLut), false);
+			}
+			UpdatePostScaleTexures();
+		}
+	}
 
 	// ML params must be refreshed before this frame is processed; keep this
 	// unconditional (only gated by active state) so a stale or zero-filled
@@ -7551,6 +7804,15 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 		hr = DrawStats(pBackBuffer);
 	}
 
+	if (m_ClipGuard.Ready() && (m_ClipGuard.OverlayVisible() || m_ClipGuard.InfoVisible() || m_ClipGuard.ShowViewNote() || m_ClipGuard.HasLogNote())) {
+		DrawClipGuardOverlay(pBackBuffer);
+	}
+
+	// F11 in ClipGuard.exe: save the log and a screenshot of this frame.
+	if (m_ClipGuard.Ready() && m_ClipGuard.LogPending()) {
+		m_ClipGuard.SaveLog(pBackBuffer);
+	}
+
 	if (m_bAlphaBitmapEnable) {
 		D3D11_TEXTURE2D_DESC desc;
 		pBackBuffer->GetDesc(&desc);
@@ -7774,7 +8036,7 @@ HRESULT CDX11VideoProcessor::UpdateConvertColorShader()
 	// do the tone mapping. Chroma upsampling (KrigBilateral 4:2:2) stays in the
 	// converter, where it belongs.
 	{
-		const bool bHdrSrc = m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084
+		const bool bHdrSrc = SrcIsPq()
 			|| m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
 		const bool bToSdrIntent = m_bConvertToSdr
 			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping));
@@ -7959,6 +8221,53 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 		resizerY = (h1 == h2) ? nullptr : (h1 > h2) ? m_pShaderDownscaleY.p : m_pShaderUpscaleY.p;
 	}
 
+	// 2.43.0: Upscaler = FSRCNNX. At about 2x (1080p on a 4K screen) the
+	// neural network doubles the luma first; the 2x picture then goes through
+	// this function again to the exact size (downscaler for the last few %).
+	{
+		const bool want = !m_bNeuralBusy && rotation == 0 && !m_bFlip && m_ClipGuard.Upscaler() == 1
+			&& w1 > 0 && h1 > 0
+			&& w2 >= w1 * 16 / 10 && w2 <= w1 * 24 / 10 && h2 >= h1 * 16 / 10 && h2 <= h1 * 24 / 10;
+		if (!m_bNeuralBusy) m_iNeuralBanner = 0;
+		if (want) {
+			m_NeuralUps.Request();
+			if (m_NeuralUps.Ready(m_pDevice)) {
+				auto draw = [&](ID3D11RenderTargetView* rtv, UINT w, UINT h, ID3D11PixelShader* ps,
+					ID3D11ShaderResourceView* const* srvs, UINT nSrv) {
+					D3D11_VIEWPORT vp = { 0.0f, 0.0f, (FLOAT)w, (FLOAT)h, 0.0f, 1.0f };
+					const UINT stride = sizeof(VERTEX), offset = 0;
+					m_pDeviceContext->IASetInputLayout(m_pVSimpleInputLayout);
+					m_pDeviceContext->OMSetRenderTargets(1, &rtv, nullptr);
+					m_pDeviceContext->RSSetViewports(1, &vp);
+					m_pDeviceContext->OMSetBlendState(nullptr, nullptr, D3D11_DEFAULT_SAMPLE_MASK);
+					m_pDeviceContext->VSSetShader(m_pVS_Simple, nullptr, 0);
+					m_pDeviceContext->PSSetShader(ps, nullptr, 0);
+					m_pDeviceContext->PSSetShaderResources(0, nSrv, srvs);
+					m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+					m_pDeviceContext->IASetVertexBuffers(0, 1, &m_pVertexBuffer.p, &stride, &offset);
+					m_pDeviceContext->Draw(4, 0);
+					ID3D11ShaderResourceView* none[5] = {};
+					m_pDeviceContext->PSSetShaderResources(0, 5, none);
+				};
+				hr = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, Tex.desc.Width, Tex.desc.Height,
+					CRect(0, 0, Tex.desc.Width, Tex.desc.Height), 0, false);
+				if (SUCCEEDED(hr)) {
+					hr = m_NeuralUps.Run(m_pDevice, m_pDeviceContext, Tex.pShaderResource, Tex.desc.Width, Tex.desc.Height, draw);
+				}
+				if (SUCCEEDED(hr)) {
+					m_bNeuralBusy = true;
+					const CRect src2(srcRect.left * 2, srcRect.top * 2, srcRect.right * 2, srcRect.bottom * 2);
+					hr = ResizeShaderPass(m_NeuralUps.Out(), pRenderTarget, src2, dstRect, 0);
+					m_bNeuralBusy = false;
+					m_iNeuralBanner = 1;
+					return hr;
+				}
+				hr = S_OK;
+			}
+			m_iNeuralBanner = (m_NeuralUps.GetState() == CNeuralUpscale::kFailed) ? 3 : 2;
+		}
+	}
+
 	// NEAR-1:1 â€” do NOT run a ringing kernel. The renderer's window is often a
 	// few pixels smaller than the source (measured 31 Oct: 3840x2160 source into
 	// a 3834x2154 window), so the 4:2:2 (P210) shader path resampled by 0.16 %
@@ -8059,12 +8368,21 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		return hr;
 	}
 
+	// ClipGuard 2.45.0: Dither Temporal moves the dither pattern to a new random
+	// whole-texel position every frame, so it averages out instead of sitting
+	// still. Static (0, 0) is the original behaviour.
+	FLOAT ditherOff[2] = { 0.0f, 0.0f };
+	if (m_ClipGuard.TemporalDither()) {
+		m_DitherSeed = m_DitherSeed * 1664525u + 1013904223u;
+		ditherOff[0] = (float)((m_DitherSeed >> 8) % dither_size) / dither_size;
+		ditherOff[1] = (float)((m_DitherSeed >> 20) % dither_size) / dither_size;
+	}
 	const FLOAT constants[8] = {
 		(float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size,
 		m_bCubeLutEnabled ? 1.0f : 0.0f, (float)m_iCubeLutSize,
 		m_bDitherActive ? 1.0f : 0.0f,
 		(float)m_iCubeLutMode,
-		0, 0
+		ditherOff[0], ditherOff[1]
 	};
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFinalPassConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
@@ -8111,7 +8429,10 @@ void CDX11VideoProcessor::DrawSubtitles(ID3D11Texture2D* pRenderTarget)
 {
 	HRESULT hr = S_OK;
 
-	CComPtr<ISubPic> pSubPic = m_pFilter->GetSubPic(m_rtStart);
+	// 2.68.0: the subtitle for the frame on screen, which the look-ahead holds back
+	// (it was the one for the newest frame, so subtitles came early by the look-ahead).
+	const REFERENCE_TIME rtShown = m_rtStart - m_rtClipGuardShownDelay;
+	CComPtr<ISubPic> pSubPic = m_pFilter->GetSubPic(rtShown);
 	if (pSubPic) {
 		RECT rcSource, rcDest;
 		hr = pSubPic->GetSourceAndDest(m_windowRect, m_videoRect, &rcSource, &rcDest, FALSE, {}, 0, FALSE);
@@ -8140,7 +8461,7 @@ void CDX11VideoProcessor::DrawSubtitles(ID3D11Texture2D* pRenderTarget)
 		if (SUCCEEDED(hr)) {
 			const CRect rSrcPri(POINT(0, 0), m_windowRect.Size());
 			const CRect rDstVid(m_videoRect);
-			const auto rtStart = m_pFilter->m_rtStartTime + m_rtStart;
+			const auto rtStart = m_pFilter->m_rtStartTime + rtShown;
 
 			// Set render target and shaders
 			m_pDeviceContext->OMSetRenderTargets(1, &pRenderTargetView, nullptr);
@@ -8741,6 +9062,115 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 		}
 
+		// ClipGuard: measure the finished SDR picture, then apply the highlight
+		// roll-off (and the test views). After every Unplugged stage and the custom
+		// shaders; before interlaced output and the final calibration LUT / dither.
+		if (m_ClipGuard.Ready()) {
+			StepSetting();
+			const bool bPqOut = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+			const bool bBypass = bPqOut || m_bHDRPassthroughRaw;
+			m_ClipGuard.BeginFrame(bBypass, (m_bMLFeaturesReady && m_MLMeanNitsRaw > 0.0f) ? m_MLMeanNitsRaw : -1.0f);
+			{
+				// Banner "Skipped": nothing counts until 10 s have been played
+				// since the start or the last seek.
+				const unsigned raw = m_pFilter->m_DrawStats.m_dropped + m_RenderStats.dropped2;
+				if (raw < m_SkipBase) { m_SkipBase = raw; m_SkipGraceT = 0; }   // counters were reset: a new start
+				// The frame count started again: a new file. Its picture may have
+				// another shape, so the remembered one is dropped.
+				const unsigned frames = (unsigned)m_pFilter->m_FrameStats.GetFrames();
+				if (frames < m_LastFrames) m_ClipGuard.AreaReset();
+				m_LastFrames = frames;
+				if (m_SkipGraceT < 100000000) {
+					m_SkipGraceT += (m_rtAvgTimePerFrame > 0) ? m_rtAvgTimePerFrame : 416667;
+					m_SkipBase = raw;
+				}
+			}
+
+			const float inW = (float)pInputTexture->desc.Width;
+			const float inH = (float)pInputTexture->desc.Height;
+			const float offX = (float)rect.left / inW;
+			const float offY = (float)rect.top / inH;
+			const float scX = (float)rect.Width() / inW;
+			const float scY = (float)rect.Height() / inH;
+
+			m_ClipGuard.GpuBegin();
+			if (!bBypass && rect.Width() > 0 && rect.Height() > 0) {
+				m_ClipGuard.FillMeasureCB(scX / m_ClipGuard.CellsX(), scY / m_ClipGuard.CellsY(), offX, offY, scX, scY);
+				const HRESULT hrM = TextureCopyRect(*pInputTexture, m_ClipGuard.MeasureTex(), rect,
+					CRect(0, 0, m_ClipGuard.CellsX(), m_ClipGuard.CellsY()), m_ClipGuard.PSMeasure(), m_ClipGuard.CBMeasure(), 0, false);
+				if (SUCCEEDED(hrM)) {
+					m_ClipGuard.EndMeasure();
+				}
+			}
+
+			// Look-ahead: keep the last frames and show the one from N frames ago.
+			// The measurement just read is from 2 frames ago, so at N = 2 the fix
+			// lands on the frame it was measured on; beyond 2 it can also start
+			// fading a new spot in before the light appears.
+			const Tex2D_t* pShow = pInputTexture;
+			const UINT la = (UINT)m_ClipGuard.LookAheadFrames();
+			m_rtClipGuardShownDelay = 0;
+			if (!bBypass && la > 0) {
+				const UINT ring = la + 1;
+				if (ring != m_ClipGuardDelayRing) {
+					for (auto& t : m_ClipGuardDelay) t.Release();
+					m_ClipGuardDelayRing = ring;
+					m_ClipGuardDelayN = 0;
+					m_ClipGuardDelayPos = 0;
+				}
+				const D3D11_TEXTURE2D_DESC& d = pInputTexture->desc;
+				bool ok = true;
+				for (UINT i = 0; i < ring; i++) {
+					Tex2D_t& t = m_ClipGuardDelay[i];
+					if (t.desc.Width != d.Width || t.desc.Height != d.Height || t.desc.Format != d.Format) {
+						m_ClipGuardDelayN = 0;
+						if (FAILED(t.Create(m_pDevice, d.Format, d.Width, d.Height, Tex2D_DefaultShader))) ok = false;
+					}
+				}
+				if (ok && pInputTexture->pTexture) {
+					m_pDeviceContext->CopyResource(m_ClipGuardDelay[m_ClipGuardDelayPos].pTexture, pInputTexture->pTexture);
+					if (m_ClipGuardDelayN >= la) {
+						pShow = &m_ClipGuardDelay[(m_ClipGuardDelayPos + 1) % ring];
+						m_rtClipGuardShownDelay = (REFERENCE_TIME)la * m_rtAvgTimePerFrame;
+					}
+					m_ClipGuardDelayPos = (m_ClipGuardDelayPos + 1) % ring;
+					m_ClipGuardDelayN = std::min(m_ClipGuardDelayN + 1, ring);
+				}
+			} else if (m_ClipGuardDelayRing) {
+				for (auto& t : m_ClipGuardDelay) t.Release();
+				m_ClipGuardDelayN = 0;
+				m_ClipGuardDelayRing = 0;
+			}
+
+			m_ClipGuard.FillMainCB(bBypass, offX, offY, scX, scY, inW);
+			hr = TextureCopyRect(*pShow, pRT, rect, rect, m_ClipGuard.PSMain(), m_ClipGuard.CBMain(), 0, false);
+			m_ClipGuard.UnbindMask();
+
+			// While the overlay shows: measure the picture as sent (after the fix),
+			// for the before/after ADL and peak readout.
+			if (!bBypass && SUCCEEDED(hr) && m_ClipGuard.OverlayVisible() && rect.Width() > 0 && rect.Height() > 0) {
+				D3D11_TEXTURE2D_DESC od = {};
+				pRT->GetDesc(&od);
+				if (SUCCEEDED(m_ClipGuardOut.CheckCreate(m_pDevice, od.Format, od.Width, od.Height, Tex2D_DefaultShader))) {
+					const D3D11_BOX box = { (UINT)rect.left, (UINT)rect.top, 0, (UINT)rect.right, (UINT)rect.bottom, 1 };
+					m_pDeviceContext->CopySubresourceRegion(m_ClipGuardOut.pTexture, 0, (UINT)rect.left, (UINT)rect.top, 0, pRT, 0, &box);
+					const HRESULT hrO = TextureCopyRect(m_ClipGuardOut, m_ClipGuard.MeasureOutTex(), rect,
+						CRect(0, 0, m_ClipGuard.CellsX(), m_ClipGuard.CellsY()), m_ClipGuard.PSMeasure(), m_ClipGuard.CBMeasure(), 0, false);
+					if (SUCCEEDED(hrO)) {
+						m_ClipGuard.EndMeasureOut();
+					}
+				}
+			}
+			m_ClipGuard.GpuEnd();
+		}
+
+		// 2.43.2: BT.709 -> BT.2020, after ClipGuard (which measures the original
+		// colour) and before interlacing, the calibration LUT and dither.
+		if (Gamut2020Step()) {
+			StepSetting();
+			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSGamut2020, nullptr, 0, false);
+		}
+
 		if (m_pPSHalfOUtoInterlace) {
 			DrawSubtitles(pRT);
 
@@ -9333,6 +9763,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.iOutputGamut != m_iOutputGamut) {
 		m_iOutputGamut = config.iOutputGamut;
+		UpdatePostScaleTexures();   // 2.43.2: the BT.709 -> BT.2020 step comes or goes
 		// Read from the correction shader's constant buffer, so it needs the SAME
 		// update mechanism as iSDRDisplayNits just below â€” changeLuminanceParams
 		// -> SetShaderLuminanceParams(). NOT changeConvertShader: that flag
@@ -9847,6 +10278,7 @@ void CDX11VideoProcessor::Flush()
 	}
 
 	m_rtStart = 0;
+	m_SkipGraceT = 0;   // banner "Skipped": the 10 s start again after a seek
 
 	m_DoviExtensionMetadata = {};
 #ifndef NDEBUG
@@ -10136,6 +10568,844 @@ void CDX11VideoProcessor::UpdateStatsPostProc()
 	}
 }
 */
+
+// ClipGuard overlay: a dark, slightly see-through panel with rounded corners
+// at the bottom left of the active picture (inside the black bars): title, the settings in three sections (the
+// selected one on a blue bar), the keys, and the readout. Kept dim so it does
+// not set off the projector's laser dimming. In Split screen and Side by side
+// a note sits above the picture. Drawn on the back buffer after the video, so
+// it is never measured by the fix.
+// 2.56.0: tone curve names as Unplugged's menu shows them (7 is "Unplugged")
+// 2.68.0: the banner's look-ahead line, with whose it is (Kaleidescape / Video Processor / Media Player).
+template <class CI> static std::wstring CgLookAheadText(const CI& ci)
+{
+	const wchar_t* who = ci.laSource == 1 ? L" (Kaleidescape)" : ci.laSource == 2 ? L" (Video Processor)" : ci.laSource == 3 ? L" (Media Player)" : L"";
+	if (ci.lookAhead >= 12) return std::wstring(L"High Performance") + who;
+	if (ci.lookAhead > 0) return std::format(L"Look-ahead {} frames", ci.lookAhead) + who;
+	return std::wstring(L"Look-ahead Off") + who;
+}
+
+static const wchar_t* const kBannerCurves[] = { L"", L"ACES", L"Reinhard", L"Hable", L"Mobius", L"BT.2390", L"ST 2094-10", L"Unplugged",
+	L"GT7", L"Spline", L"GT7 Adapt", L"Dynamic & Auto", L"Identity" };
+
+void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
+{
+	if (m_windowRect.IsRectEmpty()) {
+		return;
+	}
+	const SIZE rtSize = m_windowRect.Size();
+	m_ClipGuard.EnsureFont(rtSize.cy);
+	const int u = (int)m_ClipGuard.FontH();
+	if (u <= 0) {
+		return;
+	}
+	CD3D11Font& fM = m_ClipGuard.Font();
+	CD3D11Font& fS = m_ClipGuard.FontS();
+	CD3D11Font& fT = m_ClipGuard.FontT();
+	CD3D11Font& fB = m_ClipGuard.FontB();
+	CD3D11Font& fH = m_ClipGuard.FontHd();
+
+	CRect video = m_videoRect;
+	video.IntersectRect(video, CRect(0, 0, rtSize.cx, rtSize.cy));
+	if (video.IsRectEmpty()) {
+		video.SetRect(0, 0, rtSize.cx, rtSize.cy);
+	}
+
+	// The active picture: the video without its black bars (as measured).
+	int actTop = (int)video.top, actBot = (int)video.bottom;
+	{
+		const float vh = (float)video.Height();
+		actTop += (int)(m_ClipGuard.StableTopBarFrac() * vh);
+		actBot -= (int)(m_ClipGuard.StableBottomBarFrac() * vh);
+		if (actBot - actTop < u * 6) {
+			actTop = (int)video.top;
+			actBot = (int)video.bottom;
+		}
+	}
+
+	CComPtr<ID3D11RenderTargetView> pRTV;
+	if (FAILED(m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRTV))) {
+		return;
+	}
+
+	// Colours (premultiplied for the see-through ones).
+	auto pm = [](int a, int r, int g, int b) { return D3DCOLOR_ARGB(a, r * a / 255, g * a / 255, b * a / 255); };
+	// The Unplugged menu's palette: near-black panel, orange accent, off-white text.
+	const D3DCOLOR cPanel = pm(240, 12, 14, 14), cEdge = D3DCOLOR_XRGB(150, 150, 150), cRule = D3DCOLOR_XRGB(48, 50, 52);
+	const D3DCOLOR cSelBar = D3DCOLOR_XRGB(33, 35, 37);
+	const D3DCOLOR cText = D3DCOLOR_XRGB(226, 226, 226), cTextSel = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cDim = D3DCOLOR_XRGB(128, 128, 128), cSub = D3DCOLOR_XRGB(176, 176, 176), cTitle = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cOrange = D3DCOLOR_XRGB(245, 97, 26), cKnob = D3DCOLOR_XRGB(255, 147, 71), cInk = D3DCOLOR_XRGB(10, 10, 10);
+	const D3DCOLOR cKeyCap = D3DCOLOR_XRGB(33, 35, 37), cKeyEdge = D3DCOLOR_XRGB(96, 98, 100), cKeyText = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cWhite = D3DCOLOR_XRGB(255, 255, 255);
+
+	auto fill = [&](int x0, int y0, int x1, int y1, D3DCOLOR c) {
+		if (x1 <= x0 || y1 <= y0) return;
+		m_ClipGuardRect.Set({ x0, y0, x1, y1 }, rtSize, c);
+		m_ClipGuardRect.Draw(pRTV, rtSize);
+	};
+	// Inset of a rounded rectangle's edge on scanline j (0 = top) of r rows.
+	auto inset = [](int j, int r) {
+		const float dy = (float)r - (float)j - 0.5f;
+		return (int)std::lround((float)r - std::sqrt(std::max(0.0f, (float)(r * r) - dy * dy)));
+	};
+	auto fillRound = [&](int x0, int y0, int x1, int y1, int r, D3DCOLOR c) {
+		r = std::min(r, std::min((x1 - x0) / 2, (y1 - y0) / 2));
+		for (int j = 0; j < r; j++) {
+			const int d = inset(j, r);
+			fill(x0 + d, y0 + j, x1 - d, y0 + j + 1, c);
+			fill(x0 + d, y1 - j - 1, x1 - d, y1 - j, c);
+		}
+		fill(x0, y0 + r, x1, y1 - r, c);
+	};
+	// A rounded outline t pixels wide, drawn without covering the inside.
+	auto edgeRound = [&](int x0, int y0, int x1, int y1, int r, int t, D3DCOLOR c) {
+		r = std::min(r, std::min((x1 - x0) / 2, (y1 - y0) / 2));
+		const int ri = std::max(0, r - t);
+		for (int j = 0; j < r; j++) {
+			const int d = inset(j, r);
+			int a, b;
+			if (j < t) { a = x0 + d; b = x1 - d; }
+			else { a = x0 + d; b = x0 + t + inset(j - t, ri); }
+			for (int k = 0; k < 2; k++) {
+				const int yy = k ? (y1 - j - 1) : (y0 + j);
+				if (j < t) fill(a, yy, b, yy + 1, c);
+				else { fill(a, yy, b, yy + 1, c); fill(x1 - (b - x0), yy, x1 - (a - x0), yy + 1, c); }
+			}
+		}
+		fill(x0, y0 + r, x0 + t, y1 - r, c);
+		fill(x1 - t, y0 + r, x1, y1 - r, c);
+	};
+	auto width = [](CD3D11Font& f, const std::wstring& s) {
+		SIZE sz = {};
+		f.GetTextExtent(s.c_str(), &sz);
+		return (int)sz.cx;
+	};
+	auto text = [&](CD3D11Font& f, int x, int y, D3DCOLOR c, const std::wstring& s) {
+		f.Draw2DText(pRTV, rtSize, (float)x, (float)y, c, s.c_str());
+	};
+	// Settings rows: values off-white, Off and hints grey. Readout lines: what
+	// is active in the lighter orange, notes in orange, the cost line grey.
+	auto rowColor = [&](int st, bool sel) {
+		if (st == 3 || st == 2) return cDim;
+		return sel ? cTextSel : cText;
+	};
+	auto lineColor = [&](int st) {
+		if (st == 3) return cOrange;
+		if (st == 2) return cDim;
+		if (st == 1) return cKnob;
+		return cText;
+	};
+	auto ndcX = [&](float x) { return x * 2.0f / rtSize.cx - 1.0f; };
+	auto ndcY = [&](float y) { return 1.0f - y * 2.0f / rtSize.cy; };
+	// A right-pointing triangle sz pixels high (the menu's section arrow).
+	auto tri = [&](int x, int y, int sz, D3DCOLOR c) {
+		const float l = (float)x, t = (float)y, b = (float)(y + sz), rr = (float)x + 0.7f * (float)sz, m = (float)y + 0.5f * (float)sz;
+		m_ClipGuardQuad.Set(ndcX(l), ndcY(t), ndcX(rr), ndcY(m), ndcX(rr), ndcY(m), ndcX(l), ndcY(b), c);
+		m_ClipGuardQuad.Draw(pRTV, rtSize);
+	};
+	// A section heading: arrow and bold capitals in orange. Returns its right edge.
+	auto heading = [&](int x, int y, const std::wstring& s) {
+		const int sz = u * 3 / 5;
+		tri(x, y + u / 8, sz, cOrange);
+		text(fH, x + sz, y, cOrange, s);
+		return x + sz + width(fH, s);
+	};
+
+	// ---- info banner (F6) ---------------------------------------------------------
+	// Along the top of the picture: large badges for the essentials on the left,
+	// live status badges on the right, and below them one column per group
+	// with every detail, in the Unplugged menu's look. kind: 0 = normal, 1 = active, 2 = worth a look.
+	if (m_ClipGuard.InfoVisible()) {
+		struct InfoItem { std::wstring t; int k; };
+		struct InfoGroup { std::wstring name; std::vector<InfoItem> items; std::vector<std::wstring> wide; };   // wide: the widest lines it can show, so the column keeps one width
+		struct InfoBadge { std::wstring t; bool hot; std::wstring wide; };   // wide: widest text it can show, so it keeps one width
+		std::vector<InfoGroup> groups;
+		std::vector<InfoBadge> left, right;
+
+		const bool bHDRsrc = SourceIsHDR();
+		const bool bPQsrc = m_decExFmt.VideoTransferFunction == MFVideoTransFunc_2084;
+		const bool bHLGsrc = m_decExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
+		const double fpsIn = m_pFilter->m_FrameStats.GetAverageFps();
+		const double fpsOut = m_pFilter->m_DrawStats.GetAverageFps();
+		const wchar_t scan = (m_SampleFormat != D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE) ? L'i' : L'p';
+		LPCSTR fx[6] = {};
+		const bool bYUV = m_srcParams.CSType == CS_YUV;
+		if (bYUV) {
+			GetExtendedFormatString(fx, m_srcExFmt, m_srcParams.CSType);
+		}
+		auto fxStr = [&](int i) { return (bYUV && fx[i]) ? A2WStr(fx[i]) : std::wstring(); };
+		// Bit depth: P010, P210, Y210 and Y410 hold 10 bits in a 16-bit container.
+		int srcBits = m_srcParams.CDepth;
+		if (m_srcParams.str) {
+			const std::wstring_view fn(m_srcParams.str);
+			if (fn == L"P010" || fn == L"P210" || fn == L"Y210" || fn == L"Y410") srcBits = 10;
+		}
+
+		// Badges on the left: size class, HDR type, frame rate, primaries, bit depth.
+		{
+			const UINT w = m_srcRectWidth, h = m_srcRectHeight;
+			left.push_back({ (w >= 3800 || h >= 2100) ? L"4K" : (w >= 2500 || h >= 1400) ? L"1440p" : (w >= 1900 || h >= 1000) ? L"1080p"
+				: (w >= 1200 || h >= 700) ? L"720p" : L"SD", false });
+			left.push_back({ m_Dovi.bValid ? L"DOLBY VISION" : bPQsrc ? L"HDR10" : bHLGsrc ? L"HLG" : L"SDR", bHDRsrc });
+			if (fpsIn > 1.0) left.push_back({ std::format(L"{:.3f}{}", fpsIn, scan), false });
+			// 2.59.0: Dolby Vision is rebuilt in BT.2020 (Profile 5 files say BT.709)
+			if (m_Dovi.bValid) left.push_back({ L"BT.2020", false });
+			else if (!fxStr(4).empty()) left.push_back({ fxStr(4), false });
+			if (srcBits > 0) left.push_back({ std::format(L"{}-bit", srcBits), false });
+		}
+
+		// SOURCE
+		{
+			InfoGroup g{ L"SOURCE", {} };
+			// 2.68.0 (Player): where the picture comes from.
+			{
+				const int src = m_ClipGuard.GetInfo().laSource;
+				if (src == 2) g.items.push_back({ L"Capture", 0 });
+				else if (src == 3) g.items.push_back({ L"File", 0 });
+			}
+			g.items.push_back({ fpsIn > 1.0 ? std::format(L"{} x {}, {:.3f} fps in", m_srcRectWidth, m_srcRectHeight, fpsIn)
+				: std::format(L"{} x {}", m_srcRectWidth, m_srcRectHeight), 0 });
+			if (m_srcParams.str) {
+				std::wstring f = m_srcParams.str;
+				if (srcBits > 0 && bYUV) {
+					f += std::format(L" {}-bit {}", srcBits,
+						m_srcParams.Subsampling == 420 ? L"4:2:0" : m_srcParams.Subsampling == 422 ? L"4:2:2" : L"4:4:4");
+				}
+				g.items.push_back({ f, 0 });
+			}
+			if (m_Dovi.bValid) {
+				g.items.push_back({ L"Dolby Vision", 1 });
+			} else if (bYUV) {
+				std::wstring mx = fxStr(2).empty() ? std::wstring() : L"Matrix " + fxStr(2);
+				if (!fxStr(1).empty()) mx += (mx.empty() ? L"Range " : L", range ") + fxStr(1);
+				// 2.58.0: what the range check found for a file labelled full range
+				if (m_rangeCheck == 1) mx += L" (checking)";
+				else if (m_rangeCheck == 2) mx += L" (file said 0-255)";
+				else if (m_rangeCheck == 3) mx += L" (checked)";
+				if (!mx.empty()) g.items.push_back({ mx, 0 });
+				if (!fxStr(5).empty()) g.items.push_back({ L"Transfer " + fxStr(5), 0 });
+			}
+			// The picture inside the black bars, as its aspect ratio (measured on
+			// the grid, so snapped to the usual ratios when within 1.5%).
+			{
+				float wf = 1.0f, hf = 1.0f;
+				if (m_ClipGuard.PictureArea(wf, hf) && hf > 0.01f && m_srcRectHeight) {
+					double ar = ((double)m_srcRectWidth * wf) / ((double)m_srcRectHeight * hf);
+					static const double usual[] = { 1.33, 1.37, 1.66, 1.78, 1.85, 1.90, 2.00, 2.20, 2.35, 2.39, 2.76 };
+					double best = ar;
+					double bestD = 0.015;
+					for (const double v : usual) {
+						const double dd = fabs(ar / v - 1.0);
+						if (dd < bestD) { bestD = dd; best = v; }
+					}
+					g.items.push_back({ std::format(L"Picture area {:.2f}:1", best), 0 });
+				}
+			}
+			groups.push_back(g);
+		}
+		// HDR metadata (ST 2086 as the renderer read it from the file)
+		if (bHDRsrc) {
+			InfoGroup g{ L"HDR", {} };
+			// 2.57.0: the Dolby Vision in the file, and whether the renderer uses it.
+			if (m_doviSeenProfile) {
+				const int pr = m_doviSeenProfile;
+				std::wstring dvs = std::format(L"Dolby Vision P{}", pr);
+				if (pr == 7) dvs += m_doviSeenFel ? L" FEL" : L" MEL";
+				const bool used = m_Dovi.bValid;
+				const wchar_t* why = L"Not Used";
+				if (used) why = L"Used";
+				else if (!m_bHdrPreferDoVi) why = L"Off, HDR10 Used";
+				const bool baseByDesign = !used && m_bHdrPreferDoVi && ((pr == 7 && m_doviSeenFel) || pr == 4);
+				if (baseByDesign) why = L"HDR10 Base Used";
+				// 2.68.0: the HDR10 base for FEL / P4 is how it plays (not an error); the
+				// marker is only for Dolby Vision that should have been used and was not.
+				g.items.push_back({ dvs + L": " + why, (used || baseByDesign || !m_bHdrPreferDoVi) ? 0 : 2 });
+			}
+			// 2.58.0: what the file says (Dolby Vision's own figures when it is used),
+			// whether or not the tone mapping reads it.
+			UINT cll = m_hdr10Cll ? m_hdr10Cll : m_bnCll, fall = m_hdr10Fall ? m_hdr10Fall : m_bnFall;
+			UINT mmax = m_hdr10Mmax ? m_hdr10Mmax : m_bnMmax, mmin = m_hdr10Mmax ? m_hdr10Mmin : m_bnMmin;
+			if (m_Dovi.bValid) {
+				if (m_DoviMaxContentLightLevel) cll = m_DoviMaxContentLightLevel;
+				if (m_DoviMaxFrameAverageLightLevel) fall = m_DoviMaxFrameAverageLightLevel;
+				if (m_DoviMaxMasteringLuminance) { mmax = m_DoviMaxMasteringLuminance; mmin = m_DoviMinMasteringLuminance; }
+			}
+			if (cll) g.items.push_back({ std::format(L"MaxCLL {}", cll), 0 });
+			if (fall) g.items.push_back({ std::format(L"MaxFALL {}", fall), 0 });
+			if (mmax) g.items.push_back({ std::format(L"Master {:.4f} - {} nits", (double)mmin / 10000.0, mmax), 0 });
+			if (m_Dovi.bValid && m_DoviExtensionMetadata.L1.present)
+				g.items.push_back({ std::format(L"Scene max {} nits (Dolby Vision)", (UINT)m_DoviExtensionMetadata.L1.max_pq), 0 });
+			if (g.items.empty()) {
+				// 2.70.0: a capture card never passes the HDR figures on; that is normal, not
+				// an error. The picture is measured every frame, and the Title peak stands in
+				// for the signal's peak.
+				if (m_ClipGuard.GetInfo().laSource == 2) {
+					g.items.push_back({ L"Not sent with capture (normal)", 0 });
+					g.items.push_back({ L"Measured every frame: scene peak and average", 0 });
+					g.items.push_back({ std::format(L"Signal peak: {:.0f} nits (Title peak)", std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f)), 0 });
+				} else {
+					g.items.push_back({ L"None received", 2 });
+				}
+			}
+			groups.push_back(g);
+		}
+		// PROCESS
+		const UINT dstW = m_videoRect.Width(), dstH = m_videoRect.Height();
+		{
+			InfoGroup g{ L"PROCESS", {} };
+			g.items.push_back({ m_D3D11VP.IsReady() ? L"D3D11 VP" : L"Shaders", 0 });
+			if (m_srcRectWidth != dstW || m_srcRectHeight != dstH) {
+				// A scale within 2% of 1:1 is a near miss (a window just short of
+				// the screen): the picture is resampled for no gain.
+				const double sx = m_srcRectWidth ? (double)dstW / (double)m_srcRectWidth : 1.0;
+				const bool nearMiss = sx > 0.98 && sx < 1.02;
+				if (m_iNeuralBanner == 1) g.items.push_back({ L"FSRCNNX x2", 0 });
+				else if (m_iNeuralBanner == 2) g.items.push_back({ L"FSRCNNX loading", 2 });
+				else if (m_iNeuralBanner == 3) g.items.push_back({ L"FSRCNNX failed", 2 });
+				else if (m_strShaderX) g.items.push_back({ m_strShaderX, 0 });
+				else if (m_strShaderY) g.items.push_back({ m_strShaderY, 0 });
+				g.items.push_back({ std::format(L"Scaled to {} x {}", dstW, dstH), nearMiss ? 2 : 0 });
+			} else {
+				g.items.push_back({ L"1:1, no scaling", 0 });
+			}
+			// 2.43.2: how colour (chroma) is upscaled
+			{
+				static const wchar_t* kChroma[CHROMA_COUNT] = { L"Nearest", L"Bilinear", L"Catmull-Rom", L"KrigBilateral" };
+				const int sub = m_srcParams.Subsampling;
+				std::wstring c;
+				if (m_D3D11VP.IsReady()) c = L"Chroma by D3D11 VP";
+				else if (sub == 444 || sub == 0) c = L"Chroma 4:4:4, none needed";
+				else c = std::format(L"Chroma {} {}", kChroma[std::clamp(m_iChromaScaling, 0, CHROMA_COUNT - 1)], sub == 420 ? L"4:2:0" : L"4:2:2");
+				if (m_iNeuralBanner == 1) c += L" + Krig 2x";
+				g.items.push_back({ c, 0 });
+			}
+			// 2.56.0: say what does the tone mapping, in Unplugged's names
+			if (m_strCorrection && !wcscmp(m_strCorrection, L"PQ to SDR")) {
+				const int tc = m_iHdrLocalToneMappingType;
+				const wchar_t* cn = (tc >= 1 && tc < (int)std::size(kBannerCurves)) ? kBannerCurves[tc] : L"Unplugged";
+				g.items.push_back({ std::format(L"Tone Mapped: {} Curve, Shaders", cn), 0 });
+			}
+			else if (m_strCorrection) g.items.push_back({ m_strCorrection, 0 });
+			g.items.push_back({ m_bDitherUsed ? L"Dither On" : L"Dither Off", 0 });
+			groups.push_back(g);
+		}
+		// UNPLUGGED
+		{
+			InfoGroup g{ L"UNPLUGGED", {} };
+			if (bHDRsrc && !m_bHDRPassthroughRaw) {
+				const int tc = m_iHdrLocalToneMappingType;
+				if (tc >= 1 && tc < (int)std::size(kBannerCurves)) g.items.push_back({ std::wstring(L"Tone Curve ") + kBannerCurves[tc], 0 });
+			}
+			if (m_bMLFeaturesReady) {
+				// Always shown (0 on a black frame), so the lines below don't move.
+				g.items.push_back({ std::format(L"Scene {:.0f} nits", std::max(0.0f, m_MLMeanNitsRaw)), 0 });
+				g.wide = { L"Scene 0000 nits" };
+			}
+			g.items.push_back({ m_bMLActive ? L"ML Grade On" : (m_bML && !SourceIsHDR()) ? L"ML Grade Off (SDR source)" : L"ML Grade Off", m_bMLActive ? 1 : 0 });
+			if (m_bMLActive) {
+				const bool mc = m_lastMLParams.MCStrength > 0.0f;
+				g.items.push_back({ mc ? L"Micro contrast On" : L"Micro contrast Off", mc ? 1 : 0 });
+			}
+			groups.push_back(g);
+		}
+		// OUTPUT: the display line of the statistics, the adapter, the drawn rate.
+		{
+			InfoGroup g{ L"OUTPUT", {} };
+			std::wstring d = m_strStatsDispInfo;
+			auto cut = [&](const wchar_t* what) {
+				const size_t i = d.find(what);
+				if (i != std::wstring::npos) d.erase(i, wcslen(what));
+				return i != std::wstring::npos;
+			};
+			cut(L"\nDisplay: ");
+			std::wstring color;
+			{
+				const size_t i = d.find(L"\n  Color: ");
+				if (i != std::wstring::npos) { color = d.substr(i + 10); d.erase(i); }
+			}
+			cut(L" Primary");
+			const bool exclusive = cut(L" exclusive");
+			cut(L" windowed");
+			if (!d.empty()) g.items.push_back({ d, 0 });
+			if (!color.empty()) g.items.push_back({ color, 0 });
+			// 2.43.2: the colour space the picture is sent in
+			{
+				const bool pq = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+				const bool src2020 = (m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) || m_Dovi.bValid;   // Dolby Vision is rebuilt in BT.2020
+				const wchar_t* gm = Gamut2020Step() ? L"Gamut BT.2020, BT.709 converted"
+					: (pq || (src2020 && m_iOutputGamut == 1)) ? L"Gamut BT.2020"
+					: L"Gamut BT.709";
+				g.items.push_back({ gm, 0 });
+			}
+			if (fpsOut > 1.0) g.items.push_back({ std::format(L"{:.3f} fps drawn", fpsOut), 0 });
+			// 2.44.4: "filled" when the player asked for a few pixels less than its
+			// full-screen window and the video fills it; otherwise what the player
+			// window is, when the video is smaller than it.
+			if (g_cgFilled)
+				g.items.push_back({ std::format(L"{} {} x {}, filled", exclusive ? L"Exclusive" : L"Window", (int)rtSize.cx, (int)rtSize.cy), 0 });
+			else if (g_cgPlayerW > 0 && (g_cgPlayerW != (int)rtSize.cx || g_cgPlayerH != (int)rtSize.cy))
+				g.items.push_back({ std::format(L"{} {} x {} (player {} x {})", exclusive ? L"Exclusive" : L"Window", (int)rtSize.cx, (int)rtSize.cy, g_cgPlayerW, g_cgPlayerH), 2 });
+			else
+				g.items.push_back({ std::format(L"{} {} x {}", exclusive ? L"Exclusive" : L"Window", (int)rtSize.cx, (int)rtSize.cy), 0 });
+			{
+				std::wstring a = m_strAdapterDescription;
+				const size_t i = a.find(L" (");
+				if (i != std::wstring::npos) a.erase(i);
+				if (!a.empty()) g.items.push_back({ a, 0 });
+			}
+			groups.push_back(g);
+		}
+		// SYNC
+		{
+			InfoGroup g{ L"SYNC", {} };
+			g.wide = { L"Frames 00000000", L"Skipped 00000", L"Offset +0000 ms", L"ClipGuard GPU 00.00 ms", L"ClipGuard CPU 00.00 ms", L"GPU load 100%", L"GPU memory 00.0 of 00.0 GB" };
+			const unsigned skippedAll = m_pFilter->m_DrawStats.m_dropped + m_RenderStats.dropped2;
+			const unsigned skipped = skippedAll > m_SkipBase ? skippedAll - m_SkipBase : 0;   // not those of the first 10 s
+			g.items.push_back({ std::format(L"Frames {}", m_pFilter->m_FrameStats.GetFrames()), 0 });
+			g.items.push_back({ std::format(L"Skipped {}", skipped), skipped ? 2 : 0 });
+			g.items.push_back({ std::format(L"Offset {:+} ms", (m_RenderStats.syncoffset + 5000) / 10000), 0 });
+			if (m_ClipGuard.GpuMs() >= 0.0) g.items.push_back({ std::format(L"ClipGuard GPU {:.2f} ms", m_ClipGuard.GpuMs()), 0 });
+			g.items.push_back({ std::format(L"ClipGuard CPU {:.2f} ms", m_ClipGuard.CpuMs()), 0 });
+			// The card's load as Windows reports it (Task Manager's 3D figure).
+			if (m_ClipGuard.GpuLoad() >= 0.0f) {
+				const float load = m_ClipGuard.GpuLoad();
+				g.items.push_back({ std::format(L"GPU load {:.0f}%", load), load >= 85.0f ? 2 : 0 });
+			}
+			// Video memory this player uses, and what Windows allows it (read twice a second).
+			{
+				static ULONGLONG sMemTick = 0;
+				static double sMemUsed = -1.0, sMemBudget = 0.0;
+				const ULONGLONG nowTick = GetTickCount64();
+				if (nowTick - sMemTick >= 500 && m_pDevice) {
+					sMemTick = nowTick;
+					CComQIPtr<IDXGIDevice> pDxgiDev(m_pDevice.p);
+					CComPtr<IDXGIAdapter> pAd;
+					if (pDxgiDev && SUCCEEDED(pDxgiDev->GetAdapter(&pAd)) && pAd) {
+						CComQIPtr<IDXGIAdapter3> pAd3(pAd);
+						DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+						if (pAd3 && SUCCEEDED(pAd3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) {
+							sMemUsed = (double)mi.CurrentUsage / 1073741824.0;
+							sMemBudget = (double)mi.Budget / 1073741824.0;
+						}
+					}
+				}
+				if (sMemUsed >= 0.0) g.items.push_back({ std::format(L"GPU memory {:.1f} of {:.1f} GB", sMemUsed, sMemBudget), 0 });
+			}
+			groups.push_back(g);
+		}
+		// CLIPGUARD: the fix and its settings. HOT SPOTS: the lights.
+		{
+			const auto ci = m_ClipGuard.GetInfo();
+			InfoGroup g{ std::wstring(L"CLIPGUARD ") + m_ClipGuard.VersionText(), {} };
+			InfoGroup h{ L"HOT SPOTS", {} };
+			g.wide = { L"Picture 100.0%, peak 100%", L"Guard 100%, white 100%", L"Strength 0.00, Normal", L"Strength 0.00, Anchor", L"Look-ahead 6 frames", L"Look-ahead 6 frames (Kaleidescape)", L"Look-ahead 6 frames (Video Processor)", L"High Performance (Video Processor)", L"Look-ahead Off", L"Normal grid", L"Titan Noir Max DBLE High (Predictive)", L"Titan Noir Max DBLE Low (Predictive)", L"Projector Universal (Reactive)", L"Laser 100%, clips above 255", L"DBLE level 255", L"Firmware V1.3.38", L"LUT: Valerion, BT.2020 BT.1886, dE 0.8, 17 Nov" };
+			h.wide = { L"16 lights, 16 dimmed", L"Hot spot 0.00, Patch", L"Hot spot 0.00, Pixel", L"Below 10.0%: holding off", L"Below 10.0%: at 100%", L"16 lamps, 16 strips", L"16 fires left alone", L"16 graded to 100%", L"No graded spots" };
+			// 2.46.0: the projector mode is always shown.
+			if (m_ClipGuard.MeasuredMode()) {
+				// 2.47.0: the measured model replaces the Guard and Hot spot rules; show what it predicts.
+				g.items.push_back({ m_ClipGuard.ProjectorName(), 0 });   // 2.60.0: DBLE High or DBLE Low
+				g.items.push_back({ L"Firmware V1.3.38", 0 });
+				if (!m_ClipGuard.FixOn()) {
+					g.items.push_back({ L"Guard Off", 2 });
+				} else if (m_ClipGuard.RampStale()) {
+					g.items.push_back({ L"No video: prediction paused", 0 });
+				} else if (m_ClipGuard.Measured()) {
+					const float rp = m_ClipGuard.RampPct();
+					g.items.push_back({ rp < 99.5f ? std::format(L"Laser {:.0f}%, clips above {:.0f}", rp, m_ClipGuard.ClipLevel()) : std::wstring(L"Laser 100%, no clipping"), rp < 99.5f ? 1 : 0 });
+					g.items.push_back({ std::format(L"DBLE level {:.0f}", m_ClipGuard.DbleLevel()), 0 });
+					g.items.push_back({ CgLookAheadText(ci), 0 });
+				} else {
+					g.items.push_back({ L"Measuring", 0 });
+				}
+				h.items.push_back({ L"Predictive model", 0 });
+			} else {
+				g.items.push_back({ L"Projector Universal (Reactive)", 0 });
+			}
+			// 2.48.0: the calibration LUT, as the renderer has it.
+			if (m_ClipGuard.Lut() != 0) {   // 2.50.0: the LUT row, not the projector
+				const int ls = m_ClipGuard.LutState();
+				if (ls == 1 && m_bCubeLutEnabled)
+					g.items.push_back({ L"LUT: " + m_ClipGuard.LutDesc() + L" (on)", 0 });
+				else if (ls == 2)
+					g.items.push_back({ L"LUT: failed to load", 2 });
+				else if (ls == 3)
+					g.items.push_back({ L"LUT: off (F5)", 1 });
+				else
+					g.items.push_back({ L"LUT: none", 0 });
+			}
+			if (m_ClipGuard.MeasuredMode()) {
+				// shown above
+			} else if (!m_ClipGuard.FixOn()) {
+				g.items.push_back({ L"Guard Off", 2 });
+			} else if (m_ClipGuard.Measured()) {
+				g.items.push_back({ std::format(L"Picture {:.1f}%, peak {:.0f}%", ci.picture, ci.peak), 0 });
+				g.items.push_back({ std::format(L"Guard {:.0f}%, white {:.0f}%", ci.fix, ci.white), ci.fix >= 0.5f ? 1 : 0 });
+				g.items.push_back({ std::format(L"Strength {:.2f}, {}", ci.strength, ci.fixShape == 1 ? L"Anchor" : L"Normal"), 0 });
+				g.items.push_back({ CgLookAheadText(ci), 0 });
+				g.items.push_back({ ci.grid ? L"Fine grid" : L"Normal grid", 0 });
+
+				const int spots = m_ClipGuard.SpotsDimmed();
+				if (ci.hotSpot <= 0.0f) {
+					h.items.push_back({ L"Hot spot Off", 2 });
+				} else {
+					h.items.push_back({ ci.lights ? std::format(L"{} light{}, {} dimmed", ci.lights, ci.lights == 1 ? L"" : L"s", spots) : std::wstring(L"No lights"), spots ? 1 : 0 });
+					h.items.push_back({ std::format(L"Hot spot {:.2f}, {}", ci.hotSpot, m_ClipGuard.PixelMask() ? L"Pixel" : L"Patch"), 0 });
+					h.items.push_back({ ci.gate >= 0.999f ? std::format(L"Below {:.1f}%: on", ci.hotBelow)
+						: ci.gate <= 0.001f ? std::format(L"Below {:.1f}%: holding off", ci.hotBelow)
+						: std::format(L"Below {:.1f}%: at {:.0f}%", ci.hotBelow, ci.gate * 100.0f), 0 });
+					h.items.push_back({ std::format(L"{} lamp{}, {} strip{}", ci.lamps, ci.lamps == 1 ? L"" : L"s", ci.strips, ci.strips == 1 ? L"" : L"s"), 0 });
+					if (ci.fires > 0) h.items.push_back({ std::format(L"{} fire{} left alone", ci.fires, ci.fires == 1 ? L"" : L"s"), 0 });
+					h.items.push_back({ ci.graded ? std::format(L"{} graded to {:.0f}%", ci.graded, ci.gradeCeil) : std::wstring(L"No graded spots"), ci.graded ? 1 : 0 });
+				}
+			} else {
+				g.items.push_back({ L"Measuring", 0 });
+			}
+			groups.push_back(g);
+			// Always there, so the columns keep their places.
+			if (h.items.empty()) h.items.push_back({ m_ClipGuard.FixOn() ? L"Measuring" : L"Guard Off", 0 });
+			groups.push_back(h);
+		}
+		// Status badges on the right.
+		if (m_ClipGuard.MeasuredMode() && m_ClipGuard.FixOn() && m_ClipGuard.RampStale()) {
+			right.push_back({ std::wstring(L"NO VIDEO"), false, L"CLIPS ABOVE 000" });
+		} else if (m_ClipGuard.MeasuredMode() && m_ClipGuard.FixOn() && m_ClipGuard.Measured()) {
+			// 2.47.0: Titan Noir Max: what the model predicts instead of the Guard amount.
+			const float cl = m_ClipGuard.ClipLevel();
+			right.push_back({ cl < 254.5f ? std::format(L"CLIPS ABOVE {:.0f}", cl) : std::wstring(L"NO CLIPPING"), cl < 254.5f, L"CLIPS ABOVE 000" });
+		} else if (m_ClipGuard.FixOn() && m_ClipGuard.Measured()) {
+			const int spots = m_ClipGuard.SpotsDimmed();
+			right.push_back({ std::format(L"GUARD {:.0f}%", m_ClipGuard.FixPct()), m_ClipGuard.FixPct() >= 0.5f, L"GUARD 100%" });
+			// Always shown while Hot spot is on (unlit at 0), so the row doesn't shift.
+			if (m_ClipGuard.GetInfo().hotSpot > 0.0f) right.push_back({ std::format(L"{} HOT SPOT{}", spots, spots == 1 ? L"" : L"S"), spots > 0, L"00 HOT SPOTS" });
+		} else {
+			right.push_back({ L"GUARD OFF", false, L"GUARD 100%" });
+			if (m_ClipGuard.GetInfo().hotSpot > 0.0f) right.push_back({ L"0 HOT SPOTS", false, L"00 HOT SPOTS" });
+		}
+		if (m_bMLFeaturesReady) right.push_back({ std::format(L"SCENE {:.0f} NITS", std::max(0.0f, m_MLMeanNitsRaw)), false, L"SCENE 0000 NITS" });
+		if (bHDRsrc && m_hdr10Cll) right.push_back({ std::format(L"MAXCLL {}", m_hdr10Cll), false });
+
+		// Layout: a row of large badges, then one column per group (its heading,
+		// then its values one under another), sized to be read from a seat.
+		const int bx0 = video.left, bx1 = video.right, by0 = actTop;
+		const int padX = u * 3 / 2, padY = u * 4 / 5;
+		const int hB = u * 3, bhB = hB * 4 / 3, hT = u * 3 / 2, bhT = hT * 3 / 2;
+		const int avail = (bx1 - bx0) - padX * 2;
+		// The columns in the large text when they all fit in one row, else in
+		// the menu's text size.
+		int hL = u * 31 / 20, hG = u * 13 / 10, minGap = u * 3 / 2;
+		CD3D11Font* pL = &m_ClipGuard.FontL();
+		CD3D11Font* pG = &m_ClipGuard.FontG();
+		// The layout is kept from frame to frame: a column never gets narrower,
+		// the banner never shorter and the text never switches size back while
+		// the window and the set of columns stay the same, so only the numbers
+		// change and nothing moves.
+		static int sAvail = 0, sU = 0, sPass = 0, sBh = 0;
+		static size_t sN = 0;
+		static bool sBadgeSmall = false;
+		static std::vector<int> sColW;
+		if (sAvail != avail || sU != u || sN != groups.size()) {
+			sAvail = avail; sU = u; sN = groups.size();
+			sPass = 0; sBh = 0; sBadgeSmall = false;
+			sColW.assign(groups.size(), 0);
+		}
+		std::vector<int> colW(groups.size());
+		int sumW = 0;
+		for (int pass = sPass; pass < 2; pass++) {
+			if (pass == 1) {
+				hL = u; hG = std::max(9, u * 4 / 5); minGap = u;
+				pL = &fM; pG = &fH;
+			}
+			sumW = 0;
+			for (size_t i = 0; i < groups.size(); i++) {
+				int w = hG * 3 / 5 + hG / 3 + width(*pG, groups[i].name);
+				for (const auto& it : groups[i].items) w = std::max(w, width(*pL, it.t) + (it.k == 2 ? hL + hL / 3 : 0));
+				for (const auto& t : groups[i].wide) w = std::max(w, width(*pL, t));
+				if (pass == sPass) w = std::max(w, sColW[i]);
+				colW[i] = w;
+				sumW += w;
+			}
+			if (pass == 1 || groups.empty() || sumW + (int)(groups.size() - 1) * minGap <= avail) {
+				if (sPass != pass) sBh = 0;   // smaller text: the height is worked out afresh
+				sPass = pass;
+				break;
+			}
+		}
+		sColW = colW;
+		CD3D11Font& fL = *pL;
+		CD3D11Font& fG = *pG;
+		const int rowH = hL * 27 / 20, headH = hL * 13 / 10;
+		const int warnW = hL;
+		// Columns side by side, spread over the width; when they don't fit
+		// (a small window) they wrap into a second band, and a third.
+		std::vector<std::vector<size_t>> bands(1);
+		{
+			int x = 0;
+			for (size_t i = 0; i < groups.size(); i++) {
+				if (!bands.back().empty() && x + colW[i] > avail && bands.size() < 3) {
+					bands.emplace_back();
+					x = 0;
+				}
+				bands.back().push_back(i);
+				x += colW[i] + minGap;
+			}
+		}
+		int gap = minGap;
+		if (bands.size() == 1 && groups.size() > 1) {
+			gap = std::clamp((avail - sumW) / (int)(groups.size() - 1), minGap, u * 8);
+		}
+		std::vector<int> bandRows(bands.size(), 0);
+		int colsH = 0;
+		for (size_t b = 0; b < bands.size(); b++) {
+			for (const size_t gi : bands[b]) bandRows[b] = std::max(bandRows[b], (int)groups[gi].items.size());
+			colsH += headH + bandRows[b] * rowH + (b ? u / 2 : 0);
+		}
+		const int colsY = by0 + padY + bhB + u * 9 / 10;
+		const int bh = std::max((colsY - by0) + colsH + u / 2, sBh);
+		sBh = bh;
+		fill(bx0, by0, bx1, by0 + bh, cPanel);
+		fill(bx0, by0 + bh - std::max(2, u / 8), bx1, by0 + bh, cOrange);
+
+		auto badgeW = [&](CD3D11Font& f, int fh, const InfoBadge& b) { return std::max(width(f, b.t), b.wide.empty() ? 0 : width(f, b.wide)) + fh * 4 / 5; };
+		auto badge = [&](CD3D11Font& f, int fh, int x, int y, int h, const InfoBadge& b) {
+			const int w = badgeW(f, fh, b);
+			fillRound(x, y, x + w, y + h, u / 2, b.hot ? cOrange : cSelBar);
+			edgeRound(x, y, x + w, y + h, u / 2, std::max(2, u / 9), cWhite);
+			text(f, x + (w - width(f, b.t)) / 2, y + (h - fh * 5 / 4) / 2, b.hot ? cInk : cTextSel, b.t);
+			return x + w;
+		};
+		{
+			const int bgap = u * 3 / 5;
+			int x = bx0 + padX;
+			for (const auto& b : left) x = badge(fB, hB, x, by0 + padY, bhB, b) + bgap;
+			// The status badges at the same size when they fit, else smaller.
+			int wBig = 0;
+			for (const auto& b : right) wBig += badgeW(fB, hB, b) + bgap;
+			if (x + u * 2 + wBig > bx1 - padX) sBadgeSmall = true;
+			const bool big = !sBadgeSmall;
+			CD3D11Font& fR = big ? fB : fT;
+			const int hR = big ? hB : hT, bhR = big ? bhB : bhT;
+			int xr = bx1 - padX;
+			const int ry = by0 + padY + (bhB - bhR) / 2;
+			for (const auto& b : right) {
+				const int w = badgeW(fR, hR, b);
+				if (xr - w < x + u) break;   // no room left beside the left badges
+				badge(fR, hR, xr - w, ry, bhR, b);
+				xr -= w + bgap;
+			}
+		}
+		{
+			int y = colsY;
+			for (size_t b = 0; b < bands.size(); b++) {
+				int x = bx0 + padX;
+				const int yBot = y + headH + bandRows[b] * rowH;
+				for (size_t ci = 0; ci < bands[b].size(); ci++) {
+					const InfoGroup& g = groups[bands[b][ci]];
+					if (ci) fill(x - gap / 2, y + u / 4, x - gap / 2 + std::max(1, u / 12), yBot - u / 4, cRule);
+					const int tsz = hG * 3 / 5;
+					tri(x, y + (hG * 5 / 4 - tsz) / 2, tsz, cOrange);
+					text(fG, x + tsz + hG / 3, y, cOrange, g.name);
+					int iy = y + headH;
+					for (const auto& it : g.items) {
+						int ix = x;
+						if (it.k == 2) {
+							// Worth a look: an orange box with "!", so it doesn't rest on colour alone.
+							const int by = iy + (hL * 5 / 4 - warnW) / 2;
+							fillRound(ix, by, ix + warnW, by + warnW, u / 5, cOrange);
+							edgeRound(ix, by, ix + warnW, by + warnW, u / 5, 1, cWhite);
+							text(fG, ix + (warnW - width(fG, L"!")) / 2, by + (warnW - hG * 5 / 4) / 2, cInk, L"!");
+							ix += warnW + hL / 3;
+						}
+						text(fL, ix, iy, it.k == 1 ? cKnob : cTextSel, it.t);
+						iy += rowH;
+					}
+					x += colW[bands[b][ci]] + gap;
+				}
+				y = yBot + u / 2;
+			}
+		}
+	}
+
+	const int x0 = video.left + u * 2;
+	if (m_ClipGuard.OverlayVisible()) {
+		const CClipGuard::OvModel m = m_ClipGuard.Overlay();
+		const int pad = u, rowH = u * 3 / 2, headH = u * 7 / 4, titleH = u * 5 / 2, keyH = u * 4 / 3, lineH = u * 5 / 4;
+		const int nameX = pad + u * 3 / 2;
+		// Fixed width: set by the setting names, the widest value any setting can
+		// show, the keys and the title, never by the changing readout, so the panel
+		// doesn't jump. Readout lines that don't fit wrap onto more lines.
+		int wNames = 0;
+		for (const auto& r : m.rows) {
+			if (r.heading) continue;
+			wNames = std::max(wNames, width(fM, r.name));
+		}
+		const int wVals = std::max(std::max(std::max(width(fM, L"Side by side"), width(fM, L"Restart & update")), width(fM, L"High Performance")), width(fM, L"6 frames (Kaleidescape)")) + u * 2;   // and the < > arrows
+		int wKey = 0, wWhat = 0;
+		for (const auto& k : m.keys) {
+			wKey = std::max(wKey, width(fS, k.key));
+			wWhat = std::max(wWhat, width(fS, k.what));
+		}
+		const int keyCol = wKey + u + u / 2 + wWhat + u;
+		int pw = std::max(nameX + wNames + u * 2 + wVals + pad + u / 2, pad * 2 + keyCol * 2);
+		pw = std::max(pw, pad * 2 + width(fT, L"ClipGuard+") + u + width(fS, m.version));
+		pw = std::max(pw, u * 22);
+		// Readout lines wrapped to the panel at spaces.
+		struct WLine { std::wstring text; int style; };
+		std::vector<WLine> wl;
+		for (const auto& l : m.lines) {
+			CD3D11Font& f = l.style == 2 ? fS : fM;
+			const int avail = pw - pad * 2;
+			std::wstring cur, word;
+			const std::wstring src = l.text + L" ";
+			for (wchar_t ch : src) {
+				if (ch != L' ') { word += ch; continue; }
+				if (word.empty()) continue;
+				const std::wstring tryLine = cur.empty() ? word : cur + L" " + word;
+				if (!cur.empty() && width(f, tryLine) > avail) {
+					wl.push_back({ cur, l.style });
+					cur = L"  " + word;
+				} else {
+					cur = tryLine;
+				}
+				word.clear();
+			}
+			if (!cur.empty() || l.text.empty()) wl.push_back({ cur, l.style });
+		}
+		// Fixed height too: the readout always takes kReadoutLines lines (blank
+		// below when there is less), and anything beyond is cut with "...", so
+		// the panel never grows or shrinks.
+		constexpr size_t kReadoutLines = 9;
+		if (wl.size() > kReadoutLines) {
+			wl.resize(kReadoutLines);
+			wl.back().text += L" ...";
+		}
+		// The selected setting's explanation: always kHelpLines small lines
+		// (blank below when it is shorter), so the panel keeps its size as the
+		// selection moves.
+		constexpr size_t kHelpLines = 4;
+		const int helpH = u * 11 / 10;
+		std::vector<std::wstring> hl;
+		{
+			const int avail = pw - pad * 2 - u;
+			std::wstring cur, word;
+			const std::wstring src = m.help + L" ";
+			for (wchar_t ch : src) {
+				if (ch != L' ') { word += ch; continue; }
+				if (word.empty()) continue;
+				const std::wstring tryLine = cur.empty() ? word : cur + L" " + word;
+				if (!cur.empty() && width(fS, tryLine) > avail) {
+					hl.push_back(cur);
+					cur = word;
+				} else {
+					cur = tryLine;
+				}
+				word.clear();
+			}
+			if (!cur.empty()) hl.push_back(cur);
+			if (hl.size() > kHelpLines) {
+				hl.resize(kHelpLines);
+				hl.back() += L" ...";
+			}
+		}
+		int ph = titleH + headH + (int)((m.keys.size() + 1) / 2) * keyH + u / 2 + (int)kReadoutLines * lineH + pad;
+		ph += u / 2 + (int)kHelpLines * helpH + u / 4;
+		for (const auto& r : m.rows) ph += r.heading ? headH : rowH;
+
+		// Bottom left of the active picture; pinned to its top if it doesn't fit.
+		int px = x0, py = actBot - u - ph;
+		if (py < actTop + u) py = actTop + u;
+		if (py + ph > rtSize.cy) py = std::max(0, (int)rtSize.cy - ph);
+		const int rad = u * 3 / 4, edge = std::max(1, u / 16);
+
+		fillRound(px, py, px + pw, py + ph, rad, cPanel);
+		edgeRound(px, py, px + pw, py + ph, rad, edge, cEdge);
+
+		// Title: an orange bar, the name in bold and the version.
+		fill(px + pad / 2, py + u / 2, px + pad / 2 + std::max(3, u / 5), py + u * 2, cOrange);
+		const int tx = px + pad + u / 2;
+		text(fT, tx, py + u / 2, cTitle, m.title);
+		text(fS, tx + width(fT, m.title) + u / 2, py + u / 2 + (u * 3 / 2 - u * 4 / 5), cDim, m.version);
+		int y = py + titleH;
+		fill(px + pad, y - u / 3, px + pw - pad, y - u / 3 + 1, cRule);
+
+		for (const auto& r : m.rows) {
+			if (r.heading) {
+				heading(px + pad, y + u / 2, r.name);
+				y += headH;
+				continue;
+			}
+			const int vx1 = px + pw - pad - u / 2;
+			if (r.selected) {
+				// The selected row: a grey bar, and orange < > around the value.
+				const int bx0 = px + u / 2, bx1 = px + pw - u / 2, by0 = y - u / 8, by1 = y + rowH - u / 8;
+				fillRound(bx0, by0, bx1, by1, u / 4, cSelBar);
+				const int wv = width(fM, r.value), wa = width(fM, L">");
+				text(fM, vx1 - wa, y, cOrange, L">");
+				text(fM, vx1 - wa - u / 2 - wv, y, rowColor(r.style, true), r.value);
+				text(fM, vx1 - wa - u / 2 - wv - u / 2 - width(fM, L"<"), y, cOrange, L"<");
+			} else {
+				text(fM, vx1 - width(fM, r.value), y, rowColor(r.style, false), r.value);
+			}
+			text(fM, px + nameX, y, r.selected ? cTextSel : cText, r.name);
+			y += rowH;
+		}
+
+		// The selected setting's explanation, in a fixed box under the settings.
+		fill(px + pad, y + u / 4, px + pw - pad, y + u / 4 + 1, cRule);
+		y += u / 2;
+		for (size_t i = 0; i < hl.size(); i++) {
+			text(fS, px + pad + u / 2, y + (int)i * helpH, cSub, hl[i]);
+		}
+		y += (int)kHelpLines * helpH + u / 4;
+
+		// Keys, two columns of small key caps.
+		heading(px + pad, y + u / 2, L"KEYS");
+		y += headH;
+		for (size_t i = 0; i < m.keys.size(); i++) {
+			const int kx = px + pad + (int)(i % 2) * keyCol, ky = y + (int)(i / 2) * keyH;
+			const int kw = width(fS, m.keys[i].key);
+			const int capH = u;
+			fillRound(kx, ky, kx + kw + u / 2, ky + capH, u / 6, cKeyCap);
+			edgeRound(kx, ky, kx + kw + u / 2, ky + capH, u / 6, 1, cKeyEdge);
+			text(fS, kx + u / 4, ky + (capH - u * 4 / 5) / 2, cKeyText, m.keys[i].key);
+			text(fS, kx + kw + u, ky + (capH - u * 4 / 5) / 2, cSub, m.keys[i].what);
+		}
+		y += (int)((m.keys.size() + 1) / 2) * keyH;
+		fill(px + pad, y + u / 4, px + pw - pad, y + u / 4 + 1, cRule);
+		y += u / 2;
+
+		// Readout.
+		for (const auto& l : wl) {
+			text(l.style == 2 ? fS : fM, px + pad, y + u / 8, lineColor(l.style), l.text);
+			y += lineH;
+		}
+	} else {
+		// Overlay hidden: the log note (F11) alone, on a small dark backing.
+		const std::wstring note = m_ClipGuard.LogNote();
+		if (!note.empty()) {
+			const int ny = std::clamp(actBot - u * 2, 0, std::max(0, (int)rtSize.cy - u * 2));
+			fillRound(x0 - u / 2, ny - u / 3, x0 + width(fM, note) + u / 2, ny + u * 4 / 3, u / 3, cPanel);
+			text(fM, x0, ny, cText, note);
+		}
+	}
+	if (m_ClipGuard.ShowViewNote()) {
+		// Above the picture: in the top letterbox bar (Side by side: the black above
+		// the half-size pictures), else above the video, else at the picture's top.
+		const int lineH = u * 5 / 4, margin = u / 2;
+		const float vh = (float)video.Height();
+		const int topPx = (m_ClipGuard.View() == 3) ? (int)(0.25f * vh + 0.5f * m_ClipGuard.TopBarFrac() * vh) : (int)(m_ClipGuard.TopBarFrac() * vh);
+		int ny;
+		if (topPx >= lineH + margin) {
+			ny = video.top + (topPx - lineH) / 2;
+		} else if (video.top >= lineH + 4) {
+			ny = video.top - lineH - 2;
+		} else {
+			ny = video.top + margin;
+		}
+		text(fM, x0, ny, cText,
+			L"For evaluation only: this view changes the picture, so the projector's laser dimming behaves differently than in Normal view");
+	}
+}
 
 HRESULT CDX11VideoProcessor::DrawStats(ID3D11Texture2D* pRenderTarget)
 {

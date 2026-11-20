@@ -21,6 +21,7 @@
 #include "stdafx.h"
 #include <atomic>
 #include <optional>
+#include <cmath>
 #include <evr.h> // for MR_VIDEO_ACCELERATION_SERVICE, because the <mfapi.h> does not contain it
 #include <Mferror.h>
 #include <shellapi.h> // Shell_NotifyIcon
@@ -895,6 +896,28 @@ static void DestRectTrace(const char* fmt, ...)
 	fclose(f);
 }
 
+// ClipGuard 2.44.4: when the window was filled (see SetWindowPosition), the
+// host's destination rect still fits the smaller area it asked for. A rect that
+// fits that area (touching both edges on one side, inside it) is fitted to the
+// whole window instead, same shape, centred; a zoomed or moved one is left alone.
+static CRect CgFillDest(const CRect& r)
+{
+	if (!g_cgFilled || g_cgAskedW <= 0 || g_cgAskedH <= 0) return r;
+	const int aw = g_cgAskedW, ah = g_cgAskedH, pw = g_cgPlayerW, ph = g_cgPlayerH;
+	const int dw = r.Width(), dh = r.Height();
+	if (dw <= 0 || dh <= 0 || pw <= 0 || ph <= 0) return r;
+	if (r.left < -1 || r.top < -1 || r.right > aw + 1 || r.bottom > ah + 1) return r;
+	const bool fitW = r.left <= 1 && r.right >= aw - 1;
+	const bool fitH = r.top <= 1 && r.bottom >= ah - 1;
+	if (!fitW && !fitH) return r;
+	const double sc = std::min((double)pw / dw, (double)ph / dh);
+	int nw = (int)std::lround(dw * sc), nh = (int)std::lround(dh * sc);
+	if (pw - nw <= 2) nw = pw;
+	if (ph - nh <= 2) nh = ph;
+	const int l = (pw - nw) / 2, t = (ph - nh) / 2;
+	return CRect(l, t, l + nw, t + nh);
+}
+
 // Apply any destination rect the host asked for since the last frame. Called from
 // the render thread per sample, and from Redraw() so a paused frame is repainted
 // with the geometry the host has just set instead of the previous one.
@@ -904,7 +927,7 @@ void CMpcVideoRenderer::ApplyPendingDestRect()
 	if (!m_destRectDirty) return;
 	m_destRectDirty = false;
 	if (m_destRectPending.IsRectNull()) return;
-	m_videoRect = m_destRectPending;
+	m_videoRect = CgFillDest(m_destRectPending);
 	m_VideoProcessor->SetVideoRect(m_videoRect);
 	DestRectTrace("applied %ldx%ld@%ld,%ld",
 		(long)m_videoRect.Width(), (long)m_videoRect.Height(),
@@ -1767,6 +1790,37 @@ STDMETHODIMP CMpcVideoRenderer::SetWindowPosition(long Left, long Top, long Widt
 		m_windowRect.left, m_windowRect.top, m_windowRect.right, m_windowRect.bottom);
 	LogLine("renderer: [VP-DBG] SetWindowPosition %ldx%ld@%ld,%ld hWndWindow=%d",
 		Width, Height, Left, Top, m_hWndWindow ? 1 : 0);
+	// ClipGuard 2.44.4: Unplugged asks for a video area a few pixels short of
+	// the screen (3828 x 2148 on 3840 x 2160: 6 px on every side), so every
+	// picture was resized (4K by 0.5 %, 1080p by 1.989 instead of 2). When the
+	// player's window covers the whole monitor and the asked area is within
+	// 32 px of it, the video fills the window instead: 4K is shown 1:1 and
+	// 1080p is an exact 2x. In a window (not full screen) nothing changes.
+	{
+		g_cgAskedW = (int)Width; g_cgAskedH = (int)Height;
+		g_cgFilled = false;
+		HWND hParent = m_hWndWindow ? ::GetParent(m_hWndWindow) : m_hWndParent;
+		RECT pc = {};
+		if (hParent && ::GetClientRect(hParent, &pc)) {
+			const long pw = pc.right - pc.left, ph = pc.bottom - pc.top;
+			g_cgPlayerW = (int)pw; g_cgPlayerH = (int)ph;
+			POINT o = { 0, 0 };
+			::ClientToScreen(hParent, &o);
+			MONITORINFO mi = { sizeof(mi) };
+			if (::GetMonitorInfoW(::MonitorFromWindow(hParent, MONITOR_DEFAULTTONEAREST), &mi)) {
+				const CRect mon(mi.rcMonitor);
+				const bool covers = o.x == mon.left && o.y == mon.top && pw == mon.Width() && ph == mon.Height();
+				const bool short_ = (Width < pw || Height < ph) && Width >= pw - 32 && Height >= ph - 32;
+				if (covers && short_) {
+					Left = 0; Top = 0; Width = pw; Height = ph;
+					g_cgFilled = true;
+				}
+			}
+		}
+		// The destination rect is fitted to the window size: apply it again.
+		CAutoLock cDestLock(&m_destRectLock);
+		if (!m_destRectPending.IsRectNull()) m_destRectDirty = true;
+	}
 	const CRect windowRect(Left, Top, Left + Width, Top + Height);
 	if (windowRect == m_windowRect) {
 		DLog(L"[VP-DBG] SetWindowPosition - rect unchanged, EARLY RETURN (no resize attempt)");

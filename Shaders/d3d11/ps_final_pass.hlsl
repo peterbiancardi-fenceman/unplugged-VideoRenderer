@@ -17,6 +17,7 @@ cbuffer PS_CONSTANTS : register(b0)
     float  cubeLutSize;      // N of LUT_3D_SIZE N
     float  ditherEnabled;    // 0.0 when this pass runs only to apply the LUT
     float  cubeLutMode;      // 1 = gamma only, 2 = greyscale, 3 = full 3D
+    float2 ditherOffset;     // ClipGuard 2.45.0: temporal dither, a new whole-texel offset each frame (0 = static)
 };
 
 struct PS_INPUT
@@ -67,7 +68,7 @@ float4 main(PS_INPUT input) : SV_Target
     }
 
     if (ditherEnabled > 0.5) {
-        float4 ditherValue = texDither.Sample(sampDither, input.Tex * ditherCoordScale);
+        float4 ditherValue = texDither.Sample(sampDither, input.Tex * ditherCoordScale + ditherOffset);
         pixel = floor(pixel * QUANTIZATION + ditherValue) / QUANTIZATION;
     }
 

@@ -136,6 +136,8 @@ protected:
 	// bit3=...DOVIMetadataV2. Logged in the pipeline dump (sdata=N) so a blank
 	// MaxCLL/MaxFALL/Mastering row can be told apart from "decoder sent nothing".
 	int m_sideData = 0;
+	int  m_doviSeenProfile = 0;   // 2.57.0: Dolby Vision profile on the last frame (0: none), for the banner
+	bool m_doviSeenFel = false;
 	bool  m_bInterlaced = false;
 	REFERENCE_TIME m_rtAvgTimePerFrame = 0;
 

@@ -1049,7 +1049,7 @@ HRESULT GetShaderConvertColor(
 			"color = LinearToST2084(color, 10000.0);\n"
 		);
 	}
-	else if (bBT2020Primaries) {
+	else if (bBT2020Primaries && !pDoviMetadata) {   // 2.58.0: Dolby Vision left as PQ is not gamma-coded
 		std::string toLinear;
 		switch (exFmt.VideoTransferFunction) {
 		case DXVA2_VideoTransFunc_10:   toLinear = "\\\\nothing\n";                  break;

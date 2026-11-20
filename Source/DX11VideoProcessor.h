@@ -38,6 +38,8 @@
 #include "sky_seg.h"
 #include "person_seg.h"
 #include "BYTETracker.h"
+#include "ClipGuard.h"
+#include "NeuralUpscale.h"
 
 #include <atomic>
 #include <memory>
@@ -75,6 +77,18 @@ private:
 #endif
 
 	Tex11Video_t m_TexSrcVideo; // for copy of frame
+	// 2.58.0: an HDR10 file labelled full range is checked against its own picture.
+	// 0 nothing to check, 1 checking, 2 limited (the label was wrong), 3 full (the label is right)
+	int   m_rangeCheck = 0;
+	int   m_rangeBright = 0, m_rangeContent = 0;   // probes with picture and nothing outside 64-940
+	bool  m_rangeApply = false;                     // re-initialise with the decision at the next frame
+	bool  m_rangePending = false;                   // a copy is waiting in the staging texture
+	DWORD m_rangeTick = 0;
+	CComPtr<ID3D11Texture2D> m_pRangeStaging;
+	void  RangeProbe(ID3D11Texture2D* pTex, UINT slice);
+	// 2.58.0: the HDR10 information as the file sends it, for the banner only (the tone
+	// mapping is not given it: it measures the picture itself).
+	UINT  m_bnCll = 0, m_bnFall = 0, m_bnMmax = 0, m_bnMmin = 0;
 	Tex2D_t m_TexConvertOutput;
 	Tex2D_t m_TexResize;        // for intermediate result of two-pass resize
 	CTex2DRing m_TexsPostScale;
@@ -867,6 +881,31 @@ private:
 	CD3D11Font      m_Font3D;
 	CD3D11Rectangle m_Rect3D;
 	CD3D11Rectangle m_Underlay;
+
+	// ClipGuard: highlight compensation, test views and on-screen overlay (ClipGuard.h).
+	CClipGuard m_ClipGuard;
+	// 2.43.0: Upscaler = FSRCNNX: neural 2x luma doubler on the shader scaling path
+	CNeuralUpscale m_NeuralUps;
+	uint32_t m_DitherSeed = 12345u;      // 2.45.0: temporal dither offsets
+	// 2.43.2: Output gamut BT.2020 with a BT.709 (SDR) picture: convert its colour
+	// to BT.2020 as the last step before dither (the projector stays in BT.2020).
+	CComPtr<ID3D11PixelShader> m_pPSGamut2020;
+	bool Gamut2020Step();
+	bool m_bNeuralBusy = false;          // inside the 2x resize (no second doubling)
+	int  m_iNeuralBanner = 0;            // banner: 0 not used, 1 running, 2 loading, 3 failed
+	CD3D11Rectangle     m_ClipGuardRect;   // ClipGuard overlay panel, bars and key caps
+	CD3D11Quadrilateral m_ClipGuardQuad;   // ClipGuard overlay icon
+	Tex2D_t  m_ClipGuardDelay[13];  // look-ahead: the last frames, shown 2-12 frames late
+	UINT     m_ClipGuardDelayN = 0;
+	REFERENCE_TIME m_rtClipGuardShownDelay = 0;   // 2.68.0: how far the frame on screen is behind m_rtStart (look-ahead); subtitles follow it
+	// Banner "Skipped": frames skipped in the first 10 s of playback, and in
+	// the 10 s after a seek, don't count (the picture is still settling).
+	unsigned m_LastFrames = 0;           // frame count on the last frame (a drop means a new file)
+	unsigned m_SkipBase = 0;             // skipped frames not counted
+	REFERENCE_TIME m_SkipGraceT = 0;     // played time since the start or seek, up to 10 s
+	UINT     m_ClipGuardDelayPos = 0;
+	UINT     m_ClipGuardDelayRing = 0;  // slots in use (look-ahead + 1), 0 = off
+	Tex2D_t  m_ClipGuardOut;        // copy of the picture as sent, measured for the readout
 	CD3D11Lines     m_Lines;
 	CD3D11Polyline  m_SyncLine;
 
@@ -1015,6 +1054,8 @@ private:
 	// decides the extractor's luma domain, the ML passes' input domain, and which
 	// shader SetShaderLuminanceParams feeds.
 	bool IsPqToSdrSelected() const;
+	// 2.58.0: the picture reaching the correction pass is PQ (HDR10, or Dolby Vision rebuilt to PQ).
+	bool SrcIsPq() const;
 
 	// Which luma domain each consumer's texture is actually in. TWO predicates,
 	// deliberately — they read DIFFERENT textures, and one flag cannot be right
@@ -1206,6 +1247,7 @@ private:
 	void UpdateStatsStatic() override;
 	//void UpdateStatsPostProc();
 	HRESULT DrawStats(ID3D11Texture2D* pRenderTarget);
+	void DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget);
 
 public:
 	// IMFVideoProcessor
