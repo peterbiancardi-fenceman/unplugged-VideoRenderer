@@ -5134,7 +5134,11 @@ void CDX11VideoProcessor::UpdateTexParams(int cdepth)
 {
 	switch (m_iTexFormat) {
 	case TEXFMT_AUTOINT:
-		m_InternalTexFmt = (cdepth > 8 || m_bVPUseRTXVideoHDR) ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+		// 10-bit is a property of the OUTPUT as much as the source: on a 10-bit
+		// display an 8-bit SDR source must still get a 10-bit internal format,
+		// otherwise Preferred10BitOutput() is false and the swap chain stays
+		// 8-bit no matter what the app requested.
+		m_InternalTexFmt = (cdepth > 8 || m_bVPUseRTXVideoHDR || m_DisplayBitsPerChannel >= 10) ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
 		break;
 	case TEXFMT_8INT:    m_InternalTexFmt = DXGI_FORMAT_B8G8R8A8_UNORM;     break;
 	case TEXFMT_10INT:   m_InternalTexFmt = DXGI_FORMAT_R10G10B10A2_UNORM;  break;
