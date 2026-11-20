@@ -18,6 +18,13 @@ Branch `clipguard-2.60.0`, based on tag `v2.3.0` (70ae00d). ClipGuard changes on
 - `Source/D3DUtil/D3D11Font.cpp`: `CreateFontBitmap` passes the font flags
   (ClipGuard's bold headings need them).
 
+## 2.62.0 additions
+
+- LUTs (`titan.cube` / `valerion.cube`) are also found in `%LOCALAPPDATA%\ClipGuard`
+  after the renderer's own folder (the renderer now sits under Program Files).
+- The Test-only "Source" menu row is removed (22 rows; the shared-memory field
+  stays in place, unused, so the layout is unchanged).
+
 ## Who owns the settings
 
 - ClipGuard.exe running (shared memory `Local\ClipGuard_v1`, refreshed every

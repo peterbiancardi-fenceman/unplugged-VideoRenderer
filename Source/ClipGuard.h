@@ -1,5 +1,5 @@
 /*
- * ClipGuard 2.60.0 (formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
+ * ClipGuard 2.62.0 (formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
  * dark pictures first, so after the projector's gain they land below clipping.
@@ -106,7 +106,7 @@ struct ClipGuardShared
 	int32_t  projector;         // written by ClipGuard.exe: "Projector": 0 = Universal, 1 = Titan Noir Max (Predictive) (2.46.0); Valerion (2) removed again in 2.51.2
 	int32_t  lutOff;            // written by ClipGuard.exe: F5, calibration LUT off for comparing (2.48.2)
 	int32_t  lut;               // written by ClipGuard.exe: "LUT": 0 = None, 1 = Titan (titan.cube), 2 = Valerion (valerion.cube) (2.50.0)
-	int32_t  source;            // written by ClipGuard.exe (Test): "Source": 0 = Video Processor, 1 = Media Player (Plex) (2.52.0)
+	int32_t  unusedSource;      // was the Test-only Source row (2.52.0-2.61.0), no longer read
 	uint32_t reserved[10];
 };
 #pragma pack(pop)
@@ -138,7 +138,6 @@ struct CgRunSettings
 	bool  lutOff = false;    // F5: the calibration LUT off for comparing (not saved)
 	int   projector = 0;     // "Projector": 0 = Universal (Reactive), 1 = Titan Noir Max (Predictive)
 	int   lut = 0;           // 2.50.0: "LUT": 0 = None, 1 = Titan, 2 = Valerion
-	int   source = 0;        // 2.52.0 (Test): "Source": 0 = Video Processor, 1 = Media Player
 	int   grid = 1;
 	int   lookAhead = 4;  // frames: 0, 2, 4, 6
 	int   view       = 0;
@@ -539,17 +538,15 @@ public:
 	static constexpr UINT  kMaxCellsY = 144;
 	static constexpr UINT  kStaging = 3;
 	static constexpr DWORD kOverlayHideMs = 8000;
-	static constexpr int   kRows = 23;
+	static constexpr int   kRows = 22;   // 2.62.0: the Test-only Source row is gone
 	static constexpr int   kRowUpscaler = 15;
 	// Menu rows shown: ClipGuard (not +) leaves out Upscaler.
-	static constexpr int   kRowSource = 19;   // 2.52.0: Test build only
-	int Rows() const { return kRows - (m_s.plus ? 0 : 1) - (m_s.testBuild ? 0 : 1); }
+	int Rows() const { return kRows - (m_s.plus ? 0 : 1); }
 	// The setting behind a shown row.
 	int RowOf(int shown) const
 	{
 		shown = std::clamp(shown, 0, Rows() - 1);
 		if (!m_s.plus && shown >= kRowUpscaler) shown++;
-		if (!m_s.testBuild && shown >= kRowSource) shown++;
 		return shown;
 	}
 	// Dim fire (2.40.0). Each cell also measures how warm its bright half is:
@@ -1202,7 +1199,7 @@ public:
 	bool RampStale() const { return m_rampTick == 0 || GetTickCount64() - m_rampTick > 500; }
 
 	// ---- 2.48.0: calibration LUT (2.50.0: chosen in its own LUT row) ------------------
-	// titan.cube / valerion.cube next to clipguard.ini (made by ClipGuard Meter's
+	// titan.cube / valerion.cube next to clipguard.ini, or in %LOCALAPPDATA%\ClipGuard (made by ClipGuard Meter's
 	// auto-cal), with a one-line description in titan.txt / valerion.txt. Checked
 	// about every 2 s so a new auto-cal is picked up while playing. Universal, or
 	// no file: no LUT from ClipGuard (one ClipGuard loaded earlier is taken off;
@@ -1217,11 +1214,21 @@ public:
 	std::wstring LutBase() const
 	{
 		if (m_s.lutOff) return L"";   // F5: off for comparing, treated like no LUT
+		const wchar_t* name = m_s.lut == 1 ? L"\\titan" : m_s.lut == 2 ? L"\\valerion" : nullptr;
+		if (!name) return L"";
 		const size_t sl = m_iniPath.find_last_of(L"\\/");
 		const std::wstring dir = sl == std::wstring::npos ? L"." : m_iniPath.substr(0, sl);
-		if (m_s.lut == 1) return dir + L"\\titan";
-		if (m_s.lut == 2) return dir + L"\\valerion";
-		return L"";
+		// 2.62.0: next to the filter first, then %LOCALAPPDATA%\ClipGuard (the renderer's
+		// folder is under Program Files with Unplugged 2.3.0, so users put LUTs there).
+		if (GetFileAttributesW((dir + name + L".cube").c_str()) == INVALID_FILE_ATTRIBUTES) {
+			wchar_t buf[MAX_PATH] = {};
+			const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
+			if (n > 0 && n < MAX_PATH) {
+				const std::wstring alt = std::wstring(buf) + L"\\ClipGuard" + name;
+				if (GetFileAttributesW((alt + L".cube").c_str()) != INVALID_FILE_ATTRIBUTES) return alt;
+			}
+		}
+		return dir + name;
 	}
 	// True when the renderer should load (path) or clear (empty path) a LUT now.
 	bool LutWanted(std::wstring& path)
@@ -1704,7 +1711,7 @@ public:
 	// The graphics card's load in % as Windows reports it (Task Manager's 3D
 	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
 	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
-	const wchar_t* VersionText() const { return L"2.60.0"; }
+	const wchar_t* VersionText() const { return L"2.62.0"; }
 	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
 	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
 	float PicturePct() const { return m_picture; }
@@ -1754,13 +1761,12 @@ public:
 	{
 		OvModel m;
 		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
-		m.version = m_s.testBuild ? L"2.60.0 Test" : L"2.60.0";
+		m.version = m_s.testBuild ? L"2.62.0 Test" : L"2.62.0";
 		const auto vals = Lines();
-		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"Source", L"View", L"Overlay", L"Restart & update" };
+		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"View", L"Overlay", L"Restart & update" };
 		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it
 		for (int i = 0; i < kRows; i++) {
 			if (i == kRowUpscaler && !m_s.plus) continue;
-			if (i == kRowSource && !m_s.testBuild) continue;
 			if (i == 0) m.rows.push_back({ true, L"GUARD", L"", false, 2 });
 			if (i == 8) m.rows.push_back({ true, L"SPOTS", L"", false, 2 });
 			if (i == 13) m.rows.push_back({ true, L"DISPLAY", L"", false, 2 });
@@ -1790,7 +1796,6 @@ public:
 			L"Static keeps the fine dither pattern still; Temporal moves it every frame so dark gradients look smoother. Compare on a dark, smooth scene; Static if you see a fine shimmer.",
 			L"Universal (Reactive) works with any laser projector, reacting to what is on screen with the Guard and Hot spot settings. Titan Noir Max DBLE High / DBLE Low (Predictive) predict DBLE from meter measurements (firmware V1.3.38) and squeeze only the highlights it would clip; they replace the Guard and Hot spot settings, shown as Predictive. Set the projector's DBLE to the same mode. On a Valerion Max use Universal (Reactive).",
 			L"The calibration LUT from ClipGuard Meter's auto-cal: Titan loads titan.cube, Valerion loads valerion.cube; None uses no LUT. F5 turns it off and on to compare.",
-			L"Video Processor shows the HDMI input. Media Player opens your Plex movies; pick one and it plays here with ClipGuard. F4 goes back to the library while a film plays.",
 			L"Normal for watching. The other views show where the Guard is working, or compare it on and off.",
 			L"Auto-hide closes this menu after a few seconds. Always keeps it up while you adjust.",
 			L"Press Right to restart Unplugged and ClipGuard." };
@@ -1841,10 +1846,9 @@ public:
 		swprintf_s(v[18], L"%ls", m_s.lut == 1 ? L"Titan" : (m_s.lut == 2 ? L"Valerion" : L"None"));
 		if (MeasuredMode())
 			for (int i = 1; i <= 12; i++) swprintf_s(v[i], L"Predictive");   // the measured model replaces these
-		swprintf_s(v[19], L"%ls", m_s.source == 1 ? L"Media Player" : L"Video Processor");
-		swprintf_s(v[20], L"%ls", views[std::clamp(m_s.view, 0, 3)]);
-		swprintf_s(v[21], L"%ls", m_s.pinned ? L"Always" : L"Auto-hide");
-		swprintf_s(v[22], L"Press Right");
+		swprintf_s(v[19], L"%ls", views[std::clamp(m_s.view, 0, 3)]);
+		swprintf_s(v[20], L"%ls", m_s.pinned ? L"Always" : L"Auto-hide");
+		swprintf_s(v[21], L"Press Right");
 		std::vector<std::wstring> out;
 		for (int i = 0; i < kRows; i++) out.push_back(v[i]);
 		return out;
@@ -3312,10 +3316,10 @@ private:
 		m_s.view         = std::clamp(n.view, 0, 3);
 		m_s.overlayOn    = n.osd;
 		m_s.pinned       = n.osdPinned;
-		m_s.selected     = std::clamp(n.osdSelected, 0, kRows - 3);   // no ClipGuard+ or Test rows
+		m_s.selected     = std::clamp(n.osdSelected, 0, kRows - 2);   // no ClipGuard+ row
 		// Not in the native block: ClipGuard.exe-only features stay at their defaults.
 		m_s.upscaler = 0; m_s.plus = false; m_s.kscape = false;
-		m_s.projector = 0; m_s.lut = 0; m_s.lutOff = false; m_s.source = 0;
+		m_s.projector = 0; m_s.lut = 0; m_s.lutOff = false;
 		m_s.infoOn = false; m_s.testBuild = false;
 	}
 public:
@@ -3384,8 +3388,7 @@ public:
 			m_s.pinned      = s->overlayPinned != 0;
 			m_s.lastKeyTick = s->lastKeyTick;
 			m_s.testBuild   = s->buildKind == 1;
-			m_s.source      = m_s.testBuild && s->source == 1 ? 1 : 0;
-			m_s.selected    = std::clamp((int)s->selected, 0, kRows - (s->edition == 1 ? 0 : 1) - (m_s.testBuild ? 0 : 1) - 1);
+			m_s.selected    = std::clamp((int)s->selected, 0, kRows - (s->edition == 1 ? 0 : 1) - 1);
 			const uint32_t req = s->logRequest;
 			if (req != 0 && req != m_logSeen) {
 				m_logSeen = req;
