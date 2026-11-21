@@ -1,4 +1,4 @@
-/*
+﻿/*
 * (C) 2018-2026 see Authors.txt
 *
 * This file is part of MPC-BE.
@@ -914,6 +914,15 @@ private:
 	UINT     m_ClipGuardDelayPos = 0;
 	UINT     m_ClipGuardDelayRing = 0;  // slots in use (look-ahead + 1), 0 = off
 	Tex2D_t  m_ClipGuardOut;        // copy of the picture as sent, measured for the readout
+	// 2.93.0: Depth (Detail / Edges / Depth), see Depth.h
+	CComPtr<ID3D11PixelShader> m_pPSDepthLuma, m_pPSDepthBlur, m_pPSDepthEnergy, m_pPSDepthMain;
+	CComPtr<ID3D11Buffer> m_pCBDepthLuma, m_pCBDepthBlur, m_pCBDepthEnergy, m_pCBDepthMain;
+	Tex2D_t m_dL0, m_dT0, m_dG1, m_dL1, m_dT1, m_dG2, m_dL2, m_dT2, m_dG3, m_dE, m_dTE, m_dEB, m_dOut;
+	bool m_bDepthReady = false;
+	HRESULT InitDepth();
+	void ReleaseDepth();
+	bool DepthActive() const;   // any of the three above 0 and not switched off for comparing
+	HRESULT DrawDepth(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect, bool bypass);
 	CD3D11Lines     m_Lines;
 	CD3D11Polyline  m_SyncLine;
 
