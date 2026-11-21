@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ClipGuard Media Player 0.9.2 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
@@ -1641,12 +1641,12 @@ public:
 
 	int Upscaler() const { return m_s.upscaler; }
 	bool TemporalDither() const { return m_s.dither == 1; }
+	int OutGamma() const { return m_s.outGamma; }   // 0.9.2
 
 	bool OverlayVisible() const
 	{
 		if (!m_s.overlayOn) return false;
 		if (m_s.pinned) return true;
-	int OutGamma() const { return m_s.outGamma; }   // 0.9.2
 		return (DWORD)(GetTickCount() - m_s.lastKeyTick) < kOverlayHideMs;
 	}
 
