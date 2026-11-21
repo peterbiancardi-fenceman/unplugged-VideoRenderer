@@ -1,5 +1,5 @@
 /*
- * ClipGuard Media Player 0.9.1 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
+ * ClipGuard Media Player 0.9.2 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
  * dark pictures first, so after the projector's gain they land below clipping.
@@ -104,7 +104,10 @@ struct ClipGuardShared
 	int32_t  lutOff;            // written by ClipGuard.exe: F5, calibration LUT off for comparing (2.48.2)
 	int32_t  lut;               // written by ClipGuard.exe: "LUT": 0 = None, 1 = Titan (titan.cube), 2 = Valerion (valerion.cube) (2.50.0)
 	int32_t  unusedSource;      // was the Test-only Source row (2.52.0-2.63.0), no longer read
-	uint32_t reserved[10];
+	int32_t  ssr;               // not used in this build (the player writes 0)
+	int32_t  fel;               // not used in this build
+	int32_t  outGamma;          // written by ClipGuard.exe: 0 = 2.2 (Unplugged's), 1 = 2.4, 2 = BT.1886 (0.9.2)
+	uint32_t reserved[7];
 };
 #pragma pack(pop)
 static_assert(sizeof(ClipGuardShared) == 256, "ClipGuardShared must stay 256 bytes (ClipGuard.cs mirrors it)");
@@ -138,6 +141,7 @@ struct ClipGuardSettings
 	bool  kscape = false;    // Look-ahead set by ClipGuard+ for a playing Kaleidescape
 	int   laSource = 0;      // 2.68.0: whose look-ahead: 1 Kaleidescape, 2 Video Processor (capture), 3 Media Player (file), ClipGuard+ Player
 	int   dither = 0;        // "Dither": 0 = Static (the renderer's fixed pattern), 1 = Temporal (moved every frame)
+	int   outGamma = 0;      // 0.9.2: 0 = 2.2, 1 = 2.4, 2 = BT.1886
 	bool  lutOff = false;    // F5: the calibration LUT off for comparing (not saved)
 	int   projector = 0;     // "Projector": 0 = Universal (Reactive), 1 = Titan Noir Max (Predictive)
 	int   lut = 0;           // 2.50.0: "LUT": 0 = None, 1 = Titan, 2 = Valerion
@@ -1642,6 +1646,7 @@ public:
 	{
 		if (!m_s.overlayOn) return false;
 		if (m_s.pinned) return true;
+	int OutGamma() const { return m_s.outGamma; }   // 0.9.2
 		return (DWORD)(GetTickCount() - m_s.lastKeyTick) < kOverlayHideMs;
 	}
 
@@ -1651,6 +1656,7 @@ public:
 	// The bars around the largest picture area seen so far, for placing the
 	// overlay: in a very dark shot the picture's edge rows read as bar on some
 	// frames, and the overlay must not move with that.
+	bool StableBarsValid() const { return m_cy > 0 && m_stickY0 <= m_stickY1; }   // 2.88.0
 	float StableTopBarFrac() const { return (m_stickY0 <= m_stickY1) ? (float)m_stickY0 / (float)m_cy : 0.0f; }
 	float StableBottomBarFrac() const { return (m_stickY0 <= m_stickY1) ? (float)((int)m_cy - 1 - m_stickY1) / (float)m_cy : 0.0f; }
 	int View() const { return m_s.view; }
@@ -1712,7 +1718,7 @@ public:
 	// The graphics card's load in % as Windows reports it (Task Manager's 3D
 	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
 	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
-	const wchar_t* VersionText() const { return L"0.9.1"; }
+	const wchar_t* VersionText() const { return L"0.9.2"; }
 	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
 	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
 	float PicturePct() const { return m_picture; }
@@ -1763,7 +1769,7 @@ public:
 	{
 		OvModel m;
 		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
-		m.version = m_s.testBuild ? L"0.9.1 Test" : L"0.9.1 beta";
+		m.version = m_s.testBuild ? L"0.9.2 Test" : L"0.9.2 beta";
 		const auto vals = Lines();
 		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"View", L"Overlay", L"Restart & update" };
 		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it
@@ -3339,6 +3345,7 @@ private:
 			m_s.pinned      = s->overlayPinned != 0;
 			m_s.lastKeyTick = s->lastKeyTick;
 			m_s.testBuild   = s->buildKind == 1;
+			m_s.outGamma    = std::clamp((int)s->outGamma, 0, 2);   // 0.9.2
 			m_s.selected    = std::clamp((int)s->selected, 0, kRows - (s->edition == 1 ? 0 : 1) - 1);
 			const uint32_t req = s->logRequest;
 			if (req != 0 && req != m_logSeen) {
@@ -3391,6 +3398,7 @@ private:
 		m_s.infoOn     = readf(L"Info", 0.0f) > 0.5f;
 		m_s.pinned     = m_s.overlayOn;
 		m_s.selected   = 0;
+		m_s.outGamma   = 0;
 	}
 
 	// Hot spot test video: the end of each 30 s part shows a row of ten 40 x 40

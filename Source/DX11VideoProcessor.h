@@ -111,6 +111,10 @@ private:
 	int  m_iCubeLutSize    = 0;      // N of LUT_3D_SIZE N; 0 == no LUT loaded
 	bool m_bCubeLutEnabled = false;
 	int  m_iCubeLutMode    = 3;      // default full 3D (the historical behaviour)
+	// ClipGuard 2.88.3: the LUT as the banner names it (any LUT, the player's too).
+	std::wstring m_wsCubeLutName;    // the file's name, or its .txt description
+	bool m_bCubeLutFailed = false;   // the last load failed
+	bool m_bCubeLutHad    = false;   // one was loaded, then cleared (F5 or None)
 	// The final pass is normally gated on dithering. A loaded LUT must run there
 	// regardless (it is the only display-referred stage), so the pass is forced on
 	// and the dither sample is skipped in the shader when it is not wanted.
@@ -902,6 +906,10 @@ private:
 	// the 10 s after a seek, don't count (the picture is still settling).
 	unsigned m_LastFrames = 0;           // frame count on the last frame (a drop means a new file)
 	unsigned m_SkipBase = 0;             // skipped frames not counted
+	bool m_bOutGammaWas = false;         // 2.88.1
+	bool OutGammaActive() const;
+	CRect m_bnVideo;                     // 2.88.0: banner: the video rect its top was worked out for
+	float m_bnTopFrac = -1.0f;           // 2.88.0: the smallest top bar seen in this film (-1 none yet)
 	REFERENCE_TIME m_SkipGraceT = 0;     // played time since the start or seek, up to 10 s
 	UINT     m_ClipGuardDelayPos = 0;
 	UINT     m_ClipGuardDelayRing = 0;  // slots in use (look-ahead + 1), 0 = off

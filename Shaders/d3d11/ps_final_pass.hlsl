@@ -18,6 +18,9 @@ cbuffer PS_CONSTANTS : register(b0)
     float  ditherEnabled;    // 0.0 when this pass runs only to apply the LUT
     float  cubeLutMode;      // 1 = gamma only, 2 = greyscale, 3 = full 3D
     float2 ditherOffset;     // ClipGuard 2.45.0: temporal dither, a new whole-texel offset each frame (0 = static)
+    float  outGamma;         // ClipGuard 2.88.1: 0 = as is (gamma 2.2), 1 = re-encode for 2.4, 2 = for BT.1886
+    float  outBlack;         // ClipGuard 2.88.1: BT.1886 black, relative to white
+    float2 pad0;
 };
 
 struct PS_INPUT
@@ -29,6 +32,23 @@ struct PS_INPUT
 float4 main(PS_INPUT input) : SV_Target
 {
     float4 pixel = tex.Sample(samp, input.Tex);
+
+    // ClipGuard 2.88.1: output gamma. The picture is encoded for a gamma 2.2 display
+    // (Unplugged's tone mapping and ClipGuard work in 2.2); for a projector set to 2.4
+    // or BT.1886 it is re-encoded so that it shows the same light. Not with a
+    // calibration LUT (the renderer sends 0 then: the LUT sets the gamma).
+    if (outGamma > 0.5) {
+        float3 L = pow(saturate(pixel.rgb), 2.2);
+        if (outGamma < 1.5) {
+            pixel.rgb = pow(L, 1.0 / 2.4);
+        } else {
+            // BT.1886 (white 1, black outBlack): L = a * max(V + b, 0)^2.4, solved for V
+            float lb = pow(max(outBlack, 0.0), 1.0 / 2.4);
+            float a = pow(1.0 - lb, 2.4);
+            float b = lb / (1.0 - lb);
+            pixel.rgb = saturate(pow(L / a, 1.0 / 2.4) - b);
+        }
+    }
 
     // Display calibration LUT (.cube). This pass is the last display-referred
     // stage — after tone mapping, after the ML grade, after scaling — which is

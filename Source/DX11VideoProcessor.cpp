@@ -1881,7 +1881,9 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 	m_pCubeLut.Release();
 	m_iCubeLutSize = 0;
 
+	m_bCubeLutFailed = false;   // ClipGuard 2.88.3
 	if (!utf8Path || !utf8Path[0]) {
+		if (!m_wsCubeLutName.empty()) m_bCubeLutHad = true;
 		DLog(L"CDX11VideoProcessor::LoadCubeLut() : cleared (no path)");
 		// S_OK: the requested end state â€” no LUT â€” is exactly what we now have.
 		// S_FALSE here would be indistinguishable from a bad file to the caller.
@@ -1893,6 +1895,30 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 
 	wchar_t wpath[MAX_PATH] = {};
 	MultiByteToWideChar(CP_UTF8, 0, utf8Path, -1, wpath, MAX_PATH);
+	m_bCubeLutFailed = true;   // ClipGuard 2.88.3: until it loads
+	m_bCubeLutHad = false;
+	{
+		// the name for the banner: <file>.txt's first line (the calibration writes it), else the file's name
+		std::wstring wp(wpath);
+		const size_t sl = wp.find_last_of(L"\\/");
+		std::wstring nm = sl == std::wstring::npos ? wp : wp.substr(sl + 1);
+		const size_t dot = nm.find_last_of(L'.');
+		if (dot != std::wstring::npos) nm.resize(dot);
+		m_wsCubeLutName = nm;
+		const size_t pd = wp.find_last_of(L'.');
+		if (pd != std::wstring::npos && (sl == std::wstring::npos || pd > sl)) {
+			FILE* tf = nullptr;
+			if (_wfopen_s(&tf, (wp.substr(0, pd) + L".txt").c_str(), L"rt, ccs=UTF-8") == 0 && tf) {
+				wchar_t line[200] = {};
+				if (fgetws(line, 200, tf)) {
+					std::wstring d(line);
+					while (!d.empty() && (d.back() == L'\n' || d.back() == L'\r' || d.back() == L' ')) d.pop_back();
+					if (!d.empty()) m_wsCubeLutName = d;
+				}
+				fclose(tf);
+			}
+		}
+	}
 
 	FILE* f = nullptr;
 	if (_wfopen_s(&f, wpath, L"rb") != 0 || !f) {
@@ -1981,6 +2007,7 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 
 	m_iCubeLutSize    = size;
 	m_bCubeLutEnabled = true;
+	m_bCubeLutFailed  = false;   // ClipGuard 2.88.3
 	DLog(L"CDX11VideoProcessor::LoadCubeLut() : loaded {}^3 LUT", size);
 	return S_OK;
 }
@@ -5309,7 +5336,8 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	// 8 floats: [0..1] dither coord scale, [2] cube LUT enabled, [3] cube LUT size,
 	// [4] dither active. Grew from 4 when the display LUT moved into this pass.
-	BufferDesc = { sizeof(FLOAT) * 8, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+	// 2.88.1: 12 floats: [8] output gamma (0 = as is, 1 = 2.4, 2 = BT.1886), [9] BT.1886 black.
+	BufferDesc = { sizeof(FLOAT) * 12, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pFinalPassConstantBuffer));
 
 	BufferDesc = { sizeof(PS_EXTSHADER_CONSTANTS), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
@@ -7975,7 +8003,7 @@ void CDX11VideoProcessor::UpdatePostScaleTexures()
 	m_bDitherActive = (m_bUseDither && needDither && m_TexDither.pTexture);
 	// A loaded calibration LUT forces the final pass even with dithering off â€”
 	// it is the last display-referred stage and nothing else can host it.
-	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled;
+	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled || OutGammaActive();   // 2.88.1: or an output gamma
 	if (m_bFinalPass) {
 		m_pPSFinalPass.Release();
 		m_bFinalPass = SUCCEEDED(CreatePShaderFromResource(
@@ -8377,12 +8405,15 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		ditherOff[0] = (float)((m_DitherSeed >> 8) % dither_size) / dither_size;
 		ditherOff[1] = (float)((m_DitherSeed >> 20) % dither_size) / dither_size;
 	}
-	const FLOAT constants[8] = {
+	const FLOAT constants[12] = {
 		(float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size,
 		m_bCubeLutEnabled ? 1.0f : 0.0f, (float)m_iCubeLutSize,
 		m_bDitherActive ? 1.0f : 0.0f,
 		(float)m_iCubeLutMode,
-		ditherOff[0], ditherOff[1]
+		ditherOff[0], ditherOff[1],
+		OutGammaActive() ? (float)m_ClipGuard.OutGamma() : 0.0f,   // 2.88.1
+		1.0f / 2000.0f,                                             // BT.1886 black: 2000:1
+		0.0f, 0.0f
 	};
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFinalPassConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
@@ -9188,6 +9219,11 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSHalfOUtoInterlace, m_pHalfOUtoInterlaceConstantBuffer, 0, false);
 		}
 
+		// 2.88.1: the output gamma turns the final pass on and off as it changes
+		if (OutGammaActive() != m_bOutGammaWas) {
+			m_bOutGammaWas = OutGammaActive();
+			UpdatePostScaleTexures();
+		}
 		if (m_bFinalPass) {
 			StepSetting();
 			hr = FinalPass(*pTex, pRT, rect, rect);
@@ -10615,7 +10651,14 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 	int actTop = (int)video.top, actBot = (int)video.bottom;
 	{
 		const float vh = (float)video.Height();
-		actTop += (int)(m_ClipGuard.StableTopBarFrac() * vh);
+		// 2.88.0: the banner sits on the largest picture seen in this film (the
+		// smallest top bar): credits and dark scenes no longer move it.
+		if (m_bnVideo != video) { m_bnVideo = video; m_bnTopFrac = -1.0f; }
+		{
+			const float f = m_ClipGuard.StableTopBarFrac();
+			if (m_ClipGuard.StableBarsValid() && (m_bnTopFrac < 0.0f || f < m_bnTopFrac)) m_bnTopFrac = f;
+		}
+		actTop += (int)(std::max(0.0f, m_bnTopFrac) * vh);
 		actBot -= (int)(m_ClipGuard.StableBottomBarFrac() * vh);
 		if (actBot - actTop < u * 6) {
 			actTop = (int)video.top;
@@ -10748,7 +10791,20 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 			left.push_back({ (w >= 3800 || h >= 2100) ? L"4K" : (w >= 2500 || h >= 1400) ? L"1440p" : (w >= 1900 || h >= 1000) ? L"1080p"
 				: (w >= 1200 || h >= 700) ? L"720p" : L"SD", false });
 			left.push_back({ m_Dovi.bValid ? L"DOLBY VISION" : bPQsrc ? L"HDR10" : bHLGsrc ? L"HLG" : L"SDR", bHDRsrc });
-			if (fpsIn > 1.0) left.push_back({ std::format(L"{:.3f}{}", fpsIn, scan), false });
+			// 2.88.0: the film's nominal rate (the measured one moved 23.974-23.978 and
+			// the badges beside it with it); SOURCE keeps the measured rate.
+			if (fpsIn > 1.0) {
+				static const double kRates[] = { 23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0, 50.0, 59.94, 60.0, 100.0, 119.88, 120.0 };
+				std::wstring fr = std::format(L"{:.2f}", fpsIn);
+				for (const double r : kRates) {
+					if (std::abs(fpsIn - r) < 0.011) {
+						fr = (r == std::floor(r)) ? std::format(L"{}", (int)r) : std::format(L"{:.3f}", r);
+						if (r == 29.97 || r == 59.94) fr = std::format(L"{:.2f}", r);
+						break;
+					}
+				}
+				left.push_back({ fr + scan, false, L"00.000p" });
+			}
 			// 2.59.0: Dolby Vision is rebuilt in BT.2020 (Profile 5 files say BT.709)
 			if (m_Dovi.bValid) left.push_back({ L"BT.2020", false });
 			else if (!fxStr(4).empty()) left.push_back({ fxStr(4), false });
@@ -10992,6 +11048,14 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				}
 				if (sMemUsed >= 0.0) g.items.push_back({ std::format(L"GPU memory {:.1f} of {:.1f} GB", sMemUsed, sMemBudget), 0 });
 			}
+			{
+				// 2.88.1: the output gamma (2.2 is Unplugged's own; with a LUT on, the LUT sets it)
+				static const wchar_t* kG[] = { L"2.2", L"2.4", L"BT.1886" };
+				const int og = std::clamp(m_ClipGuard.OutGamma(), 0, 2);
+				if (m_bCubeLutEnabled && og != 0) g.items.push_back({ std::format(L"Output gamma {}: not used, the LUT sets it", kG[og]), 2 });
+				else if (OutGammaActive()) g.items.push_back({ std::format(L"Output gamma {}", kG[og]), 0 });
+				else g.items.push_back({ L"Output gamma 2.2", 0 });
+			}
 			groups.push_back(g);
 		}
 		// CLIPGUARD: the fix and its settings. HOT SPOTS: the lights.
@@ -11031,6 +11095,18 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 					g.items.push_back({ L"LUT: failed to load", 2 });
 				else if (ls == 3)
 					g.items.push_back({ L"LUT: off (F5)", 1 });
+				else
+					g.items.push_back({ L"LUT: none", 0 });
+			} else {
+				// 2.88.3: the player's Calibration LUT (or any LUT the renderer was given).
+				if (m_bCubeLutEnabled) {
+					static const wchar_t* kMode[] = { L"", L", gamma only", L", greyscale", L"" };
+					g.items.push_back({ L"LUT: " + m_wsCubeLutName + kMode[std::clamp(m_iCubeLutMode, 0, 3)] + L" (on)", 0 });
+				}
+				else if (m_bCubeLutFailed)
+					g.items.push_back({ L"LUT: " + m_wsCubeLutName + L" failed to load", 2 });
+				else if (m_bCubeLutHad)
+					g.items.push_back({ L"LUT: off (" + m_wsCubeLutName + L")", 1 });
 				else
 					g.items.push_back({ L"LUT: none", 0 });
 			}
@@ -11101,65 +11177,79 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 		// the window and the set of columns stay the same, so only the numbers
 		// change and nothing moves.
 		static int sAvail = 0, sU = 0, sPass = 0, sBh = 0;
-		static size_t sN = 0;
 		static bool sBadgeSmall = false;
-		static std::vector<int> sColW;
-		if (sAvail != avail || sU != u || sN != groups.size()) {
-			sAvail = avail; sU = u; sN = groups.size();
+		if (sAvail != avail || sU != u) {
+			sAvail = avail; sU = u;
 			sPass = 0; sBh = 0; sBadgeSmall = false;
-			sColW.assign(groups.size(), 0);
 		}
-		std::vector<int> colW(groups.size());
-		int sumW = 0;
-		for (int pass = sPass; pass < 2; pass++) {
-			if (pass == 1) {
-				// 0.9.1: 25% over the menu text (was the menu's own size); the columns
-				// wrap into a second band when they don't fit.
-				hL = u * 5 / 4; hG = u; minGap = u;
-				pL = &m_ClipGuard.FontL2(); pG = &m_ClipGuard.FontG2();
-			}
-			sumW = 0;
+		// 2.88.3: a fixed grid: two rows of five equal columns, lined up, each group
+		// always in its own slot (an absent group leaves its slot empty), one text
+		// size and one height for the window, so nothing moves while playing.
+		//   row 1: FILE (or the source's own head) . SOURCE . HDR . PROCESS . UNPLUGGED
+		//   row 2: OUTPUT . SYNC . CLIPGUARD . HOT SPOTS . (free)
+		constexpr int kCols = 5;
+		std::vector<int> slotOf(groups.size(), -1);
+		{
+			std::vector<bool> used(kCols * 2, false);
+			auto want = [](const std::wstring& n) -> int {
+				if (n == L"SOURCE") return 1;
+				if (n == L"HDR") return 2;
+				if (n == L"PROCESS") return 3;
+				if (n == L"UNPLUGGED") return 4;
+				if (n == L"OUTPUT") return 5;
+				if (n == L"SYNC") return 6;
+				if (n.rfind(L"CLIPGUARD", 0) == 0) return 7;
+				if (n == L"HOT SPOTS") return 8;
+				return -1;
+			};
 			for (size_t i = 0; i < groups.size(); i++) {
-				int w = hG * 3 / 5 + hG / 3 + width(*pG, groups[i].name);
-				for (const auto& it : groups[i].items) w = std::max(w, width(*pL, it.t) + (it.k == 2 ? hL + hL / 3 : 0));
-				for (const auto& t : groups[i].wide) w = std::max(w, width(*pL, t));
-				if (pass == sPass) w = std::max(w, sColW[i]);
-				colW[i] = w;
-				sumW += w;
+				const int w = want(groups[i].name);
+				if (w >= 0 && !used[w]) { slotOf[i] = w; used[w] = true; }
 			}
-			if (pass == 1 || groups.empty() || sumW + (int)(groups.size() - 1) * minGap <= avail) {
-				if (sPass != pass) sBh = 0;   // smaller text: the height is worked out afresh
-				sPass = pass;
-				break;
+			// the first group (FILE, KALEIDESCAPE, ...) and anything else: the first free slot
+			for (size_t i = 0; i < groups.size(); i++) {
+				if (slotOf[i] >= 0) continue;
+				for (int sl = 0; sl < kCols * 2; sl++) if (!used[sl]) { slotOf[i] = sl; used[sl] = true; break; }
 			}
 		}
-		sColW = colW;
+		std::vector<std::vector<size_t>> bands(2);
+		for (size_t i = 0; i < groups.size(); i++) if (slotOf[i] >= 0) bands[slotOf[i] / kCols].push_back(i);
+		// the text size: the large one when every group's widest possible line (its
+		// "wide" list, fixed text, not the live values) fits a column, else the smaller
+		const int colWBig = (avail - (kCols - 1) * minGap) / kCols;
+		if (sPass == 0) {
+			bool fitsBig = true;
+			for (size_t i = 0; i < groups.size() && fitsBig; i++)
+				for (const auto& t : groups[i].wide) if (width(*pL, t) > colWBig) { fitsBig = false; break; }
+			if (!fitsBig) sPass = 1;
+		}
+		if (sPass == 1) {
+			hL = u * 5 / 4; hG = u; minGap = u;
+			pL = &m_ClipGuard.FontL2(); pG = &m_ClipGuard.FontG2();
+		}
+		const int gapC = minGap;
+		const int colWAll = (avail - (kCols - 1) * gapC) / kCols;
 		CD3D11Font& fL = *pL;
 		CD3D11Font& fG = *pG;
 		const int rowH = hL * 27 / 20, headH = hL * 13 / 10;
 		const int warnW = hL;
-		// Columns side by side, spread over the width; when they don't fit
-		// (a small window) they wrap into a second band, and a third.
-		std::vector<std::vector<size_t>> bands(1);
-		{
-			int x = 0;
-			for (size_t i = 0; i < groups.size(); i++) {
-				if (!bands.back().empty() && x + colW[i] > avail && bands.size() < 3) {
-					bands.emplace_back();
-					x = 0;
-				}
-				bands.back().push_back(i);
-				x += colW[i] + minGap;
-			}
-		}
-		int gap = minGap;
-		if (bands.size() == 1 && groups.size() > 1) {
-			gap = std::clamp((avail - sumW) / (int)(groups.size() - 1), minGap, u * 8);
-		}
-		std::vector<int> bandRows(bands.size(), 0);
+		// a line too long for its column ends in "..."
+		auto fit = [&](CD3D11Font& f, const std::wstring& t, int maxW) {
+			if (maxW <= 0 || width(f, t) <= maxW) return t;
+			std::wstring c = t;
+			while (!c.empty() && width(f, c + L"...") > maxW) c.pop_back();
+			while (!c.empty() && c.back() == L' ') c.pop_back();
+			return c + L"...";
+		};
+		// the height: at least 6 lines on the first row and 8 on the second, and it
+		// never gets shorter for this window
+		static int sRows[2] = { 0, 0 };
+		if (sBh == 0) { sRows[0] = 6; sRows[1] = 8; }
+		std::vector<int> bandRows(2, 0);
 		int colsH = 0;
-		for (size_t b = 0; b < bands.size(); b++) {
-			for (const size_t gi : bands[b]) bandRows[b] = std::max(bandRows[b], (int)groups[gi].items.size());
+		for (size_t b = 0; b < 2; b++) {
+			for (const size_t gi : bands[b]) sRows[b] = std::max(sRows[b], (int)groups[gi].items.size());
+			bandRows[b] = sRows[b];
 			colsH += headH + bandRows[b] * rowH + (b ? u / 2 : 0);
 		}
 		const int colsY = by0 + padY + bhB + u * 9 / 10;
@@ -11198,17 +11288,23 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 		}
 		{
 			int y = colsY;
-			for (size_t b = 0; b < bands.size(); b++) {
-				int x = bx0 + padX;
+			const int tsz = hG * 3 / 5;
+			for (size_t b = 0; b < 2; b++) {
 				const int yBot = y + headH + bandRows[b] * rowH;
-				for (size_t ci = 0; ci < bands[b].size(); ci++) {
-					const InfoGroup& g = groups[bands[b][ci]];
-					if (ci) fill(x - gap / 2, y + u / 4, x - gap / 2 + std::max(1, u / 12), yBot - u / 4, cRule);
-					const int tsz = hG * 3 / 5;
+				// the rules between the columns, at the same places on both rows
+				for (int c = 1; c < kCols; c++) {
+					const int xr = bx0 + padX + c * (colWAll + gapC) - gapC / 2;
+					fill(xr, y + u / 4, xr + std::max(1, u / 12), yBot - u / 4, cRule);
+				}
+				for (const size_t gi : bands[b]) {
+					const InfoGroup& g = groups[gi];
+					const int x = bx0 + padX + (slotOf[gi] % kCols) * (colWAll + gapC);
 					tri(x, y + (hG * 5 / 4 - tsz) / 2, tsz, cOrange);
-					text(fG, x + tsz + hG / 3, y, cOrange, g.name);
+					text(fG, x + tsz + hG / 3, y, cOrange, fit(fG, g.name, colWAll - tsz - hG / 3));
 					int iy = y + headH;
+					int n = 0;
 					for (const auto& it : g.items) {
+						if (n++ >= bandRows[b]) break;
 						int ix = x;
 						if (it.k == 2) {
 							// Worth a look: an orange box with "!", so it doesn't rest on colour alone.
@@ -11218,10 +11314,9 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 							text(fG, ix + (warnW - width(fG, L"!")) / 2, by + (warnW - hG * 5 / 4) / 2, cInk, L"!");
 							ix += warnW + hL / 3;
 						}
-						text(fL, ix, iy, it.k == 1 ? cKnob : cTextSel, it.t);
+						text(fL, ix, iy, it.k == 1 ? cKnob : cTextSel, fit(fL, it.t, colWAll - (ix - x)));
 						iy += rowH;
 					}
-					x += colW[bands[b][ci]] + gap;
 				}
 				y = yBot + u / 2;
 			}
@@ -11684,3 +11779,11 @@ void CDX11VideoProcessor::SwitchFullScreen(bool set)
 	}
 }
 
+
+// 2.88.1: an output gamma other than Unplugged's 2.2, for an SDR output without a
+// calibration LUT (a LUT sets the gamma itself).
+bool CDX11VideoProcessor::OutGammaActive() const
+{
+	if (m_ClipGuard.OutGamma() == 0 || m_bCubeLutEnabled) return false;
+	return m_currentSwapChainColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+}
