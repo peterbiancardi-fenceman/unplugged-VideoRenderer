@@ -1,5 +1,5 @@
 /*
- * ClipGuard Media Player 0.9.0 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
+ * ClipGuard Media Player 0.9.1 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
  * dark pictures first, so after the projector's gain they land below clipping.
@@ -895,6 +895,8 @@ public:
 			if (SUCCEEDED(hr)) hr = m_FontH.InitDeviceObjects(pDevice, pContext);
 			if (SUCCEEDED(hr)) hr = m_FontL.InitDeviceObjects(pDevice, pContext);
 			if (SUCCEEDED(hr)) hr = m_FontG.InitDeviceObjects(pDevice, pContext);
+			if (SUCCEEDED(hr)) hr = m_FontL2.InitDeviceObjects(pDevice, pContext);   // 0.9.1
+			if (SUCCEEDED(hr)) hr = m_FontG2.InitDeviceObjects(pDevice, pContext);
 			m_fontH = 0;
 		}
 		if (FAILED(hr)) {
@@ -942,6 +944,8 @@ public:
 		m_FontH.InvalidateDeviceObjects();
 		m_FontL.InvalidateDeviceObjects();
 		m_FontG.InvalidateDeviceObjects();
+		m_FontL2.InvalidateDeviceObjects();
+		m_FontG2.InvalidateDeviceObjects();
 		m_fontH = 0;
 		m_pDevice = nullptr;
 		m_pContext = nullptr;
@@ -1687,7 +1691,9 @@ public:
 			&& SUCCEEDED(m_FontT.CreateFontBitmap(family, h * 3 / 2, D3DFONT_BOLD))
 			&& SUCCEEDED(m_FontB.CreateFontBitmap(family, h * 3, D3DFONT_BOLD))
 			&& SUCCEEDED(m_FontL.CreateFontBitmap(family, h * 31 / 20, 0))
-			&& SUCCEEDED(m_FontG.CreateFontBitmap(family, h * 13 / 10, D3DFONT_BOLD))) {
+			&& SUCCEEDED(m_FontG.CreateFontBitmap(family, h * 13 / 10, D3DFONT_BOLD))
+			&& SUCCEEDED(m_FontL2.CreateFontBitmap(family, h * 5 / 4, 0))              // 0.9.1: banner details 25% over the menu text
+			&& SUCCEEDED(m_FontG2.CreateFontBitmap(family, h, D3DFONT_BOLD))) {
 			m_fontH = h;
 		}
 	}
@@ -1698,13 +1704,15 @@ public:
 	CD3D11Font& FontHd() { return m_FontH; }
 	CD3D11Font& FontL() { return m_FontL; }
 	CD3D11Font& FontG() { return m_FontG; }
+	CD3D11Font& FontL2() { return m_FontL2; }   // 0.9.1
+	CD3D11Font& FontG2() { return m_FontG2; }
 
 	// ---- info banner (F6) --------------------------------------------------------
 	bool InfoVisible() const { return m_s.infoOn; }
 	// The graphics card's load in % as Windows reports it (Task Manager's 3D
 	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
 	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
-	const wchar_t* VersionText() const { return L"0.9.0"; }
+	const wchar_t* VersionText() const { return L"0.9.1"; }
 	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
 	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
 	float PicturePct() const { return m_picture; }
@@ -1755,7 +1763,7 @@ public:
 	{
 		OvModel m;
 		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
-		m.version = m_s.testBuild ? L"0.9.0 Test" : L"0.9.0 beta";
+		m.version = m_s.testBuild ? L"0.9.1 Test" : L"0.9.1 beta";
 		const auto vals = Lines();
 		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"View", L"Overlay", L"Restart & update" };
 		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it
@@ -3532,6 +3540,8 @@ private:
 	CD3D11Font m_FontH;   // small bold: headings
 	CD3D11Font m_FontL;   // info banner values
 	CD3D11Font m_FontG;   // info banner group headings (bold)
+	CD3D11Font m_FontL2;  // 0.9.1: info banner values when the large ones don't fit in one row
+	CD3D11Font m_FontG2;  // 0.9.1: and their headings
 	UINT m_fontH = 0;
 
 	std::wstring m_iniPath;

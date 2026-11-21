@@ -1070,12 +1070,14 @@ void CMpcVideoRenderer::UpdateDisplayInfo()
 		m_bPrimaryDisplay = false;
 	}
 
-	m_VideoProcessor->SetDisplayInfo(m_DisplayConfig, m_bPrimaryDisplay, m_bExclusiveScreen);
+	if (m_VideoProcessor) {   // ClipGuard 2.84.0: not while it is being made or after it is gone
+		m_VideoProcessor->SetDisplayInfo(m_DisplayConfig, m_bPrimaryDisplay, m_bExclusiveScreen);
+	}
 }
 
 void CMpcVideoRenderer::OnDisplayModeChange(const bool bReset/* = false*/)
 {
-	if (m_bDisplayModeChanging) {
+	if (m_bDisplayModeChanging || !m_VideoProcessor) {   // ClipGuard 2.84.0: no processor (closing or not made yet)
 		return;
 	}
 
@@ -1093,7 +1095,7 @@ void CMpcVideoRenderer::OnDisplayModeChange(const bool bReset/* = false*/)
 
 void CMpcVideoRenderer::OnWindowMove()
 {
-	if (GetActive()) {
+	if (GetActive() && m_VideoProcessor) {   // ClipGuard 2.84.0
 		const HMONITOR hMon = MonitorFromWindow(m_hWnd, MONITOR_DEFAULTTONEAREST);
 		if (hMon != m_hMon) {
 			if (m_Sets.bReinitByDisplay) {

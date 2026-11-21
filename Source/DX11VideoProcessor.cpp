@@ -11113,8 +11113,10 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 		int sumW = 0;
 		for (int pass = sPass; pass < 2; pass++) {
 			if (pass == 1) {
-				hL = u; hG = std::max(9, u * 4 / 5); minGap = u;
-				pL = &fM; pG = &fH;
+				// 0.9.1: 25% over the menu text (was the menu's own size); the columns
+				// wrap into a second band when they don't fit.
+				hL = u * 5 / 4; hG = u; minGap = u;
+				pL = &m_ClipGuard.FontL2(); pG = &m_ClipGuard.FontG2();
 			}
 			sumW = 0;
 			for (size_t i = 0; i < groups.size(); i++) {
