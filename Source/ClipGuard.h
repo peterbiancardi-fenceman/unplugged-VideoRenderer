@@ -3417,13 +3417,13 @@ private:
 		m_s.pinned     = m_s.overlayOn;
 		m_s.selected   = 0;
 		m_s.outGamma   = 0;
+		m_s.outRange   = 0;
+		m_s.depthDetail = m_s.depthEdges = m_s.depthWide = m_s.depthView = 0;   // 0.9.3
 	}
 
 	// Hot spot test video: the end of each 30 s part shows a row of ten 40 x 40
 	// grey (bit 1, signal 0.30) or black (bit 0) blocks along the bottom right of
 	// the 1920 x 1080 frame: the code 10110010 and then the part number in two
-		m_s.outRange   = 0;
-		m_s.depthDetail = m_s.depthEdges = m_s.depthWide = m_s.depthView = 0;   // 2.93.0
 	// bits. Seen on kMarkFrames frames in a row, it counts once; ClipGuard Test
 	// then saves and sends the log (the last 30 s: that part).
 	static constexpr int kMarkFrames = 4;
