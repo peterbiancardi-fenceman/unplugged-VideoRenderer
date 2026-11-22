@@ -8796,33 +8796,6 @@ void CDX11VideoProcessor::DrawGeometry(ID3D11Texture2D* pBackBuffer)
 	rtv->Release();
 }
 
-HRESULT CDX11VideoProcessor::InitDepth()
-{
-	ReleaseDepth();
-	if (!m_pDevice) return E_POINTER;
-	auto ps = [&](const char* src, size_t len, ID3D11PixelShader** pp) {
-		ID3DBlob* pBlob = nullptr;
-		HRESULT h = CompileShader(std::string(src, len), nullptr, "ps_4_0", &pBlob);
-		if (SUCCEEDED(h) && pBlob) h = m_pDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, pp);
-		if (pBlob) pBlob->Release();
-		return h;
-	};
-	auto cb = [&](UINT bytes, ID3D11Buffer** pp) {
-		D3D11_BUFFER_DESC bd = { bytes, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
-		return m_pDevice->CreateBuffer(&bd, nullptr, pp);
-	};
-	HRESULT hr = ps(kDepthLumaHLSL, sizeof(kDepthLumaHLSL) - 1, &m_pPSDepthLuma);
-	if (SUCCEEDED(hr)) hr = ps(kDepthBlurHLSL, sizeof(kDepthBlurHLSL) - 1, &m_pPSDepthBlur);
-	if (SUCCEEDED(hr)) hr = ps(kDepthEnergyHLSL, sizeof(kDepthEnergyHLSL) - 1, &m_pPSDepthEnergy);
-	if (SUCCEEDED(hr)) hr = ps(kDepthMainHLSL, sizeof(kDepthMainHLSL) - 1, &m_pPSDepthMain);
-	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthLuma);
-	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthBlur);
-	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthEnergy);
-	if (SUCCEEDED(hr)) hr = cb(80, &m_pCBDepthMain);
-	if (FAILED(hr)) { ReleaseDepth(); return hr; }
-	m_bDepthReady = true;
-	return S_OK;
-}
 
 // ---- 2.93.0: Depth --------------------------------------------------------------
 
