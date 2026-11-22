@@ -841,6 +841,7 @@ void CDX11VideoProcessor::ReleaseDevice()
 
 	m_ClipGuard.ReleaseDevice();
 	ReleaseDepth();   // 2.93.0
+	ReleaseGeometry();   // 2.105.0
 	m_NeuralUps.ReleaseDevice();
 	m_pPSGamut2020.Release();
 	for (auto& t : m_ClipGuardDelay) t.Release();
@@ -7826,8 +7827,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 		}
 
+	ReadView();          // 2.105.0
+	ApplyAnamorphic();
 	if (!m_renderRect.IsRectEmpty()) {
-		hr = Process(pBackBuffer, m_srcRect, m_videoRect, m_FieldDrawn == 2);
+		hr = Process(pBackBuffer, m_view.lens100 > 101 ? m_srcRectAna : m_srcRect, m_videoRect, m_FieldDrawn == 2);
 	}
 
 	if (!m_pPSHalfOUtoInterlace) {
@@ -7894,6 +7897,8 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 		}
 	}
 #endif
+
+	DrawGeometry(pBackBuffer);   // 2.105.0: the screen's 12-point geometry, last (everything on it is fitted)
 
 	uint64_t tick3 = GetPreciseTick();
 	m_RenderStats.paintticks = tick3 - tick1;
@@ -8515,6 +8520,310 @@ void CDX11VideoProcessor::DrawSubtitles(ID3D11Texture2D* pRenderTarget)
 	}
 }
 
+// ---- 2.105.0: anamorphic lens and screen geometry -------------------------------------
+
+static const char kGeoVS[] = R"(
+cbuffer CB : register(b0) { float4 P[6]; float4 prm; };
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+float2 Pt(int i) { float4 q = P[i >> 1]; return (i & 1) ? q.zw : q.xy; }
+float2 Lag4(float t, float2 a, float2 b, float2 c, float2 d)
+{
+	const float n0 = 0.0, n1 = 1.0 / 3.0, n2 = 2.0 / 3.0, n3 = 1.0;
+	const float l0 = (t - n1) * (t - n2) * (t - n3) / ((n0 - n1) * (n0 - n2) * (n0 - n3));
+	const float l1 = (t - n0) * (t - n2) * (t - n3) / ((n1 - n0) * (n1 - n2) * (n1 - n3));
+	const float l2 = (t - n0) * (t - n1) * (t - n3) / ((n2 - n0) * (n2 - n1) * (n2 - n3));
+	const float l3 = (t - n0) * (t - n1) * (t - n2) / ((n3 - n0) * (n3 - n1) * (n3 - n2));
+	return l0 * a + l1 * b + l2 * c + l3 * d;
+}
+VSOut main(uint id : SV_VertexID)
+{
+	const uint nx = (uint)prm.x, ny = (uint)prm.y;
+	const uint q = id / 6, c = id % 6;
+	const uint qx = q % nx, qy = q / nx;
+	const uint cx = (c == 1 || c == 3 || c == 4) ? 1 : 0;
+	const uint cy = (c == 2 || c == 4 || c == 5) ? 1 : 0;
+	const float u = (float)(qx + cx) / (float)nx, v = (float)(qy + cy) / (float)ny;
+	// the 12 points are on the edges: 0-3 top, 4-7 bottom, 8-9 left (upper, lower third),
+	// 10-11 right. Each edge is a curve through its 4; the inside blends the four edges.
+	const float2 T = Lag4(u, Pt(0), Pt(1), Pt(2), Pt(3));
+	const float2 B = Lag4(u, Pt(4), Pt(5), Pt(6), Pt(7));
+	const float2 L = Lag4(v, Pt(0), Pt(8), Pt(9), Pt(4));
+	const float2 R = Lag4(v, Pt(3), Pt(10), Pt(11), Pt(7));
+	const float2 C = (1.0 - u) * (1.0 - v) * Pt(0) + u * (1.0 - v) * Pt(3) + (1.0 - u) * v * Pt(4) + u * v * Pt(7);
+	const float2 off = (1.0 - v) * T + v * B + (1.0 - u) * L + u * R - C;
+	const float2 p = float2(u, v) + off;
+	VSOut o;
+	o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+	o.uv = float2(u, v);
+	return o;
+}
+)";
+
+// 2.106.0: EWA Lanczos (jinc, radius 3.24, as mpv's ewa_lanczossharp) with anti-ringing:
+// a round filter, so a warped picture keeps the same sharpness in every direction.
+static const char kGeoPS[] = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+float J1(float x)
+{
+	const float ax = abs(x);
+	if (ax < 8.0) {
+		const float y = x * x;
+		const float a1 = x * (72362614232.0 + y * (-7895059235.0 + y * (242396853.1 + y * (-2972611.439 + y * (15704.48260 + y * (-30.16036606))))));
+		const float a2 = 144725228442.0 + y * (2300535178.0 + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y))));
+		return a1 / a2;
+	}
+	const float z = 8.0 / ax, y2 = z * z, xx = ax - 2.356194491;
+	const float b1 = 1.0 + y2 * (0.183105e-2 + y2 * (-0.3516396496e-4 + y2 * (0.2457520174e-5 + y2 * (-0.240337019e-6))));
+	const float b2 = 0.04687499995 + y2 * (-0.2002690873e-3 + y2 * (0.8449199096e-5 + y2 * (-0.88228987e-6 + y2 * 0.105787412e-6)));
+	const float r = sqrt(0.636619772 / ax) * (cos(xx) * b1 - z * sin(xx) * b2);
+	return x < 0.0 ? -r : r;
+}
+float Jinc(float x)
+{
+	if (x < 1e-5) return 1.0;
+	const float px = 3.14159265 * x;
+	return 2.0 * J1(px) / px;
+}
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+	uint w, h;
+	tex.GetDimensions(w, h);
+	const float2 p = uv * float2(w, h) - 0.5;
+	const float2 base = floor(p);
+	const float2 f = p - base;
+	const float R = 3.2383154841662362, BLUR = 0.9812505644269356, WZ = 1.2196698912665045;
+	float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+	float wsum = 0.0;
+	float4 lo = float4(1e9, 1e9, 1e9, 1e9), hi = float4(-1e9, -1e9, -1e9, -1e9);
+	[loop] for (int y = -3; y <= 4; y++) {
+		[loop] for (int x = -3; x <= 4; x++) {
+			const float2 o = float2((float)x, (float)y) - f;
+			const float d = length(o);
+			if (d >= R) continue;
+			const int2 cc = clamp(int2(base) + int2(x, y), int2(0, 0), int2((int)w - 1, (int)h - 1));
+			const float4 t = tex.Load(int3(cc, 0));
+			const float wt = Jinc(d / BLUR) * Jinc(d * WZ / R);
+			sum += t * wt;
+			wsum += wt;
+			if (d < 1.5) { lo = min(lo, t); hi = max(hi, t); }
+		}
+	}
+	float4 c = sum / max(wsum, 1e-6);
+	c = lerp(c, clamp(c, lo, hi), 0.8);   // anti-ringing: no halos past the nearby pixels
+	return c;
+}
+)";
+
+// The player's view block: lens (x100, 0 = none), scope screen (x100), the film's aspect
+// (x1000, 0 = the frame's own), geometry on, and the 12 points' moves (4 across x 3 down,
+// row by row, x / y in 1/10000 of the width / height). Opened once a second until it
+// exists; nothing changes without it.
+void CDX11VideoProcessor::ReadView()
+{
+	if (!m_pView) {
+		const ULONGLONG now = GetTickCount64();
+		if (now < m_viewRetry) { m_view = {}; return; }
+		m_viewRetry = now + 1000;
+		HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\ClipGuard_view_v1");
+		if (!h) { m_view = {}; return; }
+		void* p = MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(ViewShared));
+		if (!p) { CloseHandle(h); m_view = {}; return; }
+		m_hViewMap = h;
+		m_pView = (const volatile ViewShared*)p;
+	}
+	ViewShared v;
+	memcpy(&v, (const void*)m_pView, sizeof(v));
+	if (v.magic != 0x56574543) v = {};
+	m_view = v;
+}
+
+// With a lens, two cases only, decided by the player once per film (no switching while it
+// plays): SCOPE (the film is 2.2 or wider): the letterbox is cut off and the picture fills
+// the panel's height at the screen's shape, so the lens widens it to fill the screen.
+// NOT SCOPE: the film keeps its own shape at the screen's full height, squeezed sideways by
+// the lens factor, with black at the sides. aspect1000: the film's aspect (x1000) from the
+// player, 0 = Auto (read from the picture, below), -1 = not scope (the frame's own shape).
+void CDX11VideoProcessor::ApplyAnamorphic()
+{
+	const CRect vr = m_videoRectOrig.IsRectEmpty() ? m_videoRect : m_videoRectOrig;
+	CRect sr = m_srcRect;
+	const int W = m_windowRect.Width(), H = m_windowRect.Height();
+	const float f = (float)m_view.lens100 / 100.0f;
+	if (f > 1.01f && W > 0 && H > 0 && vr.Width() > 0 && vr.Height() > 0 && sr.Width() > 0 && sr.Height() > 0) {
+		const float S = m_view.screen100 > 0 ? (float)m_view.screen100 / 100.0f : 2.40f;
+		const float As = (float)vr.Width() / (float)vr.Height();   // the frame's shape as shown
+		// 2.105.2: Auto reads the film's shape from the picture. A new film starts as not scope;
+		// once 4 s of bright frames show a scope letterbox (the picture 68-80% of the height,
+		// bars the same top and bottom), it becomes scope for the rest of the film. Never back.
+		if (m_view.geoEdit != m_anaFilm) { m_anaFilm = m_view.geoEdit; m_anaVotes = 0; m_anaScope = false; m_anaMeasured = 0.0f; }
+		if (m_view.aspect1000 == 0 && !m_anaScope) {
+			int cy0, cy1, rows; float pic;
+			if (m_ClipGuard.ContentRows(cy0, cy1, rows, pic) && rows > 0 && pic >= 0.3f && m_ClipGuard.TextPct() < 20.0f) {   // 2.106.0: not credits or text
+				const float frac = (float)(cy1 - cy0 + 1) / (float)rows;
+				const int top = cy0, bot = rows - 1 - cy1;
+				const bool letterbox = As < 2.0f && frac >= 0.68f && frac <= 0.80f && std::abs(top - bot) <= std::max(2, rows / 36);
+				if (letterbox) {
+					++m_anaVotes;
+					m_anaMeasured += ((As / frac) - m_anaMeasured) / (float)std::min(m_anaVotes, 96);   // the film's aspect, averaged
+					if (m_anaVotes >= 96) m_anaScope = true;
+				}
+				else if (frac > 0.92f) m_anaVotes = std::max(0, m_anaVotes - 2);
+			}
+		}
+		const float a = std::clamp(m_view.aspect1000 > 0 ? (float)m_view.aspect1000 / 1000.0f : (m_anaScope ? 2.39f : As), 1.0f, 3.0f);
+		const bool scope = m_view.aspect1000 >= 0 && a >= 2.2f;
+		const float T = scope ? S : a;   // the shape shown, at the panel's full height
+		const int ph = H;
+		const int pw = std::max(1, std::min(W, (int)std::lround(T * H / f)));
+		const CRect nv(CPoint(m_windowRect.left + (W - pw) / 2, m_windowRect.top), CSize(pw, ph));
+		if (T > As * 1.005f) {          // wider than the frame: its letterbox is cut off
+			const int keep = std::max(1, (int)std::lround(sr.Height() * As / T));
+			const int cut = (sr.Height() - keep) / 2;
+			sr.top += cut; sr.bottom = sr.top + keep;
+		} else if (T < As / 1.005f) {   // narrower: the sides are cut off
+			const int keep = std::max(1, (int)std::lround(sr.Width() * T / As));
+			const int cut = (sr.Width() - keep) / 2;
+			sr.left += cut; sr.right = sr.left + keep;
+		}
+		m_srcRectAna = sr;
+		if (nv != m_videoRect) { m_videoRect = nv; UpdateRenderRect(); UpdateTexures(); }
+	} else {
+		m_srcRectAna = m_srcRect;
+		if (!m_videoRectOrig.IsRectEmpty() && m_videoRect != m_videoRectOrig) { m_videoRect = m_videoRectOrig; UpdateRenderRect(); UpdateTexures(); }
+	}
+}
+
+void CDX11VideoProcessor::ReleaseGeometry()
+{
+	m_pVSGeo.Release(); m_pPSGeo.Release(); m_pCBGeo.Release(); m_pRSGeo.Release();
+	m_pGeoSRV.Release(); m_pGeoCopy.Release();
+	m_bGeoTried = false;
+}
+
+// The finished frame (picture, subtitles, banner, menus) is drawn again through a mesh
+// that moves each of the 12 points by its amount, smoothly between them (a cubic across,
+// a quadratic down, through all 12), onto black.
+void CDX11VideoProcessor::DrawGeometry(ID3D11Texture2D* pBackBuffer)
+{
+	if (!pBackBuffer || !m_pDevice || !m_pDeviceContext || !m_view.geoOn) return;
+	bool any = false;
+	for (int i = 0; i < 24; i++) if (m_view.pt[i] != 0) { any = true; break; }
+	if (!any) return;
+	if (!m_bGeoTried) {
+		m_bGeoTried = true;
+		ID3DBlob* b = nullptr;
+		if (SUCCEEDED(CompileShader(std::string(kGeoVS, sizeof(kGeoVS) - 1), nullptr, "vs_4_0", &b)) && b)
+			m_pDevice->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &m_pVSGeo);
+		if (b) { b->Release(); b = nullptr; }
+		if (SUCCEEDED(CompileShader(std::string(kGeoPS, sizeof(kGeoPS) - 1), nullptr, "ps_4_0", &b)) && b)
+			m_pDevice->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &m_pPSGeo);
+		if (b) { b->Release(); b = nullptr; }
+		D3D11_BUFFER_DESC bd = { 112, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+		m_pDevice->CreateBuffer(&bd, nullptr, &m_pCBGeo);
+		D3D11_RASTERIZER_DESC rd = {};
+		rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+		m_pDevice->CreateRasterizerState(&rd, &m_pRSGeo);
+	}
+	if (!m_pVSGeo || !m_pPSGeo || !m_pCBGeo || !m_pSamplerLinear) return;
+
+	D3D11_TEXTURE2D_DESC d;
+	pBackBuffer->GetDesc(&d);
+	if (m_pGeoCopy) {
+		D3D11_TEXTURE2D_DESC c;
+		m_pGeoCopy->GetDesc(&c);
+		if (c.Width != d.Width || c.Height != d.Height || c.Format != d.Format) { m_pGeoSRV.Release(); m_pGeoCopy.Release(); }
+	}
+	if (!m_pGeoCopy) {
+		D3D11_TEXTURE2D_DESC c = d;
+		c.MipLevels = 1; c.ArraySize = 1; c.SampleDesc.Count = 1; c.SampleDesc.Quality = 0;
+		c.Usage = D3D11_USAGE_DEFAULT; c.BindFlags = D3D11_BIND_SHADER_RESOURCE; c.CPUAccessFlags = 0; c.MiscFlags = 0;
+		if (FAILED(m_pDevice->CreateTexture2D(&c, nullptr, &m_pGeoCopy))) return;
+		if (FAILED(m_pDevice->CreateShaderResourceView(m_pGeoCopy, nullptr, &m_pGeoSRV))) { m_pGeoCopy.Release(); return; }
+	}
+	m_pDeviceContext->CopyResource(m_pGeoCopy, pBackBuffer);
+
+	ID3D11RenderTargetView* rtv = nullptr;
+	if (FAILED(m_pDevice->CreateRenderTargetView(pBackBuffer, nullptr, &rtv)) || !rtv) return;
+	ID3D11DeviceContext* ctx = m_pDeviceContext;
+
+	// keep the pipeline as it was
+	ID3D11InputLayout* oIL = nullptr; ctx->IAGetInputLayout(&oIL);
+	D3D11_PRIMITIVE_TOPOLOGY oTop; ctx->IAGetPrimitiveTopology(&oTop);
+	ID3D11VertexShader* oVS = nullptr; ctx->VSGetShader(&oVS, nullptr, nullptr);
+	ID3D11PixelShader* oPS = nullptr; ctx->PSGetShader(&oPS, nullptr, nullptr);
+	ID3D11Buffer* oCB = nullptr; ctx->VSGetConstantBuffers(0, 1, &oCB);
+	ID3D11ShaderResourceView* oSRV = nullptr; ctx->PSGetShaderResources(0, 1, &oSRV);
+	ID3D11SamplerState* oSamp = nullptr; ctx->PSGetSamplers(0, 1, &oSamp);
+	ID3D11RasterizerState* oRS = nullptr; ctx->RSGetState(&oRS);
+	UINT nVP = 1; D3D11_VIEWPORT oVP = {}; ctx->RSGetViewports(&nVP, &oVP);
+	ID3D11BlendState* oBS = nullptr; FLOAT oBF[4] = {}; UINT oSM = 0; ctx->OMGetBlendState(&oBS, oBF, &oSM);
+
+	const FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	ctx->ClearRenderTargetView(rtv, black);
+	struct { float pt[24]; float prm[4]; } cbd = {};
+	for (int i = 0; i < 24; i++) cbd.pt[i] = (float)m_view.pt[i] / 10000.0f;
+	const UINT NX = 48, NY = 27;
+	cbd.prm[0] = (float)NX; cbd.prm[1] = (float)NY;
+	ctx->UpdateSubresource(m_pCBGeo, 0, nullptr, &cbd, 0, 0);
+	const D3D11_VIEWPORT vp = { 0.0f, 0.0f, (FLOAT)d.Width, (FLOAT)d.Height, 0.0f, 1.0f };
+	ctx->RSSetViewports(1, &vp);
+	ctx->RSSetState(m_pRSGeo);
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx->VSSetShader(m_pVSGeo, nullptr, 0);
+	ID3D11Buffer* cb = m_pCBGeo;
+	ctx->VSSetConstantBuffers(0, 1, &cb);
+	ctx->PSSetShader(m_pPSGeo, nullptr, 0);
+	ID3D11ShaderResourceView* srv = m_pGeoSRV;
+	ctx->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState* smp = m_pSamplerLinear;
+	ctx->PSSetSamplers(0, 1, &smp);
+	ctx->Draw(NX * NY * 6, 0);
+
+	ID3D11ShaderResourceView* nullSRV = nullptr;
+	ctx->PSSetShaderResources(0, 1, &nullSRV);
+	ctx->OMSetRenderTargets(0, nullptr, nullptr);
+	ctx->IASetInputLayout(oIL); ctx->IASetPrimitiveTopology(oTop);
+	ctx->VSSetShader(oVS, nullptr, 0); ctx->PSSetShader(oPS, nullptr, 0);
+	ctx->VSSetConstantBuffers(0, 1, &oCB); ctx->PSSetShaderResources(0, 1, &oSRV); ctx->PSSetSamplers(0, 1, &oSamp);
+	ctx->RSSetState(oRS); if (nVP) ctx->RSSetViewports(1, &oVP);
+	ctx->OMSetBlendState(oBS, oBF, oSM);
+	if (oIL) oIL->Release(); if (oVS) oVS->Release(); if (oPS) oPS->Release(); if (oCB) oCB->Release();
+	if (oSRV) oSRV->Release(); if (oSamp) oSamp->Release(); if (oRS) oRS->Release(); if (oBS) oBS->Release();
+	rtv->Release();
+}
+
+HRESULT CDX11VideoProcessor::InitDepth()
+{
+	ReleaseDepth();
+	if (!m_pDevice) return E_POINTER;
+	auto ps = [&](const char* src, size_t len, ID3D11PixelShader** pp) {
+		ID3DBlob* pBlob = nullptr;
+		HRESULT h = CompileShader(std::string(src, len), nullptr, "ps_4_0", &pBlob);
+		if (SUCCEEDED(h) && pBlob) h = m_pDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, pp);
+		if (pBlob) pBlob->Release();
+		return h;
+	};
+	auto cb = [&](UINT bytes, ID3D11Buffer** pp) {
+		D3D11_BUFFER_DESC bd = { bytes, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+		return m_pDevice->CreateBuffer(&bd, nullptr, pp);
+	};
+	HRESULT hr = ps(kDepthLumaHLSL, sizeof(kDepthLumaHLSL) - 1, &m_pPSDepthLuma);
+	if (SUCCEEDED(hr)) hr = ps(kDepthBlurHLSL, sizeof(kDepthBlurHLSL) - 1, &m_pPSDepthBlur);
+	if (SUCCEEDED(hr)) hr = ps(kDepthEnergyHLSL, sizeof(kDepthEnergyHLSL) - 1, &m_pPSDepthEnergy);
+	if (SUCCEEDED(hr)) hr = ps(kDepthMainHLSL, sizeof(kDepthMainHLSL) - 1, &m_pPSDepthMain);
+	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthLuma);
+	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthBlur);
+	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthEnergy);
+	if (SUCCEEDED(hr)) hr = cb(80, &m_pCBDepthMain);
+	if (FAILED(hr)) { ReleaseDepth(); return hr; }
+	m_bDepthReady = true;
+	return S_OK;
+}
+
 // ---- 2.93.0: Depth --------------------------------------------------------------
 
 HRESULT CDX11VideoProcessor::InitDepth()
@@ -8718,7 +9027,15 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	else if (m_PSConvColorData.bEnable) {
 		ConvertColorPass(m_TexConvertOutput.pTexture);
 		pInputTexture = &m_TexConvertOutput;
-		rSrc.SetRect(0, 0, m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height);
+		const int cw = (int)m_TexConvertOutput.desc.Width, ch = (int)m_TexConvertOutput.desc.Height;
+		if (srcRect != m_srcRect && m_srcRect.Width() > 0 && m_srcRect.Height() > 0) {
+			// 2.105.2: a crop of the source (the lens's letterbox cut) carried into the
+			// converted copy, which holds all of m_srcRect (before, it was always shown whole)
+			rSrc.SetRect(MulDiv(srcRect.left - m_srcRect.left, cw, m_srcRect.Width()), MulDiv(srcRect.top - m_srcRect.top, ch, m_srcRect.Height()),
+				MulDiv(srcRect.right - m_srcRect.left, cw, m_srcRect.Width()), MulDiv(srcRect.bottom - m_srcRect.top, ch, m_srcRect.Height()));
+		} else {
+			rSrc.SetRect(0, 0, cw, ch);
+		}
 	}
 	else {
 		pInputTexture = &m_TexSrcVideo;
@@ -9398,6 +9715,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 void CDX11VideoProcessor::SetVideoRect(const CRect& videoRect)
 {
+	m_videoRectOrig = videoRect;   // 2.105.0: kept, so the lens can be switched off again
 	m_videoRect = videoRect;
 	UpdateRenderRect();
 	UpdateTexures();
@@ -11134,6 +11452,34 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				const unsigned skipped = skippedAll > m_SkipBase ? skippedAll - m_SkipBase : 0;   // not those of the first 10 s
 				if (fpsOut > 1.0) g.items.push_back({ std::format(L"{:.3f} fps drawn, {} skipped", fpsOut, skipped), skipped ? 2 : 0 });
 				else g.items.push_back({ std::format(L"{} skipped", skipped), skipped ? 2 : 0 });
+			}
+			// 2.106.0: the anamorphic lens: lens and screen, the film's shape and how it was
+			// decided, its measured aspect, the scaling, and the screen geometry
+			if (m_view.lens100 > 101) {
+				const float lf = (float)m_view.lens100 / 100.0f, S = m_view.screen100 > 0 ? (float)m_view.screen100 / 100.0f : 2.40f;
+				const CRect vo = m_videoRectOrig.IsRectEmpty() ? m_videoRect : m_videoRectOrig;
+				const float As = vo.Height() > 0 ? (float)vo.Width() / (float)vo.Height() : 1.78f;
+				g.items.push_back({ std::format(L"Lens {:.2f}x, {:.2f} screen", lf, S), 0 });
+				std::wstring shape;
+				if (m_view.aspect1000 > 0) shape = L"Scope (set)";
+				else if (m_view.aspect1000 < 0) shape = L"Not scope (set)";
+				else if (As >= 2.2f) shape = L"Scope (the frame's shape)";
+				else if (m_anaScope) shape = L"Scope (read from the picture)";
+				else if (m_anaVotes > 0) shape = std::format(L"Not scope, checking {}%", std::min(99, m_anaVotes * 100 / 96));
+				else shape = L"Not scope (read from the picture)";
+				g.items.push_back({ shape, 0 });
+				g.items.push_back({ m_anaMeasured > 0.5f ? std::format(L"Film {:.2f} in a {:.2f} frame", m_anaMeasured, As) : std::format(L"Frame {:.2f}", As), 0 });
+				const CRect sr = m_srcRectAna.IsRectEmpty() ? m_srcRect : m_srcRectAna;
+				if (sr.Width() > 0 && sr.Height() > 0 && m_videoRect.Width() > 0) {
+					const float k = ((float)m_videoRect.Height() / sr.Height()) / ((float)m_videoRect.Width() / sr.Width());
+					g.items.push_back({ std::format(L"{} x {} -> {} x {}{}", sr.Width(), sr.Height(), m_videoRect.Width(), m_videoRect.Height(),
+						k > 1.01f ? std::format(L", x{:.2f} tall", k) : (k < 0.99f ? std::format(L", x{:.2f} wide", k) : std::wstring())), 0 });
+				}
+			}
+			{
+				bool anyPt = false;
+				for (int i = 0; i < 24; i++) if (m_view.pt[i] != 0) { anyPt = true; break; }
+				if (m_view.geoOn && anyPt) g.items.push_back({ L"Screen geometry on (EWA Lanczos)", 0 });
 			}
 			// 2.44.4: "filled" when the player asked for a few pixels less than its
 			// full-screen window and the video fills it; otherwise what the player

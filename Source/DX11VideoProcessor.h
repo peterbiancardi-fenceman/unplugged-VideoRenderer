@@ -923,6 +923,30 @@ private:
 	void ReleaseDepth();
 	bool DepthActive() const;   // any of the three above 0 and not switched off for comparing
 	HRESULT DrawDepth(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect, bool bypass);
+	// 2.105.0: anamorphic lens and 12-point screen geometry, set by ClipGuard Media Player
+	// through the shared block Local\ClipGuard_view_v1 (see ReadView).
+	struct ViewShared { int32_t magic, seq, lens100, screen100, aspect1000, geoOn, geoEdit, pt[24]; };
+	HANDLE m_hViewMap = nullptr;
+	const volatile ViewShared* m_pView = nullptr;
+	ULONGLONG m_viewRetry = 0;
+	ViewShared m_view = {};
+	CRect m_videoRectOrig;   // the rect the player gave (before the lens)
+	CRect m_srcRectAna;      // the source part shown (the letterbox cut off with the lens)
+	CComPtr<ID3D11VertexShader> m_pVSGeo;
+	CComPtr<ID3D11PixelShader> m_pPSGeo;
+	CComPtr<ID3D11Buffer> m_pCBGeo;
+	CComPtr<ID3D11RasterizerState> m_pRSGeo;
+	CComPtr<ID3D11Texture2D> m_pGeoCopy;
+	CComPtr<ID3D11ShaderResourceView> m_pGeoSRV;
+	bool m_bGeoTried = false;
+	int m_anaFilm = -1;       // 2.105.2: the film the scope check belongs to (the player's count)
+	int m_anaVotes = 0;       // bright frames with a scope letterbox
+	bool m_anaScope = false;  // decided: scope (kept for the rest of the film)
+	float m_anaMeasured = 0.0f;   // 2.106.0: the film's aspect as measured from its letterbox (average of the scope votes)
+	void ReadView();
+	void ApplyAnamorphic();
+	void DrawGeometry(ID3D11Texture2D* pBackBuffer);
+	void ReleaseGeometry();
 	CD3D11Lines     m_Lines;
 	CD3D11Polyline  m_SyncLine;
 

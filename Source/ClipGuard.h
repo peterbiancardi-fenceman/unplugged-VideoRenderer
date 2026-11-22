@@ -1665,6 +1665,8 @@ public:
 
 	float BottomBarFrac() const { return m_bottomBarFrac; }
 	// Top letterbox bar, fraction of the video height (0 when unknown).
+	float TextPct() const { return m_textPct; }   // share of the highlights that read as text / credits (%)
+	bool ContentRows(int& y0, int& y1, int& rows, float& pic) const { y0 = m_by0; y1 = m_by1; rows = (int)m_cy; pic = m_picture; return m_haveMeasure && m_by0 <= m_by1; }
 	float TopBarFrac() const { return (m_haveMeasure && m_by0 <= m_by1) ? (float)m_by0 / (float)m_cy : 0.0f; }
 	// The bars around the largest picture area seen so far, for placing the
 	// overlay: in a very dark shot the picture's edge rows read as bar on some
