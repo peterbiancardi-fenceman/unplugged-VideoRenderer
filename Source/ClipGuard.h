@@ -1652,6 +1652,14 @@ public:
 	int OutGamma() const { return m_s.outGamma; }   // 0.9.3
 	int OutRange() const { return m_s.outRange; }   // 0.9.3
 	int DepthDetail() const { return m_s.depthDetail; }   // 0.9.3: ClipBee
+	// ClipBit and the load, as the player / renderer set them
+	int m_bitDetail = 0, m_bitGrain = 0, m_cbState = 0, m_cbKbps = 0, m_cbMode = 0;
+	struct LoadS { int gpu, cpu; float ms, limit; };
+	LoadS m_loadS[30] = {}; int m_loadN = 0, m_loadW = 0;
+	std::wstring m_outDetail;
+	void SetLoad(int gpu, int cpu, float ms, float limit) { m_loadS[m_loadW] = { gpu, cpu, ms, limit }; m_loadW = (m_loadW + 1) % 30; if (m_loadN < 30) m_loadN++; }
+	void SetOutputDetail(const std::wstring& s) { m_outDetail = s; }
+	void SetBitrateHelp(int detail, int grain, int state, int kbps, int mode) { m_bitDetail = detail; m_bitGrain = grain; m_cbState = state; m_cbKbps = kbps; m_cbMode = mode; }
 	int DepthEdges() const { return m_s.depthEdges; }
 	int DepthWide() const { return m_s.depthWide; }
 	int DepthView() const { return m_s.depthView; }

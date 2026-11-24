@@ -40,6 +40,8 @@
 #include "BYTETracker.h"
 #include "ClipGuard.h"
 #include "NeuralUpscale.h"
+#include "Ravu.h"       // 0.9.6
+#include "SSimDown.h"   // 0.9.6
 
 #include <atomic>
 #include <memory>
@@ -890,6 +892,16 @@ private:
 	CClipGuard m_ClipGuard;
 	// 2.43.0: Upscaler = FSRCNNX: neural 2x luma doubler on the shader scaling path
 	CNeuralUpscale m_NeuralUps;
+	CRavuZoom m_Ravu;                    // 0.9.6: RAVU-Zoom-AR, upscales that are not about 2x
+	CSsimDown m_SsimD;                   // 0.9.6: SSimDownscaler
+	bool m_bSsimBusy = false;            // drawing the downscale SSimDownscaler then corrects
+	CComPtr<ID3D11PixelShader> m_pShaderSsimBaseX, m_pShaderSsimBaseY;   // its base downscale: Catmull-Rom
+	CComPtr<ID3D11PixelShader> m_pShaderLensLwX, m_pShaderLensLwY;       // lens Lightweight: Lanczos3
+	bool m_lensSsim = false;             // the lens's neural 2x is being brought down to size
+	int m_iRavuBanner = 0, m_iSsimdBanner = 0;   // 1 used, 2 loading, 3 failed
+	std::vector<std::wstring> m_scaleSteps;   // the scaling path of the last frame, for the banner
+	int m_scaleW1 = 0, m_scaleH1 = 0, m_scaleW2 = 0, m_scaleH2 = 0;
+	std::wstring ScalerName(ID3D11PixelShader* ps);
 	uint32_t m_DitherSeed = 12345u;      // 2.45.0: temporal dither offsets
 	// 2.43.2: Output gamut BT.2020 with a BT.709 (SDR) picture: convert its colour
 	// to BT.2020 as the last step before dither (the projector stays in BT.2020).
@@ -920,12 +932,19 @@ private:
 	Tex2D_t m_dL0, m_dT0, m_dG1, m_dL1, m_dT1, m_dG2, m_dL2, m_dT2, m_dG3, m_dE, m_dTE, m_dEB, m_dOut;
 	bool m_bDepthReady = false;
 	HRESULT InitDepth();
+	// 2.107.0: Detail and Grain for low-bitrate films, see Bitrate.h
+	CComPtr<ID3D11PixelShader> m_pPSBitrate;
+	CComPtr<ID3D11Buffer> m_pCBBitrate;
+	Tex2D_t m_bOut;
+	UINT m_bitrateSeed = 0;
+	bool BitrateActive() const { return m_pPSBitrate && (m_view.detail > 0 || m_view.grain > 0); }
+	HRESULT DrawBitrate(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect);
 	void ReleaseDepth();
 	bool DepthActive() const;   // any of the three above 0 and not switched off for comparing
 	HRESULT DrawDepth(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect, bool bypass);
 	// 2.105.0: anamorphic lens and 12-point screen geometry, set by ClipGuard Media Player
 	// through the shared block Local\ClipGuard_view_v1 (see ReadView).
-	struct ViewShared { int32_t magic, seq, lens100, screen100, aspect1000, geoOn, geoEdit, pt[24]; };
+	struct ViewShared { int32_t magic, seq, lens100, screen100, aspect1000, geoOn, geoEdit, pt[24], detail, grain, cbState, cbKbps, cbMode, lensUp, chromaCg, ravu, ssimDown; };   // 2.115.0: lensUp 0 Standard, 1 Neural 2x first, 2 Lightweight   // 2.114.0: ravu 1 RAVU-Zoom-AR for upscales, ssimDown 1 SSimDownscaler for downscales   // 2.111.0: chromaCg 0 Unplugged's choice, 1 JointBilateral, 2 CfL   // 2.109.0: ClipBit state (0 off, 1 on, 2 on for this film), bitrate, setting   // 2.107.0: detail, grain 0-100
 	HANDLE m_hViewMap = nullptr;
 	const volatile ViewShared* m_pView = nullptr;
 	ULONGLONG m_viewRetry = 0;
@@ -942,6 +961,33 @@ private:
 	int m_anaFilm = -1;       // 2.105.2: the film the scope check belongs to (the player's count)
 	int m_anaVotes = 0;       // bright frames with a scope letterbox
 	bool m_anaScope = false;  // decided: scope (kept for the rest of the film)
+	float m_anaWide = 0.0f;   // 2.116.0: decided: a film between 1.87 and 2.2 in a wider-letterboxed frame, its aspect
+	bool m_anaStretch = false;   // 2.110.0: the lens is filling the height with a scope film now
+	int m_lensNN = 0;            // lens upscale: 0 not used, 1 FSRCNNX, 3 not ready / failed
+	Tex2D_t m_lensCrop;          // 2.110.0: the picture without its letterbox, for the neural 2x
+	// 2.111.0: JointBilateral / CfL chroma upsampling (ChromaGuided.h), run before the converter
+	CComPtr<ID3D11PixelShader> m_pPSCg[5];   // LR1, LR2, JB, CfL, smoothing
+	int m_cgKey = -1;                        // planar | swap UV << 1, the shaders were built for
+	Tex2D_t m_cgLR1, m_cgLR2, m_cgUp, m_cgOut;
+	ID3D11ShaderResourceView* m_cgResult = nullptr;   // the finished chroma for t4, this frame
+	bool m_cgFailed = false;   // the passes failed: fell back to Catmull-Rom (banner)
+	// 2.112.0: load on the banner: GPU % (NVIDIA driver), CPU % (whole PC), and the GPU time
+	// each frame takes (D3D11 timestamps around the drawing, read a few frames later)
+	struct LoadQ { CComPtr<ID3D11Query> dis, t0, t1; bool used = false; };
+	LoadQ m_loadQ[4];
+	int m_loadQi = 0;
+	int m_loadGpu = -1, m_loadCpu = -1;
+	float m_loadMs = -1.0f, m_loadMsAcc = 0.0f; int m_loadMsN = 0;
+	uint64_t m_loadTick = 0, m_cpuIdle = 0, m_cpuTotal = 0;
+	// 2.113.0: Lens upscale switches itself off for a film that keeps skipping frames with it
+	bool m_lensNNOff = false; int m_lensBad = 0; unsigned m_dropLast = 0; int m_lensFilm = -1;
+	void LoadBegin();
+	void LoadEnd();
+	void LoadSample();
+	float FrameLimitMs();
+	int m_iChromaUnplugged = -1;   // Unplugged's own choice, kept while ClipGuard overrides it
+	HRESULT ChromaGuidedPass();
+	void ReleaseChromaGuided();
 	float m_anaMeasured = 0.0f;   // 2.106.0: the film's aspect as measured from its letterbox (average of the scope votes)
 	void ReadView();
 	void ApplyAnamorphic();

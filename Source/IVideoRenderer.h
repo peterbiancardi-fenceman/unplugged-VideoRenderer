@@ -49,6 +49,8 @@ enum :int {
 	CHROMA_Bilinear,
 	CHROMA_CatmullRom,
 	CHROMA_Krig, // Shiandow KrigBilateral (DX11 only; DX9 falls back to Catmull-Rom)
+	CHROMA_JointBilateral, // 2.111.0: Artoriuz JointBilateral (DX11, shader path, 4:2:0 / 4:2:2)
+	CHROMA_CfL,            // 2.111.0: Artoriuz Chroma from Luma prediction, full version
 	CHROMA_COUNT
 };
 

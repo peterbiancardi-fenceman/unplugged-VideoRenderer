@@ -13,6 +13,7 @@
 #define IDI_MPCVR_TRAY                  106
 #define IDF_DITHER_32X32_FLOAT16        401
 #define IDF_SKIN_LUT                    402
+#define IDF_RAVU_LUT                    403   // 2.114.0: RAVU-Zoom-AR r3 lookup tables (rgba16f)
 #define IDF_HLSL_ST2084                 501
 #define IDF_HLSL_HLG                    502
 #define IDF_HLSL_HDR_TONE_MAPPING       503

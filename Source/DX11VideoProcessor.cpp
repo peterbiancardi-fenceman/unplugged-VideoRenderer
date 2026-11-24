@@ -34,6 +34,8 @@
 #include "../Include/ID3DVideoMemoryConfiguration.h"
 #include "Shaders.h"
 #include "Depth.h"
+#include "Bitrate.h"   // 2.107.0
+#include "ChromaGuided.h"   // 2.111.0
 #include "Utils/CPUInfo.h"
 
 #include <dxgi1_6.h>
@@ -842,7 +844,14 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_ClipGuard.ReleaseDevice();
 	ReleaseDepth();   // 2.93.0
 	ReleaseGeometry();   // 2.105.0
+	m_lensCrop.Release();   // 0.9.6
+	ReleaseChromaGuided();
+	for (auto& q : m_loadQ) { q.dis.Release(); q.t0.Release(); q.t1.Release(); q.used = false; }
 	m_NeuralUps.ReleaseDevice();
+	m_Ravu.ReleaseDevice();
+	m_pShaderSsimBaseX.Release(); m_pShaderSsimBaseY.Release();
+	m_pShaderLensLwX.Release(); m_pShaderLensLwY.Release();
+	m_SsimD.ReleaseDevice();
 	m_pPSGamut2020.Release();
 	for (auto& t : m_ClipGuardDelay) t.Release();
 	m_ClipGuardDelayN = 0;
@@ -7713,6 +7722,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 	}
 
 	uint64_t tick1 = GetPreciseTick();
+	LoadBegin();   // 2.112.0
 
 	if (!m_windowRect.IsRectEmpty()) {
 		// fill the BackBuffer with black
@@ -7900,6 +7910,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 	DrawGeometry(pBackBuffer);   // 2.105.0: the screen's 12-point geometry, last (everything on it is fitted)
 
+	LoadEnd();   // 2.112.0
 	uint64_t tick3 = GetPreciseTick();
 	m_RenderStats.paintticks = tick3 - tick1;
 
@@ -8180,8 +8191,96 @@ HRESULT CDX11VideoProcessor::D3D11VPPass(ID3D11Texture2D* pRenderTarget, const C
 	return hr;
 }
 
+// 2.111.0: JointBilateral / CfL chroma upsampling. The chroma is upscaled to the luma's size
+// here, guided by the luma; the converter (Shaders.cpp, texCG at t4) then reads it 1:1.
+void CDX11VideoProcessor::ReleaseChromaGuided()
+{
+	for (auto& p : m_pPSCg) p.Release();
+	m_cgKey = -1;
+	m_cgLR1.Release(); m_cgLR2.Release(); m_cgUp.Release(); m_cgOut.Release();
+	m_cgResult = nullptr;
+}
+
+HRESULT CDX11VideoProcessor::ChromaGuidedPass()
+{
+	m_cgResult = nullptr;
+	const int cs = m_iChromaScaling;
+	const int sub = m_srcParams.Subsampling;
+	if ((cs != CHROMA_JointBilateral && cs != CHROMA_CfL) || (sub != 420 && sub != 422) || !m_srcParams.pDX11Planes) return S_FALSE;
+	const bool planar = m_srcParams.pDX11Planes->FmtPlane3 != DXGI_FORMAT_UNKNOWN;
+	if (!planar && m_srcParams.pDX11Planes->FmtPlane2 == DXGI_FORMAT_UNKNOWN) return S_FALSE;
+	const bool swap = planar && (m_srcParams.cformat == CF_YV12 || m_srcParams.cformat == CF_YV16 || m_srcParams.cformat == CF_YV24);
+	const int key = (planar ? 1 : 0) | (swap ? 2 : 0);
+	if (key != m_cgKey || !m_pPSCg[0]) {
+		for (auto& p : m_pPSCg) p.Release();
+		m_cgKey = key;
+		const D3D_SHADER_MACRO defs[] = { { "CG_PLANAR", planar ? "1" : "0" }, { "CG_SWAPUV", swap ? "1" : "0" }, { nullptr, nullptr } };
+		const char* srcs[5] = { kCgLR1, kCgLR2, kCgJB, kCgCfL, kCgSmooth };
+		for (int i = 0; i < 5; i++) {
+			CComPtr<ID3DBlob> b;
+			if (FAILED(CompileShader(std::string(kCgCommon) + srcs[i], defs, "ps_4_0", &b)) || !b
+				|| FAILED(m_pDevice->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &m_pPSCg[i]))) {
+				DLog(L"ChromaGuidedPass(): shader {} failed", i);
+				for (auto& p : m_pPSCg) p.Release();
+				return E_FAIL;
+			}
+		}
+	}
+	const UINT lw = m_TexSrcVideo.desc.Width, lh = m_TexSrcVideo.desc.Height;
+	const UINT cw = (lw + 1) / 2, ch = sub == 420 ? (lh + 1) / 2 : lh;
+	if (FAILED(m_cgLR1.CheckCreate(m_pDevice, DXGI_FORMAT_R16_FLOAT, cw, lh, Tex2D_DefaultShaderRTarget))
+		|| FAILED(m_cgLR2.CheckCreate(m_pDevice, DXGI_FORMAT_R16_FLOAT, cw, ch, Tex2D_DefaultShaderRTarget))
+		|| FAILED(m_cgUp.CheckCreate(m_pDevice, DXGI_FORMAT_R16G16_FLOAT, lw, lh, Tex2D_DefaultShaderRTarget))
+		|| (cs == CHROMA_CfL && FAILED(m_cgOut.CheckCreate(m_pDevice, DXGI_FORMAT_R16G16_FLOAT, lw, lh, Tex2D_DefaultShaderRTarget)))) {
+		return E_FAIL;
+	}
+	ID3D11ShaderResourceView* planes[3] = { m_TexSrcVideo.pShaderResource, m_TexSrcVideo.pShaderResource2, m_TexSrcVideo.pShaderResource3 };
+	const UINT Stride = sizeof(VERTEX), Offset = 0;
+	auto run = [&](ID3D11PixelShader* ps, Tex2D_t& rt, ID3D11ShaderResourceView* in) -> HRESULT {
+		CComPtr<ID3D11RenderTargetView> rtv;
+		HRESULT hr = m_pDevice->CreateRenderTargetView(rt.pTexture, nullptr, &rtv);
+		if (FAILED(hr)) return hr;
+		D3D11_VIEWPORT vp = { 0.0f, 0.0f, (FLOAT)rt.desc.Width, (FLOAT)rt.desc.Height, 0.0f, 1.0f };
+		ID3D11ShaderResourceView* none[4] = {};
+		m_pDeviceContext->PSSetShaderResources(0, 4, none);
+		m_pDeviceContext->IASetInputLayout(m_pVSimpleInputLayout);
+		m_pDeviceContext->OMSetRenderTargets(1, &rtv.p, nullptr);
+		m_pDeviceContext->RSSetViewports(1, &vp);
+		m_pDeviceContext->OMSetBlendState(nullptr, nullptr, D3D11_DEFAULT_SAMPLE_MASK);
+		m_pDeviceContext->VSSetShader(m_pVS_Simple, nullptr, 0);
+		m_pDeviceContext->PSSetShader(ps, nullptr, 0);
+		m_pDeviceContext->PSSetShaderResources(0, 3, planes);
+		m_pDeviceContext->PSSetShaderResources(3, 1, &in);
+		m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		m_pDeviceContext->IASetVertexBuffers(0, 1, &m_PSConvColorData.pVertexBuffer, &Stride, &Offset);
+		m_pDeviceContext->Draw(4, 0);
+		m_pDeviceContext->PSSetShaderResources(0, 4, none);
+		m_pDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+		return S_OK;
+	};
+	HRESULT hr = run(m_pPSCg[0], m_cgLR1, nullptr);
+	if (SUCCEEDED(hr)) hr = run(m_pPSCg[1], m_cgLR2, m_cgLR1.pShaderResource);
+	if (cs == CHROMA_JointBilateral) {
+		if (SUCCEEDED(hr)) hr = run(m_pPSCg[2], m_cgUp, m_cgLR2.pShaderResource);
+		if (SUCCEEDED(hr)) m_cgResult = m_cgUp.pShaderResource;
+	} else {
+		if (SUCCEEDED(hr)) hr = run(m_pPSCg[3], m_cgUp, m_cgLR2.pShaderResource);
+		if (SUCCEEDED(hr)) hr = run(m_pPSCg[4], m_cgOut, m_cgUp.pShaderResource);
+		if (SUCCEEDED(hr)) m_cgResult = m_cgOut.pShaderResource;
+	}
+	return hr;
+}
+
 HRESULT CDX11VideoProcessor::ConvertColorPass(ID3D11Texture2D* pRenderTarget)
 {
+	// 2.111.0: JointBilateral / CfL chroma first (no-op otherwise). If its passes fail, fall
+	// back to Catmull-Rom (the converter was built to read their result, so it is rebuilt).
+	if (FAILED(ChromaGuidedPass())) {
+		m_cgFailed = true;
+		m_iChromaScaling = CHROMA_CatmullRom;
+		UpdateConvertColorShader();
+	}
+
 	CComPtr<ID3D11RenderTargetView> pRenderTargetView;
 
 	HRESULT hr = m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRenderTargetView);
@@ -8215,6 +8314,7 @@ HRESULT CDX11VideoProcessor::ConvertColorPass(ID3D11Texture2D* pRenderTarget)
 	m_pDeviceContext->PSSetShaderResources(0, 1, &m_TexSrcVideo.pShaderResource.p);
 	m_pDeviceContext->PSSetShaderResources(1, 1, &m_TexSrcVideo.pShaderResource2.p);
 	m_pDeviceContext->PSSetShaderResources(2, 1, &m_TexSrcVideo.pShaderResource3.p);
+	if (m_cgResult) m_pDeviceContext->PSSetShaderResources(4, 1, &m_cgResult);   // 2.111.0
 	m_pDeviceContext->PSSetSamplers(0, 1, &m_pSamplerPoint.p);
 	m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerLinear.p);
 	m_pDeviceContext->PSSetConstantBuffers(0, 1, &m_PSConvColorData.pConstants);
@@ -8231,6 +8331,7 @@ HRESULT CDX11VideoProcessor::ConvertColorPass(ID3D11Texture2D* pRenderTarget)
 
 	ID3D11ShaderResourceView* views[3] = {};
 	m_pDeviceContext->PSSetShaderResources(0, 3, views);
+	if (m_cgResult) m_pDeviceContext->PSSetShaderResources(4, 1, views);
 
 	return hr;
 }
@@ -8260,14 +8361,60 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 		resizerY = (h1 == h2) ? nullptr : (h1 > h2) ? m_pShaderDownscaleY.p : m_pShaderUpscaleY.p;
 	}
 
+	if (!m_bNeuralBusy && !m_bSsimBusy) {   // 0.9.6
+		m_iRavuBanner = 0; m_iSsimdBanner = 0;
+		m_scaleSteps.clear(); m_scaleW1 = w1; m_scaleH1 = h1; m_scaleW2 = w2; m_scaleH2 = h2;
+	}
+	// 0.9.6: lens Lightweight: the lens stretch is always Lanczos3 (whatever the Upscaling setting)
+	if (rotation == 0 && m_view.magic == 0x56574543 && m_view.lensUp == 2 && m_view.lens100 > 101 && m_anaStretch && !m_bSsimBusy) {
+		if (!m_pShaderLensLwX) {
+			CreatePShaderFromResource(&m_pShaderLensLwX, s_Upscaling11ResIDs[UPSCALE_Lanczos3].shaderX);
+			CreatePShaderFromResource(&m_pShaderLensLwY, s_Upscaling11ResIDs[UPSCALE_Lanczos3].shaderY);
+		}
+		if (m_pShaderLensLwX && m_pShaderLensLwY) {
+			if (resizerX == m_pShaderUpscaleX.p) resizerX = m_pShaderLensLwX.p;
+			if (resizerY == m_pShaderUpscaleY.p) resizerY = m_pShaderLensLwY.p;
+		}
+	}
+	// 0.9.6: SSimDownscaler's base downscale is Catmull-Rom (its own L2 kernel)
+	if (m_bSsimBusy && rotation == 0) {
+		if (!m_pShaderSsimBaseX) {
+			CreatePShaderFromResource(&m_pShaderSsimBaseX, s_Downscaling11ResIDs[DOWNSCALE_Bicubic].shaderX);
+			CreatePShaderFromResource(&m_pShaderSsimBaseY, s_Downscaling11ResIDs[DOWNSCALE_Bicubic].shaderY);
+		}
+		if (m_pShaderSsimBaseX && m_pShaderSsimBaseY) {
+			if (resizerX == m_pShaderDownscaleX.p) resizerX = m_pShaderSsimBaseX.p;
+			if (resizerY == m_pShaderDownscaleY.p) resizerY = m_pShaderSsimBaseY.p;
+		}
+	}
+
 	// 2.43.0: Upscaler = FSRCNNX. At about 2x (1080p on a 4K screen) the
 	// neural network doubles the luma first; the 2x picture then goes through
 	// this function again to the exact size (downscaler for the last few %).
+	// 0.9.6: Lens upscale = Neural 2x first: the lens's scope stretch (taller only, any size,
+	// 4K included) goes through FSRCNNX at 2x on the picture only (the letterbox cut off
+	// first), then down to the exact size by SSimDownscaler.
 	{
-		const bool want = !m_bNeuralBusy && rotation == 0 && !m_bFlip && m_ClipGuard.Upscaler() == 1
+		const bool lensNN = !m_bNeuralBusy && !m_lensNNOff && m_view.magic == 0x56574543 && m_view.lensUp == 1 && m_view.lens100 > 101
+			&& m_anaStretch && rotation == 0 && !m_bFlip && w1 > 0 && h1 > 0 && h2 > h1 * 21 / 20;
+		if (!m_bNeuralBusy) m_lensNN = 0;
+		const bool want = !m_bNeuralBusy && rotation == 0 && !m_bFlip && (lensNN || m_ClipGuard.Upscaler() == 1)
 			&& w1 > 0 && h1 > 0
-			&& w2 >= w1 * 16 / 10 && w2 <= w1 * 24 / 10 && h2 >= h1 * 16 / 10 && h2 <= h1 * 24 / 10;
+			&& (lensNN || (w2 >= w1 * 16 / 10 && w2 <= w1 * 24 / 10 && h2 >= h1 * 16 / 10 && h2 <= h1 * 24 / 10));
 		if (!m_bNeuralBusy) m_iNeuralBanner = 0;
+		const Tex2D_t* pNNIn = &Tex;
+		CRect nnSrc = srcRect;
+		if (want && lensNN) {
+			m_lensNN = 3;   // until it runs
+			const CRect cr = srcRect & CRect(0, 0, (int)Tex.desc.Width, (int)Tex.desc.Height);
+			if (cr.Width() > 8 && cr.Height() > 8
+				&& SUCCEEDED(m_lensCrop.CheckCreate(m_pDevice, Tex.desc.Format, cr.Width(), cr.Height(), Tex2D_DefaultShaderRTarget))) {
+				const D3D11_BOX box = { (UINT)cr.left, (UINT)cr.top, 0, (UINT)cr.right, (UINT)cr.bottom, 1 };
+				m_pDeviceContext->CopySubresourceRegion(m_lensCrop.pTexture, 0, 0, 0, 0, Tex.pTexture, 0, &box);
+				pNNIn = &m_lensCrop;
+				nnSrc = CRect(srcRect.left - cr.left, srcRect.top - cr.top, srcRect.right - cr.left, srcRect.bottom - cr.top);
+			}
+		}
 		if (want) {
 			m_NeuralUps.Request();
 			if (m_NeuralUps.Ready(m_pDevice)) {
@@ -8288,17 +8435,21 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 					ID3D11ShaderResourceView* none[5] = {};
 					m_pDeviceContext->PSSetShaderResources(0, 5, none);
 				};
-				hr = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, Tex.desc.Width, Tex.desc.Height,
-					CRect(0, 0, Tex.desc.Width, Tex.desc.Height), 0, false);
+				hr = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, pNNIn->desc.Width, pNNIn->desc.Height,
+					CRect(0, 0, pNNIn->desc.Width, pNNIn->desc.Height), 0, false);
 				if (SUCCEEDED(hr)) {
-					hr = m_NeuralUps.Run(m_pDevice, m_pDeviceContext, Tex.pShaderResource, Tex.desc.Width, Tex.desc.Height, draw);
+					hr = m_NeuralUps.Run(m_pDevice, m_pDeviceContext, pNNIn->pShaderResource, pNNIn->desc.Width, pNNIn->desc.Height, draw);
 				}
 				if (SUCCEEDED(hr)) {
 					m_bNeuralBusy = true;
-					const CRect src2(srcRect.left * 2, srcRect.top * 2, srcRect.right * 2, srcRect.bottom * 2);
+					m_scaleSteps.push_back(lensNN ? L"Picture only, FSRCNNX 2x" : L"FSRCNNX 2x");   // 2.115.0
+					m_lensSsim = lensNN;   // 2.114.0: the lens's 2x comes down to size by SSimDownscaler
+					const CRect src2(nnSrc.left * 2, nnSrc.top * 2, nnSrc.right * 2, nnSrc.bottom * 2);
 					hr = ResizeShaderPass(m_NeuralUps.Out(), pRenderTarget, src2, dstRect, 0);
+					m_lensSsim = false;
 					m_bNeuralBusy = false;
 					m_iNeuralBanner = 1;
+					if (lensNN) m_lensNN = 1;
 					return hr;
 				}
 				hr = S_OK;
@@ -8318,7 +8469,81 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 	if ((w1 != w2 || h1 != h2) && abs(w1 - w2) <= 16 && abs(h1 - h2) <= 16) {
 		TextureCopyRect(Tex, pRenderTarget, srcRect, dstRect, m_pPS_Simple, nullptr,
 			rotation, m_bFlip, m_pSamplerLinear.p);
+		m_scaleSteps.push_back(L"Bilinear (near 1:1)");   // 2.115.0
 		return S_OK;
+	}
+
+	// 2.114.0: RAVU-Zoom-AR (bjin/mpv-prescalers, LGPL-3.0) for upscales the neural network
+	// did not take (any ratio; the lens's taller-only stretch included), and SSimDownscaler
+	// (igv, LGPL-3.0) for downscales: the setting, or the lens's neural 2x coming down to size.
+	if (rotation == 0 && !m_bFlip && w1 > 0 && h1 > 0 && w2 > 0 && h2 > 0) {
+		auto drawPass = [&](ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp, ID3D11PixelShader* ps,
+			ID3D11ShaderResourceView* const* srvs, UINT nSrv, ID3D11Buffer* cb, ID3D11SamplerState* samp) {
+			const UINT stride = sizeof(VERTEX), offset = 0;
+			m_pDeviceContext->IASetInputLayout(m_pVSimpleInputLayout);
+			m_pDeviceContext->OMSetRenderTargets(1, &rtv, nullptr);
+			m_pDeviceContext->RSSetViewports(1, &vp);
+			m_pDeviceContext->OMSetBlendState(nullptr, nullptr, D3D11_DEFAULT_SAMPLE_MASK);
+			m_pDeviceContext->VSSetShader(m_pVS_Simple, nullptr, 0);
+			m_pDeviceContext->PSSetShader(ps, nullptr, 0);
+			m_pDeviceContext->PSSetShaderResources(0, nSrv, srvs);
+			ID3D11SamplerState* sm = samp ? samp : m_pSamplerLinear.p;
+			m_pDeviceContext->PSSetSamplers(0, 1, &sm);
+			m_pDeviceContext->PSSetConstantBuffers(0, 1, &cb);
+			m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			m_pDeviceContext->IASetVertexBuffers(0, 1, &m_pVertexBuffer.p, &stride, &offset);
+			m_pDeviceContext->Draw(4, 0);
+			ID3D11ShaderResourceView* none[4] = {};
+			m_pDeviceContext->PSSetShaderResources(0, 4, none);
+			m_pDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+		};
+		const bool viewOk = m_view.magic == 0x56574543;
+		const bool ravuOn = viewOk && m_view.ravu != 0 && !(m_view.lensUp == 2 && m_anaStretch);   // 2.115.0: lens Lightweight: Lanczos3
+		const bool ssimOn = m_lensSsim || (viewOk && m_view.ssimDown != 0);
+		if (!m_bSsimBusy && ravuOn && w2 >= w1 && h2 >= h1 && (w2 > w1 || h2 > h1)) {
+			m_Ravu.Request();
+			if (m_Ravu.Ready(m_pDevice)) {
+				CComPtr<ID3D11RenderTargetView> rtv;
+				HRESULT hr2 = m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &rtv);
+				if (SUCCEEDED(hr2)) hr2 = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, Tex.desc.Width, Tex.desc.Height,
+					CRect(0, 0, Tex.desc.Width, Tex.desc.Height), 0, false);
+				if (SUCCEEDED(hr2)) hr2 = m_Ravu.Run(m_pDeviceContext, Tex.pShaderResource, srcRect, rtv, dstRect, drawPass);
+				if (SUCCEEDED(hr2)) { m_iRavuBanner = 1; m_scaleSteps.push_back(L"RAVU-Zoom-AR"); return hr2; }
+			}
+			m_iRavuBanner = (m_Ravu.GetState() == CRavuZoom::kFailed) ? 3 : 2;
+		}
+		else if (!m_bSsimBusy && ssimOn && w2 <= w1 && h2 <= h1 && (w2 < w1 || h2 < h1)) {
+			m_SsimD.Request();
+			if (m_SsimD.Ready(m_pDevice) && SUCCEEDED(m_SsimD.CheckTextures(m_pDevice, w1, h1, w2, h2))) {
+				CComPtr<ID3D11RenderTargetView> rtv;
+				HRESULT hr2 = m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &rtv);
+				const size_t nSteps = m_scaleSteps.size();
+				if (SUCCEEDED(hr2)) {
+					m_bSsimBusy = true;
+					hr2 = ResizeShaderPass(Tex, m_SsimD.Hooked(), srcRect, CRect(0, 0, w2, h2), 0);
+					m_bSsimBusy = false;
+				}
+				m_scaleSteps.resize(nSteps);   // 2.115.0: its Catmull-Rom base is part of it
+				if (SUCCEEDED(hr2)) hr2 = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, Tex.desc.Width, Tex.desc.Height,
+					CRect(0, 0, Tex.desc.Width, Tex.desc.Height), 0, false);
+				if (SUCCEEDED(hr2)) {
+					auto draw = [&](ID3D11RenderTargetView* r, const D3D11_VIEWPORT& vp, ID3D11PixelShader* ps,
+						ID3D11ShaderResourceView* const* srvs, UINT nSrv, ID3D11Buffer* cb) { drawPass(r, vp, ps, srvs, nSrv, cb, nullptr); };
+					hr2 = m_SsimD.Run(m_pDeviceContext, Tex.pShaderResource, srcRect, rtv, dstRect, draw);
+				}
+				if (SUCCEEDED(hr2)) { m_iSsimdBanner = 1; m_scaleSteps.push_back(L"SSimDownscaler"); return hr2; }
+			}
+			m_iSsimdBanner = (m_SsimD.GetState() == CSsimDown::kFailed) ? 3 : 2;
+		}
+	}
+
+	// 2.115.0: the kernel(s), for the banner
+	{
+		const std::wstring nx = resizerX ? ScalerName(resizerX) : std::wstring();
+		const std::wstring ny = resizerY ? ScalerName(resizerY) : std::wstring();
+		if (nx.empty() && ny.empty()) m_scaleSteps.push_back(L"none (1:1)");
+		else if (nx.empty() || ny.empty() || nx == ny) m_scaleSteps.push_back(nx.empty() ? ny : nx);
+		else m_scaleSteps.push_back(nx + L" across, " + ny + L" down");
 	}
 
 	if (resizerX && resizerY) {
@@ -8379,6 +8604,16 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 	DLogIf(FAILED(hr), L"CDX11VideoProcessor::ResizeShaderPass() : failed with error {}", HR2Str(hr));
 
 	return hr;
+}
+
+// 2.115.0: a kernel shader's name, for the banner's scaling path
+std::wstring CDX11VideoProcessor::ScalerName(ID3D11PixelShader* ps)
+{
+	if (ps == m_pShaderSsimBaseX.p || ps == m_pShaderSsimBaseY.p) return L"Catmull-Rom";
+	if (ps == m_pShaderLensLwX.p || ps == m_pShaderLensLwY.p) return L"Lanczos3";
+	if (ps == m_pShaderUpscaleX.p || ps == m_pShaderUpscaleY.p) return s_Upscaling11ResIDs[m_iUpscaling].description;
+	if (ps == m_pShaderDownscaleX.p || ps == m_pShaderDownscaleY.p) return s_Downscaling11ResIDs[m_iDownscaling].description;
+	return L"?";
 }
 
 HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect)
@@ -8636,6 +8871,26 @@ void CDX11VideoProcessor::ReadView()
 	memcpy(&v, (const void*)m_pView, sizeof(v));
 	if (v.magic != 0x56574543) v = {};
 	m_view = v;
+	m_ClipGuard.SetBitrateHelp(v.detail, v.grain, v.cbState, v.cbKbps, v.cbMode);   // 2.108.0 / 2.109.0: for the log
+	if (v.geoEdit != m_lensFilm) { m_lensFilm = v.geoEdit; m_lensNNOff = false; m_lensBad = 0; }   // 2.113.0: a new film (the film counter)
+	// 2.111.0: the player's JointBilateral / CfL choice overrides Unplugged's chroma setting
+	{
+		const int want = v.chromaCg == 1 ? CHROMA_JointBilateral : (v.chromaCg == 2 ? CHROMA_CfL : -1);
+		const bool guidedNow = m_iChromaScaling == CHROMA_JointBilateral || m_iChromaScaling == CHROMA_CfL;
+		int next = m_iChromaScaling;
+		if (want >= 0 && !m_cgFailed) {
+			if (!guidedNow) m_iChromaUnplugged = m_iChromaScaling;
+			next = want;
+		}
+		else if (want < 0 && (guidedNow || m_cgFailed)) {
+			next = m_iChromaUnplugged >= 0 ? m_iChromaUnplugged : CHROMA_Krig;
+		}
+		if (want < 0) m_cgFailed = false;
+		if (next != m_iChromaScaling) {
+			m_iChromaScaling = next;
+			if (m_PSConvColorData.bEnable && (m_srcParams.Subsampling == 420 || m_srcParams.Subsampling == 422)) UpdateConvertColorShader();
+		}
+	}
 }
 
 // With a lens, two cases only, decided by the player once per film (no switching while it
@@ -8650,30 +8905,46 @@ void CDX11VideoProcessor::ApplyAnamorphic()
 	CRect sr = m_srcRect;
 	const int W = m_windowRect.Width(), H = m_windowRect.Height();
 	const float f = (float)m_view.lens100 / 100.0f;
+	m_anaStretch = false;   // 2.110.0
 	if (f > 1.01f && W > 0 && H > 0 && vr.Width() > 0 && vr.Height() > 0 && sr.Width() > 0 && sr.Height() > 0) {
 		const float S = m_view.screen100 > 0 ? (float)m_view.screen100 / 100.0f : 2.40f;
 		const float As = (float)vr.Width() / (float)vr.Height();   // the frame's shape as shown
 		// 2.105.2: Auto reads the film's shape from the picture. A new film starts as not scope;
 		// once 4 s of bright frames show a scope letterbox (the picture 68-80% of the height,
 		// bars the same top and bottom), it becomes scope for the rest of the film. Never back.
-		if (m_view.geoEdit != m_anaFilm) { m_anaFilm = m_view.geoEdit; m_anaVotes = 0; m_anaScope = false; m_anaMeasured = 0.0f; }
-		if (m_view.aspect1000 == 0 && !m_anaScope) {
+		if (m_view.geoEdit != m_anaFilm) { m_anaFilm = m_view.geoEdit; m_anaVotes = 0; m_anaScope = false; m_anaWide = 0.0f; m_anaMeasured = 0.0f; }
+		// 2.116.0: any letterbox from about 1.87 up is measured (the picture 60-95% of the
+		// height); after 4 s of agreeing frames the film is scope (2.2 or wider) or "wide" (its
+		// own shape, e.g. 2.00 or 2.10, at full height with the bars cut off). Never back.
+		if (m_view.aspect1000 == 0 && !m_anaScope && m_anaWide <= 0.0f) {
 			int cy0, cy1, rows; float pic;
 			if (m_ClipGuard.ContentRows(cy0, cy1, rows, pic) && rows > 0 && pic >= 0.3f && m_ClipGuard.TextPct() < 20.0f) {   // 2.106.0: not credits or text
 				const float frac = (float)(cy1 - cy0 + 1) / (float)rows;
 				const int top = cy0, bot = rows - 1 - cy1;
-				const bool letterbox = As < 2.0f && frac >= 0.68f && frac <= 0.80f && std::abs(top - bot) <= std::max(2, rows / 36);
+				const bool letterbox = As < 2.0f && frac >= 0.60f && frac <= 0.95f && std::abs(top - bot) <= std::max(2, rows / 36);
 				if (letterbox) {
+					const float fa = As / frac;
+					// a different shape from the one being averaged starts the count again
+					if (m_anaVotes > 8 && std::abs(fa / m_anaMeasured - 1.0f) > 0.06f) { m_anaVotes = 0; m_anaMeasured = 0.0f; }
 					++m_anaVotes;
-					m_anaMeasured += ((As / frac) - m_anaMeasured) / (float)std::min(m_anaVotes, 96);   // the film's aspect, averaged
-					if (m_anaVotes >= 96) m_anaScope = true;
+					m_anaMeasured += (fa - m_anaMeasured) / (float)std::min(m_anaVotes, 96);   // the film's aspect, averaged
+					if (m_anaVotes >= 96) {
+						static const float usual[] = { 1.85f, 1.90f, 2.00f, 2.10f, 2.20f, 2.35f, 2.39f, 2.40f, 2.55f, 2.76f };
+						float best = m_anaMeasured, bd = 0.02f;
+						for (const float u : usual) { const float d = std::abs(m_anaMeasured / u - 1.0f); if (d < bd) { bd = d; best = u; } }
+						m_anaMeasured = best;
+						if (best >= 2.2f) m_anaScope = true;
+						else if (best > As * 1.03f) m_anaWide = best;
+						else m_anaVotes = 0;
+					}
 				}
-				else if (frac > 0.92f) m_anaVotes = std::max(0, m_anaVotes - 2);
+				else if (frac > 0.97f) m_anaVotes = std::max(0, m_anaVotes - 2);
 			}
 		}
-		const float a = std::clamp(m_view.aspect1000 > 0 ? (float)m_view.aspect1000 / 1000.0f : (m_anaScope ? 2.39f : As), 1.0f, 3.0f);
+		const float a = std::clamp(m_view.aspect1000 > 0 ? (float)m_view.aspect1000 / 1000.0f : (m_anaScope ? 2.39f : (m_anaWide > 0.0f ? m_anaWide : As)), 1.0f, 3.0f);
 		const bool scope = m_view.aspect1000 >= 0 && a >= 2.2f;
 		const float T = scope ? S : a;   // the shape shown, at the panel's full height
+		m_anaStretch = scope;   // 2.110.0
 		const int ph = H;
 		const int pw = std::max(1, std::min(W, (int)std::lround(T * H / f)));
 		const CRect nv(CPoint(m_windowRect.left + (W - pw) / 2, m_windowRect.top), CSize(pw, ph));
@@ -8823,6 +9094,9 @@ HRESULT CDX11VideoProcessor::InitDepth()
 	if (SUCCEEDED(hr)) hr = cb(16, &m_pCBDepthEnergy);
 	if (SUCCEEDED(hr)) hr = cb(80, &m_pCBDepthMain);
 	if (FAILED(hr)) { ReleaseDepth(); return hr; }
+	if (FAILED(ps(kBitrateHLSL, sizeof(kBitrateHLSL) - 1, &m_pPSBitrate)) || FAILED(cb(48, &m_pCBBitrate))) {
+		m_pPSBitrate.Release(); m_pCBBitrate.Release();   // 2.107.0: Depth still works without it
+	}
 	m_bDepthReady = true;
 	return S_OK;
 }
@@ -8832,6 +9106,7 @@ void CDX11VideoProcessor::ReleaseDepth()
 	m_bDepthReady = false;
 	m_pPSDepthLuma.Release(); m_pPSDepthBlur.Release(); m_pPSDepthEnergy.Release(); m_pPSDepthMain.Release();
 	m_pCBDepthLuma.Release(); m_pCBDepthBlur.Release(); m_pCBDepthEnergy.Release(); m_pCBDepthMain.Release();
+	m_pPSBitrate.Release(); m_pCBBitrate.Release(); m_bOut.Release();   // 2.107.0
 	for (Tex2D_t* t : { &m_dL0, &m_dT0, &m_dG1, &m_dL1, &m_dT1, &m_dG2, &m_dL2, &m_dT2, &m_dG3, &m_dE, &m_dTE, &m_dEB, &m_dOut }) t->Release();
 }
 
@@ -8839,6 +9114,20 @@ bool CDX11VideoProcessor::DepthActive() const
 {
 	if (!m_bDepthReady || m_ClipGuard.DepthView() == 1) return false;
 	return m_ClipGuard.DepthDetail() > 0 || m_ClipGuard.DepthEdges() > 0 || m_ClipGuard.DepthWide() > 0;
+}
+
+// 2.107.0: Detail and Grain for low-bitrate films (Bitrate.h)
+HRESULT CDX11VideoProcessor::DrawBitrate(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect)
+{
+	if (!pInput || !pRenderTarget || !m_pPSBitrate) return E_POINTER;
+	const bool src2020 = (m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) || m_Dovi.bValid;
+	const float det = std::clamp(m_view.detail, 0, 100) / 100.0f, grn = std::clamp(m_view.grain, 0, 100) / 100.0f;
+	const float cb[12] = {
+		det * 4.0f, grn * 0.02f, (float)(m_bitrateSeed++ % 997), 0.0012f,   // 2.108.0: twice the strength, a third of the cut-off
+		(float)rect.left, (float)rect.top, (float)(rect.right - 1), (float)(rect.bottom - 1),
+		src2020 ? 0.2627f : 0.2126f, src2020 ? 0.6780f : 0.7152f, src2020 ? 0.0593f : 0.0722f, 0.0f };
+	m_pDeviceContext->UpdateSubresource(m_pCBBitrate, 0, nullptr, cb, 0, 0);
+	return TextureCopyRect(*pInput, pRenderTarget, rect, rect, m_pPSBitrate, m_pCBBitrate, 0, false);
 }
 
 HRESULT CDX11VideoProcessor::DrawDepth(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect, bool bypass)
@@ -9599,6 +9888,14 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// 2.93.2: Depth on the frame about to be shown (after the look-ahead), so a change
 			// shows on the next redraw, paused too, and the look-ahead frames stay as they are.
 			// ClipGuard measured the frame before Depth (Depth never brightens near white).
+			// 2.107.0: Detail and Grain (low-bitrate films) first, so Depth works on the restored texture
+			if (!bBypass && BitrateActive() && pShow && pShow->pTexture && rect.Width() > 2 && rect.Height() > 2) {
+				const D3D11_TEXTURE2D_DESC& sd = pShow->desc;
+				if (SUCCEEDED(m_bOut.CheckCreate(m_pDevice, sd.Format, sd.Width, sd.Height, Tex2D_DefaultShaderRTarget))
+					&& SUCCEEDED(DrawBitrate(const_cast<Tex2D_t*>(pShow), m_bOut.pTexture, rect))) {
+					pShow = &m_bOut;
+				}
+			}
 			if (!bBypass && m_bDepthReady && DepthActive() && pShow && pShow->pTexture) {
 				const D3D11_TEXTURE2D_DESC& sd = pShow->desc;
 				if (SUCCEEDED(m_dOut.CheckCreate(m_pDevice, sd.Format, sd.Width, sd.Height, Tex2D_DefaultShaderRTarget))
@@ -10131,7 +10428,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.iChromaScaling != m_iChromaScaling) {
-		m_iChromaScaling = config.iChromaScaling;
+		m_iChromaScaling = config.iChromaScaling; m_iChromaUnplugged = config.iChromaScaling; m_cgFailed = false;   // 2.111.0 (ReadView re-applies an override)
 		changeConvertShader = m_PSConvColorData.bEnable && (m_srcParams.Subsampling == 420 || m_srcParams.Subsampling == 422);
 	}
 
@@ -11046,6 +11343,103 @@ void CDX11VideoProcessor::UpdateStatsPostProc()
 // not set off the projector's laser dimming. In Split screen and Side by side
 // a note sits above the picture. Drawn on the back buffer after the video, so
 // it is never measured by the fix.
+// ---- 2.112.0: load: GPU %, CPU %, GPU time per frame ----------------------------------------
+typedef void* (*NvQI_t)(unsigned int);
+static int NvGpuLoad()
+{
+	static bool tried = false; static void* gpu = nullptr;
+	typedef int (*NvInit_t)(); typedef int (*NvEnum_t)(void**, unsigned long*); typedef int (*NvPst_t)(void*, void*);
+	static NvPst_t pst = nullptr;
+	if (!tried) {
+		tried = true;
+		HMODULE h = LoadLibraryW(L"nvapi64.dll");
+		NvQI_t qi = h ? (NvQI_t)GetProcAddress(h, "nvapi_QueryInterface") : nullptr;
+		if (qi) {
+			NvInit_t init = (NvInit_t)qi(0x0150E828); NvEnum_t en = (NvEnum_t)qi(0xE5AC921F); pst = (NvPst_t)qi(0x60DED2ED);
+			void* gpus[64] = {}; unsigned long n = 0;
+			if (init && en && pst && init() == 0 && en(gpus, &n) == 0 && n > 0) gpu = gpus[0]; else pst = nullptr;
+		}
+	}
+	if (!pst || !gpu) return -1;
+	struct { unsigned int version, flags; struct { unsigned int present, percent; } u[8]; } info = {};
+	info.version = (unsigned int)sizeof(info) | (1u << 16);
+	if (pst(gpu, &info) != 0 || !(info.u[0].present & 1)) return -1;
+	return (int)std::min(100u, info.u[0].percent);
+}
+
+// 2.113.0: the time one frame has: the film's frame time (0 if unknown)
+float CDX11VideoProcessor::FrameLimitMs()
+{
+	if (m_rtAvgTimePerFrame > 0) return (float)(m_rtAvgTimePerFrame / 10000.0);
+	return 0.0f;
+}
+
+void CDX11VideoProcessor::LoadBegin()
+{
+	LoadQ& q = m_loadQ[m_loadQi];
+	if (q.used) {   // this slot's frame is 4 frames old: read it if the GPU is done
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT d = {}; UINT64 a = 0, b = 0;
+		if (m_pDeviceContext->GetData(q.dis, &d, sizeof(d), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+			&& m_pDeviceContext->GetData(q.t0, &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+			&& m_pDeviceContext->GetData(q.t1, &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+			&& !d.Disjoint && d.Frequency > 0 && b >= a) {
+			m_loadMsAcc += (float)((double)(b - a) * 1000.0 / (double)d.Frequency); m_loadMsN++;
+		}
+		q.used = false;
+	}
+	if (!q.dis) {
+		D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+		D3D11_QUERY_DESC qt = { D3D11_QUERY_TIMESTAMP, 0 };
+		if (FAILED(m_pDevice->CreateQuery(&qd, &q.dis)) || FAILED(m_pDevice->CreateQuery(&qt, &q.t0)) || FAILED(m_pDevice->CreateQuery(&qt, &q.t1))) {
+			q.dis.Release(); q.t0.Release(); q.t1.Release(); return;
+		}
+	}
+	m_pDeviceContext->Begin(q.dis);
+	m_pDeviceContext->End(q.t0);
+}
+
+void CDX11VideoProcessor::LoadEnd()
+{
+	LoadQ& q = m_loadQ[m_loadQi];
+	if (q.dis) {
+		m_pDeviceContext->End(q.t1);
+		m_pDeviceContext->End(q.dis);
+		q.used = true;
+	}
+	m_loadQi = (m_loadQi + 1) % 4;
+	LoadSample();
+}
+
+void CDX11VideoProcessor::LoadSample()
+{
+	const uint64_t now = GetTickCount64();
+	if (now - m_loadTick < 1000) return;
+	m_loadTick = now;
+	m_loadGpu = NvGpuLoad();
+	FILETIME fi, fk, fu;
+	if (GetSystemTimes(&fi, &fk, &fu)) {
+		const uint64_t idle = ((uint64_t)fi.dwHighDateTime << 32) | fi.dwLowDateTime;
+		const uint64_t total = (((uint64_t)fk.dwHighDateTime << 32) | fk.dwLowDateTime) + (((uint64_t)fu.dwHighDateTime << 32) | fu.dwLowDateTime);   // kernel includes idle
+		if (m_cpuTotal && total > m_cpuTotal) m_loadCpu = (int)std::clamp(100.0 - 100.0 * (double)(idle - m_cpuIdle) / (double)(total - m_cpuTotal), 0.0, 100.0);
+		m_cpuIdle = idle; m_cpuTotal = total;
+	}
+	if (m_loadMsN > 0) { m_loadMs = m_loadMsAcc / m_loadMsN; m_loadMsAcc = 0.0f; m_loadMsN = 0; }
+	const float limit = FrameLimitMs();   // 2.113.0: the film's own frame time
+	m_ClipGuard.SetLoad(m_loadGpu, m_loadCpu, m_loadMs, limit);
+	// 2.113.0: Lens upscale skipping frames 3 seconds running: off for the rest of this film
+	{
+		const unsigned dropped = m_pFilter ? m_pFilter->m_DrawStats.m_dropped : 0;
+		const bool more = dropped > m_dropLast;
+		m_dropLast = dropped;
+		if (m_lensNN == 1 && !m_lensNNOff) {
+			m_lensBad = more ? m_lensBad + 1 : 0;
+			if (m_lensBad >= 3) { m_lensNNOff = true; m_lensBad = 0; DLog(L"Lens upscale: frames skipped 3 s running, off for this film"); }
+		}
+		else m_lensBad = 0;
+	}
+}
+
+
 // 2.56.0: tone curve names as Unplugged's menu shows them (7 is "Unplugged")
 // 2.68.0: the banner's look-ahead line, with whose it is (Kaleidescape / Video Processor / Media Player).
 template <class CI> static std::wstring CgLookAheadText(const CI& ci)
@@ -11234,7 +11628,7 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 		const bool bHDRsrc = SourceIsHDR();
 		const bool bPQsrc = m_decExFmt.VideoTransferFunction == MFVideoTransFunc_2084;
 		const bool bHLGsrc = m_decExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
-		const double fpsIn = m_pFilter->m_FrameStats.GetAverageFps();
+		const double fpsIn = m_pFilter->m_DrawStats.GetAverageFps();
 		const double fpsOut = m_pFilter->m_DrawStats.GetAverageFps();
 		const wchar_t scan = (m_SampleFormat != D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE) ? L'i' : L'p';
 		LPCSTR fx[6] = {};
@@ -11258,11 +11652,14 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 			left.push_back({ m_Dovi.bValid ? L"DOLBY VISION" : bPQsrc ? L"HDR10" : bHLGsrc ? L"HLG" : L"SDR", bHDRsrc });
 			// 2.88.0: the film's nominal rate (the measured one moved 23.974-23.978 and
 			// the badges beside it with it); SOURCE keeps the measured rate.
-			if (fpsIn > 1.0) {
+			// 2.116.0: the rate the file declares (frame duration), when it has one; the measured
+			// arrival rate wobbled 23.95-24.06 and the badge with it.
+			const double fpsNom = m_rtAvgTimePerFrame > 0 ? 10000000.0 / (double)m_rtAvgTimePerFrame : fpsIn;
+			if (fpsNom > 1.0) {
 				static const double kRates[] = { 23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0, 50.0, 59.94, 60.0, 100.0, 119.88, 120.0 };
-				std::wstring fr = std::format(L"{:.2f}", fpsIn);
+				std::wstring fr = std::format(L"{:.2f}", fpsNom);
 				for (const double r : kRates) {
-					if (std::abs(fpsIn - r) < 0.011) {
+					if (std::abs(fpsNom - r) < 0.011) {
 						fr = (r == std::floor(r)) ? std::format(L"{}", (int)r) : std::format(L"{:.3f}", r);
 						if (r == 29.97 || r == 59.94) fr = std::format(L"{:.2f}", r);
 						break;
@@ -11326,10 +11723,11 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 			}
 			// 2.43.2: how colour (chroma) is upscaled (2.92.0: moved here from PROCESS)
 			{
-				static const wchar_t* kChroma[CHROMA_COUNT] = { L"Nearest", L"Bilinear", L"Catmull-Rom", L"KrigBilateral" };
+				static const wchar_t* kChroma[CHROMA_COUNT] = { L"Nearest", L"Bilinear", L"Catmull-Rom", L"KrigBilateral", L"JointBilateral", L"CfL" };
 				const int sub = m_srcParams.Subsampling;
 				std::wstring c;
 				if (m_D3D11VP.IsReady()) c = L"Chroma by D3D11 VP";
+				else if (m_cgFailed) c = L"Chroma JointBilateral / CfL failed: Catmull-Rom";   // 2.111.0
 				else if (sub == 444 || sub == 0) c = L"Chroma 4:4:4, none needed";
 				else c = std::format(L"Chroma {} {}", kChroma[std::clamp(m_iChromaScaling, 0, CHROMA_COUNT - 1)], sub == 420 ? L"4:2:0" : L"4:2:2");
 				if (m_iNeuralBanner == 1 || m_iNeuralBanner == 11) c += L" + Krig 2x";
@@ -11426,33 +11824,32 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				if (fpsOut > 1.0) g.items.push_back({ std::format(L"{:.3f} fps drawn, {} skipped", fpsOut, skipped), skipped ? 2 : 0 });
 				else g.items.push_back({ std::format(L"{} skipped", skipped), skipped ? 2 : 0 });
 			}
-			// 2.106.0: the anamorphic lens: lens and screen, the film's shape and how it was
-			// decided, its measured aspect, the scaling, and the screen geometry
-			if (m_view.lens100 > 101) {
-				const float lf = (float)m_view.lens100 / 100.0f, S = m_view.screen100 > 0 ? (float)m_view.screen100 / 100.0f : 2.40f;
-				const CRect vo = m_videoRectOrig.IsRectEmpty() ? m_videoRect : m_videoRectOrig;
-				const float As = vo.Height() > 0 ? (float)vo.Width() / (float)vo.Height() : 1.78f;
-				g.items.push_back({ std::format(L"Lens {:.2f}x, {:.2f} screen", lf, S), 0 });
-				std::wstring shape;
-				if (m_view.aspect1000 > 0) shape = L"Scope (set)";
-				else if (m_view.aspect1000 < 0) shape = L"Not scope (set)";
-				else if (As >= 2.2f) shape = L"Scope (the frame's shape)";
-				else if (m_anaScope) shape = L"Scope (read from the picture)";
-				else if (m_anaVotes > 0) shape = std::format(L"Not scope, checking {}%", std::min(99, m_anaVotes * 100 / 96));
-				else shape = L"Not scope (read from the picture)";
-				g.items.push_back({ shape, 0 });
-				g.items.push_back({ m_anaMeasured > 0.5f ? std::format(L"Film {:.2f} in a {:.2f} frame", m_anaMeasured, As) : std::format(L"Frame {:.2f}", As), 0 });
-				const CRect sr = m_srcRectAna.IsRectEmpty() ? m_srcRect : m_srcRectAna;
-				if (sr.Width() > 0 && sr.Height() > 0 && m_videoRect.Width() > 0) {
-					const float k = ((float)m_videoRect.Height() / sr.Height()) / ((float)m_videoRect.Width() / sr.Width());
-					g.items.push_back({ std::format(L"{} x {} -> {} x {}{}", sr.Width(), sr.Height(), m_videoRect.Width(), m_videoRect.Height(),
-						k > 1.01f ? std::format(L", x{:.2f} tall", k) : (k < 0.99f ? std::format(L", x{:.2f} wide", k) : std::wstring())), 0 });
-				}
+			// 2.109.0: ClipBit (Detail and Grain for low-bitrate 4K films)
+			if (m_view.magic == 0x56574543 && m_view.cbMode > 0) {
+				const std::wstring rate = m_view.cbKbps > 0 ? std::format(L"{:.1f} Mbps", m_view.cbKbps / 1000.0) : std::wstring(L"bitrate unknown");
+				if (m_view.cbState > 0 && !m_pPSBitrate) g.items.push_back({ L"ClipBit: shader failed", 2 });
+				else if (m_view.cbState > 0) g.items.push_back({ std::format(L"ClipBit on{}: detail {}, grain {} ({})", m_view.cbState == 2 ? L" for this film" : L"", m_view.detail, m_view.grain, rate), 0 });
+				else g.items.push_back({ std::format(L"ClipBit off ({})", rate), 0 });
 			}
+			// 0.9.6: the load: GPU %, CPU %, GPU time per frame against the film's frame time.
 			{
-				bool anyPt = false;
-				for (int i = 0; i < 24; i++) if (m_view.pt[i] != 0) { anyPt = true; break; }
-				if (m_view.geoOn && anyPt) g.items.push_back({ L"Screen geometry on (EWA Lanczos)", 0 });
+				const float limit = FrameLimitMs();   // 2.113.0: the film's frame time, not the drawn rate
+				std::wstring t = m_loadGpu >= 0 ? std::format(L"GPU {}%", m_loadGpu) : std::wstring(L"GPU -");
+				t += m_loadCpu >= 0 ? std::format(L" \u00b7 CPU {}%", m_loadCpu) : std::wstring(L" \u00b7 CPU -");
+				if (m_loadMs >= 0.0f) t += limit > 0.0f ? std::format(L" \u00b7 render {:.1f} ms of {:.1f}", m_loadMs, limit) : std::format(L" \u00b7 render {:.1f} ms", m_loadMs);
+				const bool hot = m_loadGpu > 85 || (limit > 0.0f && m_loadMs > limit * 0.8f);
+				g.items.push_back({ t, hot ? 2 : 0 });
+				if (m_lensNNOff) g.items.push_back({ L"Lens upscale off for this film: frames were skipped", 2 });   // 2.113.0
+			}
+			// 2.115.0: the scaling path: sizes, then each step (yellow when one fell back)
+			if (m_scaleW1 > 0 && m_scaleW2 > 0) {
+				g.items.push_back({ std::format(L"Scale {}x{} > {}x{}", m_scaleW1, m_scaleH1, m_scaleW2, m_scaleH2), 0 });
+				std::wstring p;
+				for (const auto& s : m_scaleSteps) { if (!p.empty()) p += L" > "; p += s; }
+				const bool fell = m_iRavuBanner == 3 || m_iSsimdBanner == 3 || m_iNeuralBanner == 3;
+				if (!p.empty()) g.items.push_back({ p, fell ? 2 : 0 });
+				if (m_iRavuBanner == 3) g.items.push_back({ L"RAVU-Zoom-AR failed: standard upscaler", 2 });
+				if (m_iSsimdBanner == 3) g.items.push_back({ L"SSimDownscaler failed: standard downscaler", 2 });
 			}
 			// 2.44.4: "filled" when the player asked for a few pixels less than its
 			// full-screen window and the video fills it; otherwise what the player
@@ -11934,7 +12331,7 @@ HRESULT CDX11VideoProcessor::DrawStats(ID3D11Texture2D* pRenderTarget)
 	wchar_t frametype = (m_SampleFormat != D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE) ? 'i' : 'p';
 	str += std::format(
 		L"\nFrame rate    : {:7.3f}{},{:7.3f}",
-		m_pFilter->m_FrameStats.GetAverageFps(),
+		m_pFilter->m_DrawStats.GetAverageFps(),
 		frametype,
 		m_pFilter->m_DrawStats.GetAverageFps()
 	);

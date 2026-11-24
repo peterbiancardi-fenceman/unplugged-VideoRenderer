@@ -253,6 +253,8 @@ void ShaderGetPixels(
 		|| fmtParams.cformat == CF_Y216
 		|| fmtParams.cformat == CF_V210);
 	const bool blendDeint420 = (blendDeinterlace && fmtParams.Subsampling == 420);
+	const bool bGuided = bDX11 && (chromaScaling == CHROMA_JointBilateral || chromaScaling == CHROMA_CfL)
+		&& (fmtParams.Subsampling == 420 || fmtParams.Subsampling == 422);   // 2.111.0
 
 	const char* strChromaPos = "";
 	const char* strChromaPos2 = "";
@@ -375,7 +377,10 @@ void ShaderGetPixels(
 					"colorY = (colorY * 2 + y1 + y2) / 4;\n");
 			}
 			code.append("float2 colorUV;\n");
-			if (chromaScaling == CHROMA_Nearest || fmtParams.Subsampling == 444) {
+			if (bGuided && fmtParams.Subsampling != 444) {
+				code.append("colorUV = texCG.Load(int3(int2(input.Tex * wh), 0)).rg;\n");   // 2.111.0
+			}
+			else if (chromaScaling == CHROMA_Nearest || fmtParams.Subsampling == 444) {
 				code.append("colorUV = texUV.Sample(samp, input.Tex).rg;\n");
 			}
 			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 420) {
@@ -424,7 +429,10 @@ void ShaderGetPixels(
 					"colorY = (colorY * 2 + y1 + y2) / 4;\n");
 			}
 			code.append("float2 colorUV;\n");
-			if (chromaScaling == CHROMA_Nearest || fmtParams.Subsampling == 444) {
+			if (bGuided && fmtParams.Subsampling != 444) {
+				code.append("colorUV = texCG.Load(int3(int2(input.Tex * wh), 0)).rg;\n");   // 2.111.0
+			}
+			else if (chromaScaling == CHROMA_Nearest || fmtParams.Subsampling == 444) {
 				code.append(
 					"colorUV[0] = texU.Sample(samp, input.Tex).r;\n"
 					"colorUV[1] = texV.Sample(samp, input.Tex).r;\n"
@@ -764,6 +772,13 @@ HRESULT GetShaderConvertColor(
 	// KrigBilateral helpers are top-level functions; emit them up front (DX11/4:2:0 only)
 	if (bDX11 && chromaScaling == CHROMA_Krig) {
 		AppendKrigHelpers(code);
+	}
+	// 2.111.0: JointBilateral / CfL: the chroma is upscaled beforehand (ChromaGuided.h passes)
+	// into a luma-sized texture at t4; the converter reads it one-to-one.
+	const bool bGuided = bDX11 && (chromaScaling == CHROMA_JointBilateral || chromaScaling == CHROMA_CfL)
+		&& (fmtParams.Subsampling == 420 || fmtParams.Subsampling == 422);
+	if (bGuided) {
+		code.append("Texture2D texCG : register(t4);\n");
 	}
 
 	const bool bBT2020Primaries = (exFmt.VideoPrimaries == MFVideoPrimaries_BT2020);

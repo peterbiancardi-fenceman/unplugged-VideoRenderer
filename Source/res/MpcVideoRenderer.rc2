@@ -22,6 +22,7 @@
 
 IDF_DITHER_32X32_FLOAT16        FILE                    "res\\dither32x32float16.bin"
 IDF_SKIN_LUT                     FILE                    "res\\skin_chroma_lut.bin"
+IDF_RAVU_LUT                     FILE                    "res\\ravu_zoom_ar_r3_lut.bin"
 
 IDF_HLSL_ST2084                 FILE                    "..\\Shaders\\convert\\st2084.hlsl"
 IDF_HLSL_HLG                    FILE                    "..\\Shaders\\convert\\hlg.hlsl"
