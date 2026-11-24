@@ -897,6 +897,7 @@ private:
 	bool m_bSsimBusy = false;            // drawing the downscale SSimDownscaler then corrects
 	CComPtr<ID3D11PixelShader> m_pShaderSsimBaseX, m_pShaderSsimBaseY;   // its base downscale: Catmull-Rom
 	CComPtr<ID3D11PixelShader> m_pShaderLensLwX, m_pShaderLensLwY;       // lens Lightweight: Lanczos3
+	CComPtr<ID3D11PixelShader> m_pShaderLensLwDX, m_pShaderLensLwDY;     // and Lanczos for a width that shrinks (2.00 / 2.10)
 	bool m_lensSsim = false;             // the lens's neural 2x is being brought down to size
 	int m_iRavuBanner = 0, m_iSsimdBanner = 0;   // 1 used, 2 loading, 3 failed
 	std::vector<std::wstring> m_scaleSteps;   // the scaling path of the last frame, for the banner
@@ -944,7 +945,7 @@ private:
 	HRESULT DrawDepth(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect, bool bypass);
 	// 2.105.0: anamorphic lens and 12-point screen geometry, set by ClipGuard Media Player
 	// through the shared block Local\ClipGuard_view_v1 (see ReadView).
-	struct ViewShared { int32_t magic, seq, lens100, screen100, aspect1000, geoOn, geoEdit, pt[24], detail, grain, cbState, cbKbps, cbMode, lensUp, chromaCg, ravu, ssimDown; };   // 2.115.0: lensUp 0 Standard, 1 Neural 2x first, 2 Lightweight   // 2.114.0: ravu 1 RAVU-Zoom-AR for upscales, ssimDown 1 SSimDownscaler for downscales   // 2.111.0: chromaCg 0 Unplugged's choice, 1 JointBilateral, 2 CfL   // 2.109.0: ClipBit state (0 off, 1 on, 2 on for this film), bitrate, setting   // 2.107.0: detail, grain 0-100
+	struct ViewShared { int32_t magic, seq, lens100, screen100, aspect1000, geoOn, geoEdit, pt[24], detail, grain, cbState, cbKbps, cbMode, lensUp, chromaCg, ravu, ssimDown, anaMem; };   // 2.118.1: chromaCg 3 KrigBilateral (Video Processor with the lens)   // 2.117.0: anaMem: this film's shape remembered by the player (x1000, 0 none)   // 2.115.0: lensUp 0 Standard, 1 Neural 2x first, 2 Lightweight   // 2.114.0: ravu 1 RAVU-Zoom-AR for upscales, ssimDown 1 SSimDownscaler for downscales   // 2.111.0: chromaCg 0 Unplugged's choice, 1 JointBilateral, 2 CfL   // 2.109.0: ClipBit state (0 off, 1 on, 2 on for this film), bitrate, setting   // 2.107.0: detail, grain 0-100
 	HANDLE m_hViewMap = nullptr;
 	const volatile ViewShared* m_pView = nullptr;
 	ULONGLONG m_viewRetry = 0;
@@ -965,6 +966,13 @@ private:
 	bool m_anaStretch = false;   // 2.110.0: the lens is filling the height with a scope film now
 	int m_lensNN = 0;            // lens upscale: 0 not used, 1 FSRCNNX, 3 not ready / failed
 	Tex2D_t m_lensCrop;          // 2.110.0: the picture without its letterbox, for the neural 2x
+	Tex2D_t m_mixTex;            // 0.9.7: taller but narrower (lens, 2.00 / 2.10): RAVU for the height first
+	bool m_bMixBusy = false;
+	bool m_anaLensOn = false;    // 0.9.7: the lens is fitting this film (scope or not)
+	int m_anaSrc = 0;            // 0.9.7: how Auto decided: 0 the picture, 2 the film's metadata
+	int m_anaScopeVotes = 0;     // 0.9.7: a "wide" film still turns scope after 4 s of scope letterbox
+	struct DvL5 { int l = 0, r = 0, t = 0, b = 0; ULONGLONG tick = 0; } m_dvL5;   // 0.9.7: the film's active area (metadata)
+	bool m_chromaOver = false;   // 0.9.7: the player's chroma choice is in force
 	// 2.111.0: JointBilateral / CfL chroma upsampling (ChromaGuided.h), run before the converter
 	CComPtr<ID3D11PixelShader> m_pPSCg[5];   // LR1, LR2, JB, CfL, smoothing
 	int m_cgKey = -1;                        // planar | swap UV << 1, the shaders were built for
@@ -981,6 +989,7 @@ private:
 	uint64_t m_loadTick = 0, m_cpuIdle = 0, m_cpuTotal = 0;
 	// 2.113.0: Lens upscale switches itself off for a film that keeps skipping frames with it
 	bool m_lensNNOff = false; int m_lensBad = 0; unsigned m_dropLast = 0; int m_lensFilm = -1;
+	int m_lensUpLast = -1; ULONGLONG m_lensRunSince = 0;   // 2.117.1: choosing Neural again turns it back on; only steady playback counts
 	void LoadBegin();
 	void LoadEnd();
 	void LoadSample();

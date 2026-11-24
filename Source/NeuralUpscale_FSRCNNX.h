@@ -1135,16 +1135,37 @@ static const Pass kPasses[] = {
 		"\tres += mul(T(t3, 1, 1), float4x4(0.00218720874,0.0173248164,0.0193927605,-0.00439311797,0.00889612082,0.0238487516,0.00538194412,-0.0194583926,0.00603333255,0.0123941889,0.0321498439,-0.00684960932,0.00716461521,0.000913757074,0.0105294362,-0.025690645));\n"
 		"\treturn res;\n"
 		"}\n" },
-	{ "luma2x", 1, { 1, 0, 0, 0, 0 }, 15,
+	// 2.118.0 (by hand): the network's luma drifted a little from the source (about 0.4 of 255
+	// darker). The difference between the source luma and the network's 2x2 mean, smoothed
+	// (cubic B-spline, low frequencies only), is added back: detail unchanged, levels kept.
+	{ "luma2x", 2, { 1, 0, 0, 0, 0 }, 15,
 		"Texture2D<float4> t0 : register(t0);\n"
-		"#define T(t, dx, dy) t.Load(int3(clamp(p + int2(dx, dy), int2(0, 0), mx), 0))\n"
+		"Texture2D<float4> t1 : register(t1);\n"
 		"float4 main(float4 pos : SV_POSITION) : SV_TARGET\n"
 		"{\n"
 		"\tconst int2 q = int2(pos.xy);\n"
+		"\tuint w, h;\n"
+		"\tt0.GetDimensions(w, h);\n"
+		"\tconst int2 mx = int2(w, h) - 1;\n"
 		"\tconst float4 s = t0.Load(int3(q >> 1, 0));\n"
 		"\tconst int k = (q.x & 1) * 2 + (q.y & 1);\n"
 		"\tconst float yl = (k == 0) ? s.x : (k == 1) ? s.y : (k == 2) ? s.z : s.w;\n"
-		"\treturn float4((yl - 16.0 / 255.0) * (255.0 / 219.0), 0.0, 0.0, 1.0);\n"
+		"\tconst float2 c = (float2(q) + 0.5) * 0.5 - 0.5;\n"
+		"\tconst int2 b = int2(floor(c));\n"
+		"\tconst float2 f = c - float2(b);\n"
+		"\tconst float2 f2 = f * f, f3 = f2 * f;\n"
+		"\tfloat2 wt[4];\n"
+		"\twt[0] = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;\n"
+		"\twt[1] = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;\n"
+		"\twt[2] = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;\n"
+		"\twt[3] = f3 / 6.0;\n"
+		"\tfloat e = 0.0;\n"
+		"\t[unroll] for (int j = 0; j < 4; j++)\n"
+		"\t[unroll] for (int i = 0; i < 4; i++) {\n"
+		"\t\tconst int2 t = clamp(b + int2(i - 1, j - 1), int2(0, 0), mx);\n"
+		"\t\te += wt[i].x * wt[j].y * (t1.Load(int3(t, 0)).x - dot(t0.Load(int3(t, 0)), float4(0.25, 0.25, 0.25, 0.25)));\n"
+		"\t}\n"
+		"\treturn float4((yl + e - 16.0 / 255.0) * (255.0 / 219.0), 0.0, 0.0, 1.0);\n"
 		"}\n" },
 	{ "krig", 2, { 15, 13, 0, 0, 0 }, 14,
 		"Texture2D<float4> t0 : register(t0);\n"

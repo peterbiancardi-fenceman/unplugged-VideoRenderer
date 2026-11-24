@@ -1,5 +1,5 @@
 ﻿/*
- * ClipGuard Media Player 0.9.3 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
+ * ClipGuard Media Player 0.9.7 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
  * dark pictures first, so after the projector's gain they land below clipping.
@@ -1741,7 +1741,7 @@ public:
 	// The graphics card's load in % as Windows reports it (Task Manager's 3D
 	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
 	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
-	const wchar_t* VersionText() const { return L"0.9.3"; }
+	const wchar_t* VersionText() const { return L"0.9.7"; }
 	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
 	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
 	float PicturePct() const { return m_picture; }
@@ -1792,7 +1792,7 @@ public:
 	{
 		OvModel m;
 		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
-		m.version = m_s.testBuild ? L"0.9.3 Test" : L"0.9.3 beta";
+		m.version = m_s.testBuild ? L"0.9.7 Test" : L"0.9.7 beta";
 		const auto vals = Lines();
 		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"View", L"Overlay", L"Restart & update" };
 		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it

@@ -845,12 +845,14 @@ void CDX11VideoProcessor::ReleaseDevice()
 	ReleaseDepth();   // 2.93.0
 	ReleaseGeometry();   // 2.105.0
 	m_lensCrop.Release();   // 0.9.6
+	m_mixTex.Release();     // 0.9.7
 	ReleaseChromaGuided();
 	for (auto& q : m_loadQ) { q.dis.Release(); q.t0.Release(); q.t1.Release(); q.used = false; }
 	m_NeuralUps.ReleaseDevice();
 	m_Ravu.ReleaseDevice();
 	m_pShaderSsimBaseX.Release(); m_pShaderSsimBaseY.Release();
 	m_pShaderLensLwX.Release(); m_pShaderLensLwY.Release();
+	m_pShaderLensLwDX.Release(); m_pShaderLensLwDY.Release();
 	m_SsimD.ReleaseDevice();
 	m_pPSGamut2020.Release();
 	for (auto& t : m_ClipGuardDelay) t.Release();
@@ -6691,6 +6693,16 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 					return powf(y, PQ_M2);
 				};
 
+				// 0.9.7: Level 5, the active area (the letterbox), for the lens
+				for (uint32_t i = 0; i < LAV_DOVI_MAX_EXTENSIONS; ++i) {
+					if (pDOVIMetadata->Extensions[i].level == 5) {
+						const auto& L5 = pDOVIMetadata->Extensions[i].Level5;
+						m_dvL5.l = L5.left_offset; m_dvL5.r = L5.right_offset; m_dvL5.t = L5.top_offset; m_dvL5.b = L5.bottom_offset;
+						m_dvL5.tick = GetTickCount64();
+						break;
+					}
+				}
+
 				// Level 1 + 3
 				for (uint32_t i = 0; i < LAV_DOVI_MAX_EXTENSIONS; ++i) {
 					if (pDOVIMetadata->Extensions[i].level == 1) {
@@ -8361,12 +8373,12 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 		resizerY = (h1 == h2) ? nullptr : (h1 > h2) ? m_pShaderDownscaleY.p : m_pShaderUpscaleY.p;
 	}
 
-	if (!m_bNeuralBusy && !m_bSsimBusy) {   // 0.9.6
+	if (!m_bNeuralBusy && !m_bSsimBusy && !m_bMixBusy) {   // 0.9.6
 		m_iRavuBanner = 0; m_iSsimdBanner = 0;
 		m_scaleSteps.clear(); m_scaleW1 = w1; m_scaleH1 = h1; m_scaleW2 = w2; m_scaleH2 = h2;
 	}
 	// 0.9.6: lens Lightweight: the lens stretch is always Lanczos3 (whatever the Upscaling setting)
-	if (rotation == 0 && m_view.magic == 0x56574543 && m_view.lensUp == 2 && m_view.lens100 > 101 && m_anaStretch && !m_bSsimBusy) {
+	if (rotation == 0 && m_view.magic == 0x56574543 && m_view.lensUp == 2 && m_view.lens100 > 101 && m_anaLensOn && !m_bSsimBusy) {   // 0.9.7: any lens fit
 		if (!m_pShaderLensLwX) {
 			CreatePShaderFromResource(&m_pShaderLensLwX, s_Upscaling11ResIDs[UPSCALE_Lanczos3].shaderX);
 			CreatePShaderFromResource(&m_pShaderLensLwY, s_Upscaling11ResIDs[UPSCALE_Lanczos3].shaderY);
@@ -8374,6 +8386,15 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 		if (m_pShaderLensLwX && m_pShaderLensLwY) {
 			if (resizerX == m_pShaderUpscaleX.p) resizerX = m_pShaderLensLwX.p;
 			if (resizerY == m_pShaderUpscaleY.p) resizerY = m_pShaderLensLwY.p;
+		}
+		// 0.9.7: a 2.00 / 2.10 film's width shrinks: Lanczos there too (not the Downscaling setting)
+		if (!m_pShaderLensLwDX) {
+			CreatePShaderFromResource(&m_pShaderLensLwDX, s_Downscaling11ResIDs[DOWNSCALE_Lanczos].shaderX);
+			CreatePShaderFromResource(&m_pShaderLensLwDY, s_Downscaling11ResIDs[DOWNSCALE_Lanczos].shaderY);
+		}
+		if (m_pShaderLensLwDX && m_pShaderLensLwDY) {
+			if (resizerX == m_pShaderDownscaleX.p) resizerX = m_pShaderLensLwDX.p;
+			if (resizerY == m_pShaderDownscaleY.p) resizerY = m_pShaderLensLwDY.p;
 		}
 	}
 	// 0.9.6: SSimDownscaler's base downscale is Catmull-Rom (its own L2 kernel)
@@ -8498,8 +8519,31 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 			m_pDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
 		};
 		const bool viewOk = m_view.magic == 0x56574543;
-		const bool ravuOn = viewOk && m_view.ravu != 0 && !(m_view.lensUp == 2 && m_anaStretch);   // 2.115.0: lens Lightweight: Lanczos3
+		const bool ravuOn = viewOk && m_view.ravu != 0 && !(m_view.lensUp == 2 && m_anaLensOn);   // 2.115.0: lens Lightweight: Lanczos3
 		const bool ssimOn = m_lensSsim || (viewOk && m_view.ssimDown != 0);
+		// 0.9.7: the lens on a 2.00 / 2.10 film: taller but narrower. RAVU-Zoom-AR for the
+		// height first, then SSimDownscaler for the width (the same quality as a scope film).
+		if (!m_bSsimBusy && !m_bMixBusy && ravuOn && m_anaLensOn && w2 < w1 && h2 > h1) {
+			m_Ravu.Request();
+			if (m_Ravu.Ready(m_pDevice) && SUCCEEDED(m_mixTex.CheckCreate(m_pDevice, DXGI_FORMAT_R16G16B16A16_FLOAT, w1, h2, Tex2D_DefaultShaderRTarget))) {
+				CComPtr<ID3D11RenderTargetView> rtvMid;
+				HRESULT hr2 = m_pDevice->CreateRenderTargetView(m_mixTex.pTexture, nullptr, &rtvMid);
+				if (SUCCEEDED(hr2)) hr2 = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, Tex.desc.Width, Tex.desc.Height,
+					CRect(0, 0, Tex.desc.Width, Tex.desc.Height), 0, false);
+				if (SUCCEEDED(hr2)) hr2 = m_Ravu.Run(m_pDeviceContext, Tex.pShaderResource, srcRect, rtvMid, CRect(0, 0, w1, h2), drawPass);
+				if (SUCCEEDED(hr2)) {
+					m_iRavuBanner = 1;
+					m_scaleSteps.push_back(L"RAVU-Zoom-AR (height)");
+					m_bMixBusy = true;
+					m_lensSsim = true;
+					hr2 = ResizeShaderPass(m_mixTex, pRenderTarget, CRect(0, 0, w1, h2), dstRect, 0);
+					m_lensSsim = false;
+					m_bMixBusy = false;
+					return hr2;
+				}
+			}
+			else m_iRavuBanner = (m_Ravu.GetState() == CRavuZoom::kFailed) ? 3 : 2;
+		}
 		if (!m_bSsimBusy && ravuOn && w2 >= w1 && h2 >= h1 && (w2 > w1 || h2 > h1)) {
 			m_Ravu.Request();
 			if (m_Ravu.Ready(m_pDevice)) {
@@ -8543,7 +8587,7 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 		const std::wstring ny = resizerY ? ScalerName(resizerY) : std::wstring();
 		if (nx.empty() && ny.empty()) m_scaleSteps.push_back(L"none (1:1)");
 		else if (nx.empty() || ny.empty() || nx == ny) m_scaleSteps.push_back(nx.empty() ? ny : nx);
-		else m_scaleSteps.push_back(nx + L" across, " + ny + L" down");
+		else m_scaleSteps.push_back(nx + L" width, " + ny + L" height");   // 0.9.7: was "across / down"
 	}
 
 	if (resizerX && resizerY) {
@@ -8611,6 +8655,7 @@ std::wstring CDX11VideoProcessor::ScalerName(ID3D11PixelShader* ps)
 {
 	if (ps == m_pShaderSsimBaseX.p || ps == m_pShaderSsimBaseY.p) return L"Catmull-Rom";
 	if (ps == m_pShaderLensLwX.p || ps == m_pShaderLensLwY.p) return L"Lanczos3";
+	if (ps == m_pShaderLensLwDX.p || ps == m_pShaderLensLwDY.p) return L"Lanczos";
 	if (ps == m_pShaderUpscaleX.p || ps == m_pShaderUpscaleY.p) return s_Upscaling11ResIDs[m_iUpscaling].description;
 	if (ps == m_pShaderDownscaleX.p || ps == m_pShaderDownscaleY.p) return s_Downscaling11ResIDs[m_iDownscaling].description;
 	return L"?";
@@ -8873,17 +8918,19 @@ void CDX11VideoProcessor::ReadView()
 	m_view = v;
 	m_ClipGuard.SetBitrateHelp(v.detail, v.grain, v.cbState, v.cbKbps, v.cbMode);   // 2.108.0 / 2.109.0: for the log
 	if (v.geoEdit != m_lensFilm) { m_lensFilm = v.geoEdit; m_lensNNOff = false; m_lensBad = 0; }   // 2.113.0: a new film (the film counter)
+	if (v.lensUp != m_lensUpLast) { m_lensUpLast = v.lensUp; m_lensNNOff = false; m_lensBad = 0; m_lensRunSince = 0; }   // 0.9.7: chosen again (L or Settings)
 	// 2.111.0: the player's JointBilateral / CfL choice overrides Unplugged's chroma setting
 	{
-		const int want = v.chromaCg == 1 ? CHROMA_JointBilateral : (v.chromaCg == 2 ? CHROMA_CfL : -1);
-		const bool guidedNow = m_iChromaScaling == CHROMA_JointBilateral || m_iChromaScaling == CHROMA_CfL;
+		// 0.9.7: 3 = KrigBilateral
+		const int want = v.chromaCg == 1 ? CHROMA_JointBilateral : (v.chromaCg == 2 ? CHROMA_CfL : (v.chromaCg == 3 ? CHROMA_Krig : -1));
 		int next = m_iChromaScaling;
-		if (want >= 0 && !m_cgFailed) {
-			if (!guidedNow) m_iChromaUnplugged = m_iChromaScaling;
+		if (want >= 0 && !(m_cgFailed && want != CHROMA_Krig)) {
+			if (!m_chromaOver) { m_iChromaUnplugged = m_iChromaScaling; m_chromaOver = true; }
 			next = want;
 		}
-		else if (want < 0 && (guidedNow || m_cgFailed)) {
+		else if (want < 0 && (m_chromaOver || m_cgFailed)) {
 			next = m_iChromaUnplugged >= 0 ? m_iChromaUnplugged : CHROMA_Krig;
+			m_chromaOver = false;
 		}
 		if (want < 0) m_cgFailed = false;
 		if (next != m_iChromaScaling) {
@@ -8906,45 +8953,66 @@ void CDX11VideoProcessor::ApplyAnamorphic()
 	const int W = m_windowRect.Width(), H = m_windowRect.Height();
 	const float f = (float)m_view.lens100 / 100.0f;
 	m_anaStretch = false;   // 2.110.0
+	m_anaLensOn = false;    // 0.9.7
 	if (f > 1.01f && W > 0 && H > 0 && vr.Width() > 0 && vr.Height() > 0 && sr.Width() > 0 && sr.Height() > 0) {
 		const float S = m_view.screen100 > 0 ? (float)m_view.screen100 / 100.0f : 2.40f;
 		const float As = (float)vr.Width() / (float)vr.Height();   // the frame's shape as shown
 		// 2.105.2: Auto reads the film's shape from the picture. A new film starts as not scope;
 		// once 4 s of bright frames show a scope letterbox (the picture 68-80% of the height,
 		// bars the same top and bottom), it becomes scope for the rest of the film. Never back.
-		if (m_view.geoEdit != m_anaFilm) { m_anaFilm = m_view.geoEdit; m_anaVotes = 0; m_anaScope = false; m_anaWide = 0.0f; m_anaMeasured = 0.0f; }
-		// 2.116.0: any letterbox from about 1.87 up is measured (the picture 60-95% of the
-		// height); after 4 s of agreeing frames the film is scope (2.2 or wider) or "wide" (its
-		// own shape, e.g. 2.00 or 2.10, at full height with the bars cut off). Never back.
-		if (m_view.aspect1000 == 0 && !m_anaScope && m_anaWide <= 0.0f) {
+		static const float usual[] = { 1.85f, 1.90f, 2.00f, 2.10f, 2.20f, 2.35f, 2.39f, 2.40f, 2.55f, 2.76f };
+		auto snap = [](float x) { float best = x, bd = 0.02f; for (const float u : usual) { const float d = std::abs(x / u - 1.0f); if (d < bd) { bd = d; best = u; } } return best; };
+		if (m_view.geoEdit != m_anaFilm) {
+			m_anaFilm = m_view.geoEdit; m_anaVotes = 0; m_anaScopeVotes = 0; m_anaScope = false; m_anaWide = 0.0f; m_anaMeasured = 0.0f; m_anaSrc = 0;
+		}
+		// Auto. A film starts as not scope (the frame's shape). 2.117.0: scope is held: once a film
+		// shows a scope letterbox it stays scope for the rest of the film (IMAX scenes are cropped
+		// top and bottom to the screen's shape); a "wide" film (2.00, 2.10) can still turn scope,
+		// never back.
+		if (m_view.aspect1000 == 0 && !m_anaScope) {
+			// 0.9.7: the film's own active-area metadata (L5), exact and at once, when it has it
+			const int fw = (int)m_srcWidth, fh = (int)m_srcHeight;
+			if (m_dvL5.tick && GetTickCount64() - m_dvL5.tick < 2000 && fw > 0 && fh > 0
+				&& m_dvL5.t + m_dvL5.b > fh / 30 && m_dvL5.t + m_dvL5.b < fh / 2 && m_dvL5.l + m_dvL5.r < fw / 2) {
+				const float fa = snap(As * ((float)(fw - m_dvL5.l - m_dvL5.r) / fw) / ((float)(fh - m_dvL5.t - m_dvL5.b) / fh));
+				if (fa >= 2.2f) { m_anaScope = true; m_anaMeasured = fa; m_anaSrc = 2; }
+				else if (m_anaWide <= 0.0f && fa > As * 1.03f) { m_anaWide = fa; m_anaMeasured = fa; m_anaSrc = 2; }
+			}
+			// otherwise the picture: 4 s of bright frames with the same letterbox
 			int cy0, cy1, rows; float pic;
-			if (m_ClipGuard.ContentRows(cy0, cy1, rows, pic) && rows > 0 && pic >= 0.3f && m_ClipGuard.TextPct() < 20.0f) {   // 2.106.0: not credits or text
+			if (!m_anaScope && m_ClipGuard.ContentRows(cy0, cy1, rows, pic) && rows > 0 && pic >= 0.3f && m_ClipGuard.TextPct() < 20.0f) {   // 2.106.0: not credits or text
 				const float frac = (float)(cy1 - cy0 + 1) / (float)rows;
 				const int top = cy0, bot = rows - 1 - cy1;
-				const bool letterbox = As < 2.0f && frac >= 0.60f && frac <= 0.95f && std::abs(top - bot) <= std::max(2, rows / 36);
+				// 0.9.7: frames up to 2.1 wide (3840 x 1920 encodes) are read too
+				const bool letterbox = As < 2.1f && frac >= 0.60f && frac <= 0.95f && std::abs(top - bot) <= std::max(2, rows / 36);
 				if (letterbox) {
 					const float fa = As / frac;
-					// a different shape from the one being averaged starts the count again
-					if (m_anaVotes > 8 && std::abs(fa / m_anaMeasured - 1.0f) > 0.06f) { m_anaVotes = 0; m_anaMeasured = 0.0f; }
-					++m_anaVotes;
-					m_anaMeasured += (fa - m_anaMeasured) / (float)std::min(m_anaVotes, 96);   // the film's aspect, averaged
-					if (m_anaVotes >= 96) {
-						static const float usual[] = { 1.85f, 1.90f, 2.00f, 2.10f, 2.20f, 2.35f, 2.39f, 2.40f, 2.55f, 2.76f };
-						float best = m_anaMeasured, bd = 0.02f;
-						for (const float u : usual) { const float d = std::abs(m_anaMeasured / u - 1.0f); if (d < bd) { bd = d; best = u; } }
-						m_anaMeasured = best;
-						if (best >= 2.2f) m_anaScope = true;
-						else if (best > As * 1.03f) m_anaWide = best;
-						else m_anaVotes = 0;
+					if (m_anaWide > 0.0f) {
+						// decided wide: only a scope letterbox counts now
+						if (fa >= 2.15f && ++m_anaScopeVotes >= 96) { m_anaScope = true; m_anaMeasured = snap(fa); m_anaSrc = 0; }
+					}
+					else {
+						// a different shape from the one being averaged starts the count again
+						if (m_anaVotes > 8 && std::abs(fa / m_anaMeasured - 1.0f) > 0.06f) { m_anaVotes = 0; m_anaMeasured = 0.0f; }
+						++m_anaVotes;
+						m_anaMeasured += (fa - m_anaMeasured) / (float)std::min(m_anaVotes, 96);   // the film's aspect, averaged
+						if (m_anaVotes >= 96) {
+							const float best = snap(m_anaMeasured);
+							m_anaMeasured = best; m_anaSrc = 0;
+							if (best >= 2.2f) m_anaScope = true;
+							else if (best > As * 1.03f) m_anaWide = best;
+							else m_anaVotes = 0;
+						}
 					}
 				}
-				else if (frac > 0.97f) m_anaVotes = std::max(0, m_anaVotes - 2);
+				else if (frac > 0.97f) { m_anaVotes = std::max(0, m_anaVotes - 2); m_anaScopeVotes = std::max(0, m_anaScopeVotes - 2); }
 			}
 		}
 		const float a = std::clamp(m_view.aspect1000 > 0 ? (float)m_view.aspect1000 / 1000.0f : (m_anaScope ? 2.39f : (m_anaWide > 0.0f ? m_anaWide : As)), 1.0f, 3.0f);
 		const bool scope = m_view.aspect1000 >= 0 && a >= 2.2f;
 		const float T = scope ? S : a;   // the shape shown, at the panel's full height
 		m_anaStretch = scope;   // 2.110.0
+		m_anaLensOn = true;     // 0.9.7
 		const int ph = H;
 		const int pw = std::max(1, std::min(W, (int)std::lround(T * H / f)));
 		const CRect nv(CPoint(m_windowRect.left + (W - pw) / 2, m_windowRect.top), CSize(pw, ph));
@@ -9332,6 +9400,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			hr = ResizeShaderPass(*pInputTexture, pRT, rSrc, dstRect, rotation);
 		} else {
 			pTex = pInputTexture; // Hmm
+			// 0.9.7: no scaling: the banner says so (it kept the last film's path)
+			m_scaleSteps.assign(1, L"none (1:1)");
+			m_scaleW1 = m_scaleW2 = rSrc.Width(); m_scaleH1 = m_scaleH2 = rSrc.Height();
+			m_iRavuBanner = 0; m_iSsimdBanner = 0;
 		}
 
 		if (m_pPSCorrection) {
@@ -11425,11 +11497,18 @@ void CDX11VideoProcessor::LoadSample()
 	}
 	if (m_loadMsN > 0) { m_loadMs = m_loadMsAcc / m_loadMsN; m_loadMsAcc = 0.0f; m_loadMsN = 0; }
 	const float limit = FrameLimitMs();   // 2.113.0: the film's own frame time
-	m_ClipGuard.SetLoad(m_loadGpu, m_loadCpu, m_loadMs, limit);
+	if (m_pFilter && m_pFilter->m_filterState == State_Running)   // 0.9.7: the log's averages leave paused time out
+		m_ClipGuard.SetLoad(m_loadGpu, m_loadCpu, m_loadMs, limit);
 	// 2.113.0: Lens upscale skipping frames 3 seconds running: off for the rest of this film
 	{
 		const unsigned dropped = m_pFilter ? m_pFilter->m_DrawStats.m_dropped : 0;
-		const bool more = dropped > m_dropLast;
+		// 0.9.7: 3 or more frames skipped in the second, and only after 5 s of steady playing:
+		// a pause, a step, a seek or a switch of the upscaler skips a few on its own.
+		const bool running = m_pFilter && m_pFilter->m_filterState == State_Running;
+		if (!running) m_lensRunSince = 0;
+		else if (!m_lensRunSince) m_lensRunSince = now;
+		const bool steady = running && m_lensRunSince && now - m_lensRunSince >= 5000;
+		const bool more = steady && dropped >= m_dropLast + 3;
 		m_dropLast = dropped;
 		if (m_lensNN == 1 && !m_lensNNOff) {
 			m_lensBad = more ? m_lensBad + 1 : 0;
