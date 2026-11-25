@@ -11582,12 +11582,19 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 	// Colours (premultiplied for the see-through ones).
 	auto pm = [](int a, int r, int g, int b) { return D3DCOLOR_ARGB(a, r * a / 255, g * a / 255, b * a / 255); };
 	// The Unplugged menu's palette: near-black panel, orange accent, off-white text.
-	const D3DCOLOR cPanel = pm(240, 12, 14, 14), cEdge = D3DCOLOR_XRGB(150, 150, 150), cRule = D3DCOLOR_XRGB(48, 50, 52);
-	const D3DCOLOR cSelBar = D3DCOLOR_XRGB(33, 35, 37);
+	// 2.120.0: the Media Player's theme (its view block) sets the panel, card, rules and
+	// accent; warnings keep their own colour so they stand out in every theme.
+	const bool themed = m_view.themeOn == 1;
+	auto rgbOf = [](int32_t c) { return D3DCOLOR_XRGB((c >> 16) & 255, (c >> 8) & 255, c & 255); };
+	const D3DCOLOR cPanel = themed ? pm(240, (m_view.themeBg >> 16) & 255, (m_view.themeBg >> 8) & 255, m_view.themeBg & 255) : pm(240, 12, 14, 14);
+	const D3DCOLOR cEdge = D3DCOLOR_XRGB(150, 150, 150);
+	const D3DCOLOR cRule = themed ? rgbOf(m_view.themeDim) : D3DCOLOR_XRGB(48, 50, 52);
+	const D3DCOLOR cSelBar = themed ? rgbOf(m_view.themeCard) : D3DCOLOR_XRGB(33, 35, 37);
 	const D3DCOLOR cText = D3DCOLOR_XRGB(226, 226, 226), cTextSel = D3DCOLOR_XRGB(242, 242, 242);
-	const D3DCOLOR cDim = D3DCOLOR_XRGB(128, 128, 128), cSub = D3DCOLOR_XRGB(176, 176, 176), cTitle = D3DCOLOR_XRGB(242, 242, 242);
-	const D3DCOLOR cOrange = D3DCOLOR_XRGB(245, 97, 26), cKnob = D3DCOLOR_XRGB(255, 147, 71), cInk = D3DCOLOR_XRGB(10, 10, 10);
-	const D3DCOLOR cKeyCap = D3DCOLOR_XRGB(33, 35, 37), cKeyEdge = D3DCOLOR_XRGB(96, 98, 100), cKeyText = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cDim = D3DCOLOR_XRGB(128, 128, 128), cSub = themed ? rgbOf(m_view.themeGrey) : D3DCOLOR_XRGB(176, 176, 176), cTitle = D3DCOLOR_XRGB(242, 242, 242);
+	const D3DCOLOR cOrange = D3DCOLOR_XRGB(245, 97, 26), cKnob = D3DCOLOR_XRGB(255, 147, 71), cInk = D3DCOLOR_XRGB(10, 10, 10);   // warnings
+	const D3DCOLOR cAccent = themed ? rgbOf(m_view.themeHi) : cOrange;   // 2.120.0: headings, lines, arrows
+	const D3DCOLOR cKeyCap = cSelBar, cKeyEdge = D3DCOLOR_XRGB(96, 98, 100), cKeyText = D3DCOLOR_XRGB(242, 242, 242);
 	const D3DCOLOR cWhite = D3DCOLOR_XRGB(255, 255, 255);
 
 	auto fill = [&](int x0, int y0, int x1, int y1, D3DCOLOR c) {
@@ -11688,8 +11695,8 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 	// A section heading: arrow and bold capitals in orange. Returns its right edge.
 	auto heading = [&](int x, int y, const std::wstring& s) {
 		const int sz = u * 3 / 5;
-		tri(x, y + u / 8, sz, cOrange);
-		text(fH, x + sz, y, cOrange, s);
+		tri(x, y + u / 8, sz, cAccent);
+		text(fH, x + sz, y, cAccent, s);
 		return x + sz + width(fH, s);
 	};
 
@@ -12144,7 +12151,7 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 		const int bh = std::max((colsY - by0) + colsH + u / 2, sBh);
 		sBh = bh;
 		fill(bx0, by0, bx1, by0 + bh, cPanel);
-		fill(bx0, by0 + bh - std::max(2, u / 8), bx1, by0 + bh, cOrange);
+		fill(bx0, by0 + bh - std::max(2, u / 8), bx1, by0 + bh, cAccent);
 
 		auto badgeW = [&](CD3D11Font& f, int fh, const InfoBadge& b) { return std::max(width(f, b.t), b.wide.empty() ? 0 : width(f, b.wide)) + fh * 4 / 5; };
 		auto badge = [&](CD3D11Font& f, int fh, int x, int y, int h, const InfoBadge& b) {
@@ -12187,8 +12194,8 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				for (const size_t gi : bands[b]) {
 					const InfoGroup& g = groups[gi];
 					const int x = bx0 + padX + (slotOf[gi] % kCols) * (colWAll + gapC);
-					tri(x, y + (hG * 5 / 4 - tsz) / 2, tsz, cOrange);
-					text(fG, x + tsz + hG / 3, y, cOrange, fit(fG, g.name, colWAll - tsz - hG / 3));
+					tri(x, y + (hG * 5 / 4 - tsz) / 2, tsz, cAccent);
+					text(fG, x + tsz + hG / 3, y, cAccent, fit(fG, g.name, colWAll - tsz - hG / 3));
 					int iy = y + headH;
 					int n = 0;
 					for (const auto& it : g.items) {
@@ -12309,7 +12316,7 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 		edgeRound(px, py, px + pw, py + ph, rad, edge, cEdge);
 
 		// Title: an orange bar, the name in bold and the version.
-		fill(px + pad / 2, py + u / 2, px + pad / 2 + std::max(3, u / 5), py + u * 2, cOrange);
+		fill(px + pad / 2, py + u / 2, px + pad / 2 + std::max(3, u / 5), py + u * 2, cAccent);
 		const int tx = px + pad + u / 2;
 		text(fT, tx, py + u / 2, cTitle, m.title);
 		text(fS, tx + width(fT, m.title) + u / 2, py + u / 2 + (u * 3 / 2 - u * 4 / 5), cDim, m.version);
@@ -12328,9 +12335,9 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				const int bx0 = px + u / 2, bx1 = px + pw - u / 2, by0 = y - u / 8, by1 = y + rowH - u / 8;
 				fillRound(bx0, by0, bx1, by1, u / 4, cSelBar);
 				const int wv = width(fM, r.value), wa = width(fM, L">");
-				text(fM, vx1 - wa, y, cOrange, L">");
+				text(fM, vx1 - wa, y, cAccent, L">");
 				text(fM, vx1 - wa - u / 2 - wv, y, rowColor(r.style, true), r.value);
-				text(fM, vx1 - wa - u / 2 - wv - u / 2 - width(fM, L"<"), y, cOrange, L"<");
+				text(fM, vx1 - wa - u / 2 - wv - u / 2 - width(fM, L"<"), y, cAccent, L"<");
 			} else {
 				text(fM, vx1 - width(fM, r.value), y, rowColor(r.style, false), r.value);
 			}

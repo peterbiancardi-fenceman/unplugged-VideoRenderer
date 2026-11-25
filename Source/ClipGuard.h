@@ -1,5 +1,5 @@
 ﻿/*
- * ClipGuard Media Player 0.9.7 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
+ * ClipGuard Media Player 1.0.0 (ClipGuard, formerly DBLEFix) -- highlight compensation for projectors with dynamic laser dimming
  * (DBLE). In dark scenes the projector lowers the laser and raises the signal
  * gain, which pushes bright highlights into clipping. This lowers highlights in
  * dark pictures first, so after the projector's gain they land below clipping.
@@ -83,7 +83,7 @@ struct ClipGuardShared
 	// log (F11): ClipGuard.exe asks, the renderer saves, ClipGuard.exe uploads
 	uint32_t logRequest;        // written by ClipGuard.exe: id of the latest log asked for (0 = none)
 	uint32_t logDone;           // written by the renderer: id of the last log saved
-	int32_t  logState;          // written by ClipGuard.exe: 0 none, 1 saving, 2 sending, 3 sent, 4 failed, 5 no token
+	int32_t  logState;          // written by ClipGuard.exe: 0 none, 1 saving, 4 failed, 6 saved
 	uint32_t logStateTick;      // written by ClipGuard.exe: GetTickCount() when logState changed
 	// written by ClipGuard.exe
 	float    hotBelowPct;       // "Hot spot below": no hot spot in pictures brighter than this % (0 = off)
@@ -1741,7 +1741,7 @@ public:
 	// The graphics card's load in % as Windows reports it (Task Manager's 3D
 	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
 	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
-	const wchar_t* VersionText() const { return L"0.9.7"; }
+	const wchar_t* VersionText() const { return L"1.0.0"; }
 	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
 	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
 	float PicturePct() const { return m_picture; }
@@ -1792,7 +1792,7 @@ public:
 	{
 		OvModel m;
 		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
-		m.version = m_s.testBuild ? L"0.9.7 Test" : L"0.9.7 beta";
+		m.version = m_s.testBuild ? L"1.0.0 Test" : L"1.0.0";
 		const auto vals = Lines();
 		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"View", L"Overlay", L"Restart & update" };
 		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it
@@ -1975,12 +1975,7 @@ public:
 		if (!ExeAlive()) return L"";
 		const int st = (int)m_pShared->logState;
 		if (st <= 0 || (DWORD)(GetTickCount() - m_pShared->logStateTick) > 10000) return L"";
-		// 2.45.1: sending and sent are shown again (asked for, so a second F11
-		// is not pressed while the first log is still being sent).
-		if (st == 2) return L"Log: sending...";
-		if (st == 3) return L"Log sent";
-		if (st == 5) return L"Log: saved, not sent (no GitHub token in clipguard.ini)";
-		if (st == 4) return L"Log: saved, sending failed (kept in %LOCALAPPDATA%\\ClipGuard\\logs)";
+		if (st == 4) return L"Log: could not be saved";
 		return L"";
 	}
 	bool HasLogNote() const { return !LogNote().empty(); }
