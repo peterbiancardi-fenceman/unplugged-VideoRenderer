@@ -215,6 +215,20 @@ protected:
 public:
 	virtual ~CVideoProcessor() = default;
 
+	// ClipGuard Media Player 1.1.0: Video Processor's capture-to-display time in this PC, averaged:
+	// the card's frame arrival -> queued (conversion) -> handed to the renderer (forwarder queue)
+	// -> its time to be drawn (renderer wait) -> drawn and presented (draw).
+	double m_latCapMs = -1.0, m_latFwdMs = -1.0, m_latWaitMs = -1.0, m_latDrawMs = -1.0, m_latTotalMs = -1.0;
+	ULONGLONG m_latTick = 0;
+	void AddLatency(double cap, double fwd, double wait, double draw)
+	{
+		auto ema = [](double& a, double v) { a = a < 0.0 ? v : a * 0.95 + v * 0.05; };
+		ema(m_latCapMs, cap); ema(m_latFwdMs, fwd); ema(m_latWaitMs, wait); ema(m_latDrawMs, draw);
+		ema(m_latTotalMs, cap + fwd + wait + draw);
+		m_latTick = GetTickCount64();
+	}
+	bool LatencyLive() const { return m_latTotalMs >= 0.0 && GetTickCount64() - m_latTick < 3000; }
+
 	virtual int Type() = 0;
 
 	virtual HRESULT Init(const HWND hwnd, bool displayHdrChanged, bool* pChangeDevice = nullptr) = 0;

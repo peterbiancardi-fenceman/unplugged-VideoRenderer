@@ -959,6 +959,10 @@ HRESULT CMpcVideoRenderer::DoRenderSample(IMediaSample* pSample)
 	return hr;
 }
 
+// ClipGuard Media Player 1.1.0: the capture filter's timing stamps (same GUID and layout as DeckLinkSource.cpp)
+static const GUID kIID_CgTiming = { 0x7e3a9c41, 0x2b6d, 0x4f0e, { 0x8c, 0x15, 0x93, 0xd2, 0xa6, 0xb4, 0xe7, 0x11 } };
+struct CgTiming { LONGLONG arrive, enqueue, deliver; };
+
 HRESULT CMpcVideoRenderer::Receive(IMediaSample* pSample)
 {
 	// override CBaseRenderer::Receive() for the implementation of the search during the pause
@@ -969,6 +973,18 @@ HRESULT CMpcVideoRenderer::Receive(IMediaSample* pSample)
 	}
 
 	ASSERT(pSample);
+
+	// 1.1.0: the capture filter's timing for this frame, if it sent one
+	CgTiming cgT = {};
+	bool cgHave = false;
+	{
+		CComQIPtr<IMediaSideData> sd(pSample);
+		const BYTE* tp = nullptr; size_t tn = 0;
+		if (sd && SUCCEEDED(sd->GetSideData(kIID_CgTiming, &tp, &tn)) && tp && tn == sizeof(CgTiming)) {
+			memcpy(&cgT, tp, sizeof(cgT));
+			cgHave = cgT.arrive != 0 && cgT.enqueue != 0 && cgT.deliver != 0;
+		}
+	}
 
 	// [VP-DBG] delivery census: proves whether the host graph actually feeds us
 	// samples. First, 60th, then every 300th -- cheap, lifecycle-level, no flag needed.
@@ -1027,6 +1043,8 @@ HRESULT CMpcVideoRenderer::Receive(IMediaSample* pSample)
 		m_bInReceive = FALSE;
 		return NOERROR;
 	}
+	LARGE_INTEGER cgWait = {};
+	if (cgHave) QueryPerformanceCounter(&cgWait);   // 1.1.0
 
 	//  Set this here and poll it until we work out the locking correctly
 	//  It can't be right that the streaming stuff grabs the interface
@@ -1048,6 +1066,13 @@ HRESULT CMpcVideoRenderer::Receive(IMediaSample* pSample)
 
 	if (m_State == State_Running) {
 		Render(m_pMediaSample);
+		if (cgHave && m_VideoProcessor) {   // 1.1.0: drawn and presented
+			LARGE_INTEGER q, f;
+			QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+			const double k = f.QuadPart > 0 ? 1000.0 / (double)f.QuadPart : 0.0;
+			m_VideoProcessor->AddLatency((cgT.enqueue - cgT.arrive) * k, (cgT.deliver - cgT.enqueue) * k,
+				(cgWait.QuadPart - cgT.deliver) * k, (q.QuadPart - cgWait.QuadPart) * k);
+		}
 	}
 
 	ClearPendingSample();

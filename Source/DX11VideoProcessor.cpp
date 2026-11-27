@@ -11417,6 +11417,31 @@ void CDX11VideoProcessor::UpdateStatsPostProc()
 // it is never measured by the fix.
 // ---- 2.112.0: load: GPU %, CPU %, GPU time per frame ----------------------------------------
 typedef void* (*NvQI_t)(unsigned int);
+// 1.1.0: the NVIDIA card's temperature (C) and fan speed (%) through the driver's management
+// library (nvml.dll). Read-only. -1 when unavailable.
+static void NvGpuTemp(int& tempC, int& fanPct)
+{
+	typedef int (*Init_t)(); typedef int (*Handle_t)(unsigned int, void**);
+	typedef int (*Temp_t)(void*, int, unsigned int*); typedef int (*Fan_t)(void*, unsigned int*);
+	static bool tried = false; static void* dev = nullptr; static Temp_t temp = nullptr; static Fan_t fan = nullptr;
+	tempC = -1; fanPct = -1;
+	if (!tried) {
+		tried = true;
+		HMODULE h = LoadLibraryW(L"nvml.dll");
+		if (h) {
+			Init_t init = (Init_t)GetProcAddress(h, "nvmlInit_v2");
+			Handle_t handle = (Handle_t)GetProcAddress(h, "nvmlDeviceGetHandleByIndex_v2");
+			temp = (Temp_t)GetProcAddress(h, "nvmlDeviceGetTemperature");
+			fan = (Fan_t)GetProcAddress(h, "nvmlDeviceGetFanSpeed");
+			if (!init || !handle || !temp || init() != 0 || handle(0, &dev) != 0) { dev = nullptr; temp = nullptr; }
+		}
+	}
+	if (!dev || !temp) return;
+	unsigned int v = 0;
+	if (temp(dev, 0, &v) == 0) tempC = (int)v;   // 0 = NVML_TEMPERATURE_GPU
+	if (fan && fan(dev, &v) == 0) fanPct = (int)v;
+}
+
 static int NvGpuLoad()
 {
 	static bool tried = false; static void* gpu = nullptr;
@@ -11488,6 +11513,7 @@ void CDX11VideoProcessor::LoadSample()
 	if (now - m_loadTick < 1000) return;
 	m_loadTick = now;
 	m_loadGpu = NvGpuLoad();
+	NvGpuTemp(m_loadTempC, m_loadFan);   // 1.1.0
 	FILETIME fi, fk, fu;
 	if (GetSystemTimes(&fi, &fk, &fu)) {
 		const uint64_t idle = ((uint64_t)fi.dwHighDateTime << 32) | fi.dwLowDateTime;
@@ -11789,7 +11815,14 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				else if (m_rangeCheck == 2) mx += L" (file said 0-255)";
 				else if (m_rangeCheck == 3) mx += L" (checked)";
 				if (!mx.empty()) g.items.push_back({ mx, 0 });
-				if (!fxStr(5).empty()) g.items.push_back({ L"Transfer " + fxStr(5), 0 });
+				// 1.1.0: SDR brightness curves (BT.709, BT.601, sRGB, gamma) show as "SDR"; PQ and HLG
+				// keep their names.
+				if (!fxStr(5).empty()) {
+					const std::wstring tf = fxStr(5);
+					const bool hdrTf = tf.find(L"2084") != std::wstring::npos || tf.find(L"PQ") != std::wstring::npos
+						|| tf.find(L"HLG") != std::wstring::npos || tf.find(L"B67") != std::wstring::npos;
+					g.items.push_back({ hdrTf ? L"Transfer " + tf : std::wstring(L"Transfer SDR"), 0 });
+				}
 			}
 			// The picture inside the black bars, as its aspect ratio (measured on
 			// the grid, so snapped to the usual ratios when within 1.5%).
@@ -11925,6 +11958,14 @@ void CDX11VideoProcessor::DrawClipGuardOverlay(ID3D11Texture2D* pRenderTarget)
 				if (m_loadMs >= 0.0f) t += limit > 0.0f ? std::format(L" \u00b7 render {:.1f} ms of {:.1f}", m_loadMs, limit) : std::format(L" \u00b7 render {:.1f} ms", m_loadMs);
 				const bool hot = m_loadGpu > 85 || (limit > 0.0f && m_loadMs > limit * 0.8f);
 				g.items.push_back({ t, hot ? 2 : 0 });
+				// 1.1.0: the graphics card's temperature and fan speed
+				if (m_loadTempC >= 0)
+					g.items.push_back({ m_loadFan >= 0 ? std::format(L"GPU {} \u00b0C, fan {}%", m_loadTempC, m_loadFan) : std::format(L"GPU {} \u00b0C", m_loadTempC), 0 });
+				// 1.1.0: Video Processor's capture-to-display time in this PC
+				if (LatencyLive()) {
+					g.items.push_back({ std::format(L"Latency {:.0f} ms in this PC", m_latTotalMs), 0 });
+					g.items.push_back({ std::format(L"capture {:.0f} \u00b7 queue {:.0f} \u00b7 wait {:.0f} \u00b7 draw {:.0f}", m_latCapMs, m_latFwdMs, m_latWaitMs, m_latDrawMs), 0 });
+				}
 				if (m_lensNNOff) g.items.push_back({ L"Lens upscale off for this film: frames were skipped", 2 });   // 2.113.0
 			}
 			// 2.115.0: the scaling path: sizes, then each step (yellow when one fell back)

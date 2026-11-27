@@ -985,6 +985,7 @@ private:
 	LoadQ m_loadQ[4];
 	int m_loadQi = 0;
 	int m_loadGpu = -1, m_loadCpu = -1;
+	int m_loadTempC = -1, m_loadFan = -1;   // 1.1.0: GPU temperature (C) and fan speed (%)
 	float m_loadMs = -1.0f, m_loadMsAcc = 0.0f; int m_loadMsN = 0;
 	uint64_t m_loadTick = 0, m_cpuIdle = 0, m_cpuTotal = 0;
 	// 2.113.0: Lens upscale switches itself off for a film that keeps skipping frames with it

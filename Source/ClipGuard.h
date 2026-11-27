@@ -555,13 +555,15 @@ public:
 	static constexpr DWORD kOverlayHideMs = 8000;
 	static constexpr int   kRows = 22;   // 2.63.1: the Test-only Source row is gone
 	static constexpr int   kRowUpscaler = 15;
-	// Menu rows shown: ClipGuard (not +) leaves out Upscaler.
-	int Rows() const { return kRows - (m_s.plus ? 0 : 1); }
+	static constexpr int   kRowLut = 18;   // 1.1.0: the LUT row is gone (the player's Calibration LUT does it)
+	// Menu rows shown: ClipGuard (not +) leaves out Upscaler; no edition shows LUT.
+	int Rows() const { return kRows - 1 - (m_s.plus ? 0 : 1); }
 	// The setting behind a shown row.
 	int RowOf(int shown) const
 	{
 		shown = std::clamp(shown, 0, Rows() - 1);
 		if (!m_s.plus && shown >= kRowUpscaler) shown++;
+		if (shown >= kRowLut) shown++;
 		return shown;
 	}
 	// Dim fire (2.40.0). Each cell also measures how warm its bright half is:
@@ -1741,7 +1743,7 @@ public:
 	// The graphics card's load in % as Windows reports it (Task Manager's 3D
 	// figure), read by ClipGuard.exe while the banner shows; -1 = not known.
 	float GpuLoad() const { return (ExeAlive() && m_pShared->gpuLoad >= 1.0f) ? m_pShared->gpuLoad - 1.0f : -1.0f; }
-	const wchar_t* VersionText() const { return L"1.0.0"; }
+	const wchar_t* VersionText() const { return L"1.1.0"; }
 	bool Measured() const { return m_haveMeasure && !m_outputPQ; }
 	bool FixOn() const { return m_s.enabled && !m_outputPQ; }
 	float PicturePct() const { return m_picture; }
@@ -1792,12 +1794,13 @@ public:
 	{
 		OvModel m;
 		m.title = m_s.plus ? L"ClipGuard+" : L"ClipGuard";
-		m.version = m_s.testBuild ? L"1.0.0 Test" : L"1.0.0";
+		m.version = m_s.testBuild ? L"1.1.0 Test" : L"1.1.0";
 		const auto vals = Lines();
 		static const wchar_t* names[kRows] = { L"Guard", L"Strength", L"Guard shape", L"Guard starts", L"Full effect", L"Highlight start", L"Color protect", L"Text skip", L"Hot spot", L"Hot spot below", L"Hot spot mask", L"Graded spot", L"Dim fire as hot spot", L"Grid", L"Look-ahead", L"Upscaler", L"Dither", L"Projector", L"LUT", L"View", L"Overlay", L"Restart & update" };
 		int vis = 0;   // ClipGuard (not +) has no Upscaler row: menu rows are counted without it
 		for (int i = 0; i < kRows; i++) {
 			if (i == kRowUpscaler && !m_s.plus) continue;
+			if (i == kRowLut) continue;   // 1.1.0
 			if (i == 0) m.rows.push_back({ true, L"GUARD", L"", false, 2 });
 			if (i == 8) m.rows.push_back({ true, L"SPOTS", L"", false, 2 });
 			if (i == 13) m.rows.push_back({ true, L"DISPLAY", L"", false, 2 });
@@ -3349,7 +3352,7 @@ private:
 			m_s.upscaler    = std::clamp((int)s->upscaler, 0, 1);
 			m_s.dither      = std::clamp((int)s->dither, 0, 1);
 			m_s.projector   = (s->projector == 1 || s->projector == 3) ? (int)s->projector : 0;   // 2.60.0: 3 = Titan DBLE Low
-			m_s.lut         = std::clamp((int)s->lut, 0, 2);
+			m_s.lut         = 0;   // 1.1.0: the LUT row is gone; the player's Calibration LUT is used
 			m_s.lutOff      = s->lutOff != 0;
 			if (s->edition != 1) m_s.upscaler = 0;   // Upscaler is ClipGuard+ only
 			m_s.grid        = std::clamp((int)s->grid, 0, 1);
@@ -3364,7 +3367,7 @@ private:
 			m_s.lastKeyTick = s->lastKeyTick;
 			m_s.testBuild   = s->buildKind == 1;
 			m_s.outGamma    = std::clamp((int)s->outGamma, 0, 2);   // 0.9.3
-			m_s.selected    = std::clamp((int)s->selected, 0, kRows - (s->edition == 1 ? 0 : 1) - 1);
+			m_s.selected    = std::clamp((int)s->selected, 0, kRows - 1 - (s->edition == 1 ? 0 : 1) - 1);
 			const uint32_t req = s->logRequest;
 			if (req != 0 && req != m_logSeen) {
 				m_logSeen = req;
@@ -3408,7 +3411,7 @@ private:
 			// 2.50.0: Projector 2 (Valerion, 2.48-2.49) became Universal with the Valerion LUT.
 			const int pj = std::clamp((int)readf(L"Projector", 0.0f), 0, 3);
 			m_s.projector = (pj == 1 || pj == 3) ? pj : 0;   // 2.51.2: Valerion (2) becomes Universal (Reactive) with the Valerion LUT; 2.60.0: 3 = Titan DBLE Low
-			m_s.lut = std::clamp((int)readf(L"Lut", (float)(pj == 3 ? 1 : pj)), 0, 2);
+			m_s.lut = 0;   // 1.1.0: the LUT row is gone
 		}
 		m_s.grid       = std::clamp((int)readf(L"Grid", 1.0f), 0, 1);
 		m_s.lookAhead  = NormLookAhead((int)readf(L"LookAhead", 4.0f));
